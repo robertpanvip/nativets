@@ -5,12 +5,17 @@
  * factory (`--jsx=transform --jsx-factory=h --jsx-fragment=Fragment`), so JSX
  * is pure sugar over the same mutation protocol:
  *
- *     <div padding={16}>hi {n}</div>   ⟺   h("div", { padding: 16 }, "hi ", n)
+ *     <div style={{ padding: 16 }}>hi {n}</div>
+ *         ⟺   h("div", { style: { padding: 16 } }, "hi ", n)
  *
  * A capitalised tag is a component: `<Card title="…">…</Card>` becomes
  * `h(Card, { title }, …)`, with children delivered as `props.children`.
- * Style keys stay flat (they *are* the style object the host applies) — there
- * is no nested `style={{…}}` layer.
+ *
+ * Styling lives in exactly one place — the `style` prop. Intrinsic tags carry
+ * no other presentation keys, so a component's own props (`bg`, `fg`, `color`,
+ * `value`, …) can never collide with a style name, and it is always obvious
+ * which attributes reach the host's style engine. The other two props an
+ * intrinsic tag understands are `onClick` and `text`.
  */
 
 import {
@@ -23,7 +28,7 @@ import {
     appendChild,
     stats,
 } from "./runtime";
-import type { El, Child } from "./runtime";
+import type { El, Child, Style } from "./runtime";
 
 // `h` is referenced by the JSX transform itself, not by hand-written calls —
 // keep it imported even though no `h(` appears in this file.
@@ -86,14 +91,16 @@ const samples = [
 function Card(props: { title: string; children?: Child }): El {
     return (
         <div
-            flexDirection="column"
-            gap={10}
-            padding={16}
-            background={C.card}
-            borderRadius={12}
-            borderWidth={1}
-            borderColor={C.border}
-            grow={1}
+            style={{
+                flexDirection: "column",
+                gap: 10,
+                padding: 16,
+                background: C.card,
+                borderRadius: 12,
+                borderWidth: 1,
+                borderColor: C.border,
+                grow: 1,
+            }}
         >
             {text(props.title, { fontSize: 12, color: C.textSecondary })}
             {props.children}
@@ -104,14 +111,16 @@ function Card(props: { title: string; children?: Child }): El {
 function StatCard(props: { label: string; value: () => string; color: string }): El {
     return (
         <div
-            flexDirection="column"
-            gap={6}
-            padding={14}
-            background={C.cardAlt}
-            borderRadius={10}
-            borderWidth={1}
-            borderColor={C.border}
-            grow={1}
+            style={{
+                flexDirection: "column",
+                gap: 6,
+                padding: 14,
+                background: C.cardAlt,
+                borderRadius: 10,
+                borderWidth: 1,
+                borderColor: C.border,
+                grow: 1,
+            }}
         >
             {text(props.label, { fontSize: 11, color: C.textMuted })}
             {text(props.value, { fontSize: 24, fontWeight: "bold", color: props.color })}
@@ -119,18 +128,20 @@ function StatCard(props: { label: string; value: () => string; color: string }):
     );
 }
 
+/** `bg` / `fg` are *component* props — they are not style keys, which is the
+ *  whole point of keeping styling behind `style`. */
 function PillBtn(props: { bg: string; fg: string; onClick: () => void; children?: Child }): El {
+    const style: Style = {
+        background: props.bg,
+        color: props.fg,
+        fontSize: 14,
+        fontWeight: "medium",
+        padding: 10,
+        paddingX: 16,
+        borderRadius: 8,
+    };
     return (
-        <div
-            background={props.bg}
-            color={props.fg}
-            fontSize={14}
-            fontWeight="medium"
-            padding={10}
-            paddingX={16}
-            borderRadius={8}
-            onClick={props.onClick}
-        >
+        <div style={style} onClick={props.onClick}>
             {props.children}
         </div>
     );
@@ -143,31 +154,35 @@ function PillBtn(props: { bg: string; fg: string; onClick: () => void; children?
 function Header(): El {
     return (
         <div
-            flexDirection="row"
-            alignItems="center"
-            justifyContent="between"
-            padding={14}
-            paddingX={18}
-            background={C.card}
-            borderRadius={12}
-            borderWidth={1}
-            borderColor={C.border}
+            style={{
+                flexDirection: "row",
+                alignItems: "center",
+                justifyContent: "between",
+                padding: 14,
+                paddingX: 18,
+                background: C.card,
+                borderRadius: 12,
+                borderWidth: 1,
+                borderColor: C.border,
+            }}
         >
-            <div flexDirection="row" alignItems="center" gap={12}>
+            <div style={{ flexDirection: "row", alignItems: "center", gap: 12 }}>
                 <div
-                    background={C.accent}
-                    color="#ffffff"
-                    fontSize={16}
-                    fontWeight="bold"
-                    width={34}
-                    height={34}
-                    alignItems="center"
-                    justifyContent="center"
-                    borderRadius={9}
+                    style={{
+                        background: C.accent,
+                        color: "#ffffff",
+                        fontSize: 16,
+                        fontWeight: "bold",
+                        width: 34,
+                        height: 34,
+                        alignItems: "center",
+                        justifyContent: "center",
+                        borderRadius: 9,
+                    }}
                 >
                     P
                 </div>
-                <div flexDirection="column" gap={2}>
+                <div style={{ flexDirection: "column", gap: 2 }}>
                     {text("PerryTS × GPUI", { fontSize: 17, fontWeight: "bold", color: C.textPrimary })}
                     {text("TypeScript 前端 · Perry 原生编译 · GPUI GPU 渲染", {
                         fontSize: 12,
@@ -182,18 +197,18 @@ function Header(): El {
 
 function NavItem(props: { label: string }): El {
     const active = nav() === props.label;
+    const style: Style = {
+        padding: 11,
+        paddingX: 14,
+        borderRadius: 9,
+        fontSize: 14,
+        background: active ? C.elevated : C.bg,
+        color: active ? C.accent : C.textSecondary,
+        borderWidth: 1,
+        borderColor: active ? C.accent : C.border,
+    };
     return (
-        <div
-            padding={11}
-            paddingX={14}
-            borderRadius={9}
-            fontSize={14}
-            background={active ? C.elevated : C.bg}
-            color={active ? C.accent : C.textSecondary}
-            borderWidth={1}
-            borderColor={active ? C.accent : C.border}
-            onClick={() => setNav(props.label)}
-        >
+        <div style={style} onClick={() => setNav(props.label)}>
             {props.label}
         </div>
     );
@@ -202,7 +217,7 @@ function NavItem(props: { label: string }): El {
 function Sidebar(): El {
     const items = ["仪表盘", "任务", "指标", "日志", "设置"];
     return (
-        <div flexDirection="column" gap={6} width={178}>
+        <div style={{ flexDirection: "column", gap: 6, width: 178 }}>
             {For(
                 () => items,
                 (label) => <NavItem label={label} />
@@ -214,7 +229,7 @@ function Sidebar(): El {
 function CounterCard(): El {
     return (
         <Card title="计数器 · 状态 → mutation → GPU 回环">
-            <div flexDirection="row" alignItems="center" gap={14}>
+            <div style={{ flexDirection: "row", alignItems: "center", gap: 14 }}>
                 <PillBtn bg={C.accentDim} fg={C.textPrimary} onClick={() => setCount(count() - 1)}>
                     -
                 </PillBtn>
@@ -244,22 +259,26 @@ function TaskRow(props: { t: Task }): El {
     const t = props.t;
     return (
         <div
-            flexDirection="row"
-            alignItems="center"
-            justifyContent="between"
-            padding={10}
-            paddingX={12}
-            background={C.cardAlt}
-            borderRadius={8}
-            borderWidth={1}
-            borderColor={C.border}
+            style={{
+                flexDirection: "row",
+                alignItems: "center",
+                justifyContent: "between",
+                padding: 10,
+                paddingX: 12,
+                background: C.cardAlt,
+                borderRadius: 8,
+                borderWidth: 1,
+                borderColor: C.border,
+            }}
         >
-            <div flexDirection="row" alignItems="center" gap={10}>
+            <div style={{ flexDirection: "row", alignItems: "center", gap: 10 }}>
                 <div
-                    color={t.done ? C.green : C.textMuted}
-                    fontSize={15}
-                    fontWeight="bold"
-                    paddingX={4}
+                    style={{
+                        color: t.done ? C.green : C.textMuted,
+                        fontSize: 15,
+                        fontWeight: "bold",
+                        paddingX: 4,
+                    }}
                     onClick={() => toggleTask(t.id)}
                 >
                     {t.done ? "√" : "○"}
@@ -267,11 +286,7 @@ function TaskRow(props: { t: Task }): El {
                 {text(t.title, { fontSize: 13, color: t.done ? C.textMuted : C.textPrimary })}
             </div>
             <div
-                color={C.red}
-                fontSize={12}
-                paddingX={8}
-                paddingY={4}
-                borderRadius={6}
+                style={{ color: C.red, fontSize: 12, paddingX: 8, paddingY: 4, borderRadius: 6 }}
                 onClick={() => removeTask(t.id)}
             >
                 删除
@@ -283,13 +298,13 @@ function TaskRow(props: { t: Task }): El {
 function TasksCard(): El {
     return (
         <Card title="任务列表 · For 动态渲染 + 事件回传">
-            <div flexDirection="column" gap={8}>
+            <div style={{ flexDirection: "column", gap: 8 }}>
                 {For(
                     tasks,
                     (t) => <TaskRow t={t} />
                 )}
             </div>
-            <div flexDirection="row" gap={10} alignItems="center">
+            <div style={{ flexDirection: "row", gap: 10, alignItems: "center" }}>
                 <PillBtn bg={C.elevated} fg={C.accent} onClick={addTask}>
                     ＋ 快速添加
                 </PillBtn>
@@ -304,7 +319,7 @@ function TasksCard(): El {
 
 function StatsRow(): El {
     return (
-        <div flexDirection="row" gap={12}>
+        <div style={{ flexDirection: "row", gap: 12 }}>
             <StatCard label="点击事件回传" value={() => String(clicks())} color={C.green} />
             <StatCard label="mutation 批" value={() => String(batches())} color={C.accent} />
             <StatCard label="累计 mutation" value={() => String(opsTotal())} color={C.amber} />
@@ -314,7 +329,7 @@ function StatsRow(): El {
 
 function MainPanel(): El {
     return (
-        <div flexDirection="column" gap={14} grow={1}>
+        <div style={{ flexDirection: "column", gap: 14, grow: 1 }}>
             <StatsRow />
             <CounterCard />
             <TasksCard />
@@ -325,15 +340,17 @@ function MainPanel(): El {
 function Footer(): El {
     return (
         <div
-            flexDirection="row"
-            justifyContent="between"
-            alignItems="center"
-            padding={10}
-            paddingX={16}
-            background={C.cardAlt}
-            borderRadius={10}
-            borderWidth={1}
-            borderColor={C.border}
+            style={{
+                flexDirection: "row",
+                justifyContent: "between",
+                alignItems: "center",
+                padding: 10,
+                paddingX: 16,
+                background: C.cardAlt,
+                borderRadius: 10,
+                borderWidth: 1,
+                borderColor: C.border,
+            }}
         >
             {text(() => "frontend: " + mode + " · protocol 1", { fontSize: 12, color: C.textMuted })}
             {text(() => "navigation: " + nav(), { fontSize: 12, color: C.textSecondary })}
@@ -416,7 +433,7 @@ export function App(root: El): void {
 
     // NOTE: 绑定局部变量再传参（perry 0.5.1520 下实参位置的多层调用会错绑）
     const shell = (
-        <div flexDirection="row" gap={12} grow={1}>
+        <div style={{ flexDirection: "row", gap: 12, grow: 1 }}>
             <Sidebar />
             <MainPanel />
         </div>

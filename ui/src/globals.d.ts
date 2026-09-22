@@ -30,9 +30,24 @@ declare namespace JSX {
     /** A JSX expression evaluates to a host element handle. */
     type Element = import("./runtime").El;
 
-    /** Props of every intrinsic (lowercase) tag: flat style keys + onClick. */
+    type Style = import("./runtime").Style;
+
+    /**
+     * The only props an intrinsic (lowercase) tag understands. Styling goes in
+     * `style` — because this interface has no index signature, writing a style
+     * key at the top level (e.g. `<div padding={16}>`) is a type error rather
+     * than a silently ignored attribute.
+     */
+    interface IntrinsicProps {
+        style?: Style;
+        onClick?: () => void;
+        /** Initial text content; same as passing a string child. */
+        text?: string;
+        children?: any;
+    }
+
     interface IntrinsicElements {
-        [tag: string]: any;
+        [tag: string]: IntrinsicProps;
     }
 
     /** Tells the compiler which prop carries JSX children. */

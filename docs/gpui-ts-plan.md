@@ -146,8 +146,8 @@ build/dist/main.exe --transport=direct        # 默认
 `h()` 工厂，所以协议层、host、tree.rs 全部零改动：
 
 ```
-<div padding={16}>hi {n}</div>
-  --esbuild(jsx: transform, jsxFactory: h)-->  h("div", { padding: 16 }, "hi ", n)
+<div style={{ padding: 16 }}>hi {n}</div>
+  --esbuild(jsx: transform, jsxFactory: h)-->  h("div", { style: { padding: 16 } }, "hi ", n)
 ```
 
 ### runtime.ts 为 JSX 补的三件事
@@ -158,8 +158,31 @@ build/dist/main.exe --transport=direct        # 默认
 | `h()` 的**函数 tag 分支** | 大写标签＝组件：`<Card title/>` → `h(Card, props, …)` → `Card({…props, children})` |
 | `appendChildren()`（递归展平数组） | `{items.map(…)}` 是把数组当**一个实参**交给工厂的，原来会被整块 append 给 host |
 
-`h()` 对元素节点的既有语义**完全没动**（props 平铺进 setStyle、`onClick` → setEvents、
-字符串 children → 子 text 节点），所以 JSX 版与手写 `h()` 版逐节点等价。
+`h()` 对元素节点的既有语义**完全没动**（`onClick` → setEvents、字符串 children →
+子 text 节点），所以 JSX 版与手写 `h()` 版逐节点等价。
+
+### 样式收敛到 `style`（2026-09-22 23:45）
+
+最初把样式键平铺在 props 上（`<div padding={16} background={C.card}>`）。这不合适：
+组件的自有 props 与样式键在**同一平面**，`<StatCard color={C.green}>` 里的 `color` 是
+组件 prop、而 `<div color=…>` 里的 `color` 是样式，同名不同义；也看不出哪些属性真的
+会进 host 的样式引擎。
+
+改为样式走唯一的 `style` prop：
+
+```tsx
+<div style={{ padding: 16, background: C.card }}>…</div>
+```
+
+- `h()` 只读 `props.style` / `props.onClick` / `props.text`，其余内在标签属性**一律忽略**
+  （故意不保留平铺写法——留两条路等于没收敛）。
+- `globals.d.ts` 的 `JSX.IntrinsicProps` 刻意**不加索引签名**，于是
+  `<div padding={16}>` 在编辑器里直接报类型错误，而不是静默变成无样式元素。
+- 组件照旧拿到 props 原样（`style` 也在里面），自己决定怎么用；`PillBtn` 的
+  `bg`/`fg` 因此可以放心叫这个名字而不会和样式键冲突。
+- 顺手把 `Style` 类型导出，`text()` / `setRootStyle()` / 组件内部的样式对象都标注它。
+
+协议与 host 零改动：`style` 对象仍然是 `setStyle` op 的载荷原样。
 
 ### `app.ts` → `app.tsx`
 
@@ -186,6 +209,10 @@ npx perry compile build/gen/main.ts --output-type staticlib -o ../build/app-main
 1. **必须显式列出所有源文件**——`bundle: false` 时 esbuild 不跟随 import，只转点名的文件；
    目录扫描要排除 `*.d.ts`（纯声明，不应产出）。
 2. 输出用 `outExtension: { ".js": ".ts" }` 改回 `.ts`，否则 perry 的入口校验不认。
+
+另：`ui/pretranspile-tsx.mjs` 是**导出函数的模块**（`pretranspileTsx(uiDir, entryName)`），
+由 `build-perry.mjs` / `scripts/gpui-ts.mjs` 调用；直接 `node pretranspile-tsx.mjs` 只会
+import 一下然后静默退出，什么也不生成——排查时容易误判成"预转成功"。
 
 ### 编辑器支持（不参与构建）
 

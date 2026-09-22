@@ -13,12 +13,20 @@
  *   - no Proxy / generators / structuredClone
  *
  *   createSignal / createEffect      fine-grained reactivity
- *   h(tag, props, ...children)       hyperscript (Solid-ish authoring)
+ *   h(tag, props, ...children)       hyperscript (the JSX factory)
  *   text(content, style)             reactive text node
  *   Show(cond, render) / For(items, render)   control flow
  *
  * Every state change becomes a minimal mutation batch, so only what actually
  * changed crosses the transport boundary.
+ *
+ * Authoring surface — styles live in one place:
+ *
+ *     <div style={{ padding: 16, background: "#161b26" }}>hi {n}</div>
+ *
+ * `style` is the ONLY channel that reaches the host's style engine. The other
+ * two recognised props are `onClick` and `text`; components (capitalised tags)
+ * receive their props verbatim, `style` included. See `h()` for the details.
  */
 
 // ---------------------------------------------------------------------------
@@ -134,6 +142,13 @@ export interface El {
     id: number;
 }
 
+/**
+ * One style declaration. Keys are the flat names the host understands
+ * (`padding`, `paddingX`, `flexDirection`, `background`, `borderRadius`, …) —
+ * they map 1:1 onto GPUI's style setters in `host/src/tree.rs`.
+ */
+export type Style = Record<string, any>;
+
 let nextId = 1;
 const eventFns = new Map<string, () => void>();
 
@@ -154,7 +169,7 @@ function setText(e: El, text: string): void {
     scheduleFlush();
 }
 
-function setStyle(e: El, style: Record<string, any>): void {
+function setStyle(e: El, style: Style): void {
     pendingOps.push({ op: "setStyle", id: e.id, style: style });
     scheduleFlush();
 }
@@ -232,10 +247,21 @@ export type Child = El | string | number | boolean | null | undefined | Child[];
 /**
  * Hyperscript element factory — also the JSX factory (classic runtime):
  *
- *     <div padding={16}>hi {name}</div>   ⟺   h("div", { padding: 16 }, "hi ", name)
+ *     <div style={{ padding: 16 }}>hi {name}</div>
+ *         ⟺   h("div", { style: { padding: 16 } }, "hi ", name)
  *
- * props: style keys directly on the object, plus optional `onClick` and
- * `text` (for leaf text nodes). children: El | string | number | arrays.
+ * Props of an **intrinsic** (lowercase) tag — exactly three are meaningful:
+ *
+ *   style    the style object; the sole channel to the host's style engine
+ *   onClick  click handler, wired via a `setEvents` mutation
+ *   text     initial text content (equivalent to passing a string child)
+ *
+ * Anything else on an intrinsic tag is ignored: there is no flat/`style`-less
+ * spelling of a style, on purpose — one place for styling keeps a component's
+ * own props from colliding with presentation keys.
+ *
+ * A **component** (capitalised tag / function tag) is called with its props
+ * verbatim and decides for itself what to do with `style`.
  */
 export function h(tag: any, props: Record<string, any> | null, ...children: Child[]): El {
     if (typeof tag === "function") {
@@ -254,22 +280,10 @@ export function h(tag: any, props: Record<string, any> | null, ...children: Chil
         String(tag),
         props && props.text !== undefined ? String(props.text) : undefined
     );
-    if (props) {
-        const rest: Record<string, any> = {};
-        let hasStyle = false;
-        const keys = Object.keys(props);
-        for (let ki = 0; ki < keys.length; ki++) {
-            const k = keys[ki];
-            if (k === "onClick") {
-                setClick(e, props[k]);
-            } else if (k === "text") {
-                // already handled via create
-            } else {
-                rest[k] = props[k];
-                hasStyle = true;
-            }
-        }
-        if (hasStyle) setStyle(e, rest);
+    if (props !== null && props !== undefined) {
+        const style = props.style;
+        if (style !== null && style !== undefined) setStyle(e, style);
+        if (props.onClick !== null && props.onClick !== undefined) setClick(e, props.onClick);
     }
     appendChildren(e, children);
     return e;
@@ -299,8 +313,11 @@ function appendChildren(parent: El, children: any[]): void {
     }
 }
 
+/** Accepted text content: a literal, or a getter (re-run on every change). */
+export type TextSource = string | number | (() => string | number);
+
 /** A text element whose content can be reactive. */
-export function text(content: (() => string) | string, style?: Record<string, any>): El {
+export function text(content: TextSource, style?: Style): El {
     // 数字 signal 同样收敛为 string（见 setText 注释），否则 setText op
     // 携带 JSON number，host parse_op 丢弃 → 文本空白（计数器 bug 根因）。
     const e = create("text", typeof content === "function" ? "" : String(content));
@@ -358,7 +375,7 @@ function callComponent(fn: (props: any) => El, props: Record<string, any> | null
 }
 
 /** Styles applied to the implicit root container (id 0). */
-export function setRootStyle(style: Record<string, any>): void {
+export function setRootStyle(style: Style): void {
     setStyle({ id: 0 }, style);
 }
 

@@ -34,19 +34,23 @@ TypeScript/TSX 风格前端 ──esbuild──▶ 单个 IIFE JS ──内嵌�
 协议、host 侧解析全部不变：
 
 ```tsx
-<div padding={16} background={C.card}>hi {name}</div>
-// ⟺  h("div", { padding: 16, background: C.card }, "hi ", name)
+<div style={{ padding: 16, background: C.card }}>hi {name}</div>
+// ⟺  h("div", { style: { padding: 16, background: C.card } }, "hi ", name)
 ```
 
-约定（与 host 的样式映射一一对应）：
+约定：
 
 | 写法 | 含义 |
 |---|---|
-| `<div padding={16} gap={10}>` | 属性**平铺**即样式，没有 `style={{…}}` 中间层（host 的 setStyle 直接消费该对象） |
+| `style={{ padding: 16, gap: 10 }}` | **样式的唯一通道**：对象原样进 host 的 setStyle op。没有平铺写法 —— 样式集中在一处，组件的自有 props 不会和样式键撞名 |
 | `onClick={fn}` | 事件绑定（协议层目前只有 click） |
-| `<Card title="…">…</Card>` | 大写标签＝组件：`h(Card, props, …)`，children 以 `props.children` 传入 |
+| `<Card title="…">…</Card>` | 大写标签＝组件：`h(Card, props, …)`，children 以 `props.children` 传入；组件拿到 props 原样自处（含 `style`） |
 | `<></>` | Fragment：host 没有 fragment 概念，落成一个透明 flex-column 容器 |
 | `{items.map(…)}` | 数组 children 会被展平（`h` 内的 `appendChildren`） |
+
+内在标签（小写）只认 `style` / `onClick` / `text` 三个 prop，其余一律忽略。
+`globals.d.ts` 里的 `JSX.IntrinsicProps` 没有索引签名，所以把样式键写到顶层
+（`<div padding={16}>`）在编辑器里是**类型错误**而不是静默失效。
 
 每个 `.tsx` 必须 `import { h } from "./runtime"`（用 `<></>` 时再加 `Fragment`）——
 classic transform 直接引用这个标识符，不会自动注入。
@@ -121,6 +125,7 @@ cd host && cargo build
 cd ui && npm install && npm run build:qjs
 #    Perry 后端：npm run build:perry（需 PATH 有 zstd，msys2 自带）
 #    node 开发模式：node build.mjs
+#    TSX 类型检查：npm run typecheck（编辑器之外的同一套 JSX 属性约束）
 # 3. 启动（在仓库根目录；host 自动选择前端）
 host/target/release/gpui-perryts-host.exe
 ```
