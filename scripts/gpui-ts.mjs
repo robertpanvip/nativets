@@ -30,6 +30,8 @@ import { existsSync, mkdirSync, copyFileSync, statSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { pretranspileTsx } from "../ui/pretranspile-tsx.mjs";
+
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const args = process.argv.slice(2);
 
@@ -144,13 +146,16 @@ const useSizeOpt =
     process.env.PERRY_NO_SIZE_OPT !== "1" &&
     existsSync(path.join(perrySrc, "crates", "perry-runtime", "Cargo.toml"));
 
-console.log(`[gpui-ts] 1/3 perry compile ${entry} → build/${libBase}.lib (staticlib)`);
+console.log("[gpui-ts] 1/4 esbuild 预转 TSX → ui/build/gen（perry 解析器无 JSX 分支）");
+const gen = await pretranspileTsx(uiDir, path.basename(entryPath));
+
+console.log(`[gpui-ts] 2/4 perry compile ${gen.entryRel} → build/${libBase}.lib (staticlib)`);
 run(
     "npx",
     [
         "perry",
         "compile",
-        path.relative(uiDir, entryPath).replace(/\\/g, "/"),
+        gen.entryRel,
         "--output-type",
         "staticlib",
         "-o",
@@ -171,7 +176,7 @@ if (!existsSync(path.join(buildDir, `${libBase}.lib`))) {
     process.exit(1);
 }
 
-console.log("[gpui-ts] 2/3 cargo build --release（单 exe 链接：gpui + perry runtime）");
+console.log("[gpui-ts] 3/4 cargo build --release（单 exe 链接：gpui + perry runtime）");
 run("cargo", ["build", "--release", "--manifest-path", path.join(root, "host", "Cargo.toml")], {
     env: { ...process.env, PERRY_STATIC_LIB_BASE: libBase },
 });
@@ -180,5 +185,5 @@ if (!existsSync(HOST_EXE)) {
     process.exit(1);
 }
 
-console.log("[gpui-ts] 3/3 拷贝产物");
+console.log("[gpui-ts] 4/4 拷贝产物");
 emit();

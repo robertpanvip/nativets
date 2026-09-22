@@ -27,6 +27,41 @@ TypeScript/TSX 风格前端 ──esbuild──▶ 单个 IIFE JS ──内嵌�
 - 无需 react-reconciler/scheduler 等 npm 依赖，运行时约 300 行纯 TS，完全落在 Perry 支持的 TS 子集内；
 - React/Preact 路线依赖第三方 reconciler 在 Perry 下的兼容性（调度器、内部启发式），风险更高。
 
+## 前端写法：TSX
+
+前端源码是 **TSX**（`.tsx`）。JSX 在构建期由 esbuild 以 **classic transform**
+编译成运行时导出的 `h()` 工厂调用 —— JSX 纯粹是语法糖，运行时契约、mutation
+协议、host 侧解析全部不变：
+
+```tsx
+<div padding={16} background={C.card}>hi {name}</div>
+// ⟺  h("div", { padding: 16, background: C.card }, "hi ", name)
+```
+
+约定（与 host 的样式映射一一对应）：
+
+| 写法 | 含义 |
+|---|---|
+| `<div padding={16} gap={10}>` | 属性**平铺**即样式，没有 `style={{…}}` 中间层（host 的 setStyle 直接消费该对象） |
+| `onClick={fn}` | 事件绑定（协议层目前只有 click） |
+| `<Card title="…">…</Card>` | 大写标签＝组件：`h(Card, props, …)`，children 以 `props.children` 传入 |
+| `<></>` | Fragment：host 没有 fragment 概念，落成一个透明 flex-column 容器 |
+| `{items.map(…)}` | 数组 children 会被展平（`h` 内的 `appendChildren`） |
+
+每个 `.tsx` 必须 `import { h } from "./runtime"`（用 `<></>` 时再加 `Fragment`）——
+classic transform 直接引用这个标识符，不会自动注入。
+
+**JSX 在各后端如何落地**：
+
+| 后端 | 处理 |
+|---|---|
+| quickjs（默认）/ node-dev | esbuild 直接 bundle，`jsx: "transform"` + `jsxFactory: "h"` |
+| perry（对照） | perry 解析器**没有 JSX 分支**（`perry check x.tsx` 直接报 *No TypeScript files found*），故先由 esbuild 预转成 `ui/build/gen/*.ts`（不 bundle、保留 ESM 结构与 import 路径）再交给 perry——见 `ui/pretranspile-tsx.mjs` |
+
+`ui/tsconfig.json` + `ui/src/globals.d.ts` 只服务编辑器/`tsc`：前者声明
+`jsx: "react"`（classic）+ `jsxFactory: h`，后者补上宿主注入的 `process` shim 与
+全局 `JSX` 命名空间。两者都不参与构建。
+
 ## 目录结构
 
 ```
@@ -36,33 +71,37 @@ host/             Rust gpui 渲染宿主
   src/quickjs.rs    内嵌 QuickJS 引擎（默认后端）：事件循环 + process shim
   src/embedded.rs   Perry staticlib 嵌入后端（对照模式）
   build.rs          模式选择（QUICKJS_EMBED / perry staticlib 自动检测）
-ui/               TypeScript 前端
-  src/runtime.ts    Solid 风格微运行时（signals + h + Show/For + stdio transport）
-  src/app.ts        demo 应用（仪表盘）
-  build-qjs.mjs     TS → 单 IIFE JS 打包（QuickJS 后端的编译步骤）
+ui/               TSX 前端
+  src/runtime.ts    Solid 风格微运行时（signals + h/Fragment + Show/For + transport）
+  src/app.tsx       demo 应用（仪表盘，JSX 编写）
+  src/globals.d.ts  process shim / JSX 命名空间的类型声明（仅编辑器用）
+  tsconfig.json     JSX classic 变换配置（jsxFactory=h）
+  build-qjs.mjs     TSX → 单 IIFE JS 打包（QuickJS 后端的编译步骤）
   build.mjs         node 开发模式打包（esbuild）
-  build-perry.mjs   Perry 原生编译脚本（对照后端）
+  build-perry.mjs   Perry 原生编译脚本（对照后端，含 TSX 预转）
+  pretranspile-tsx.mjs  TSX → 中间 TS（perry 解析器无 JSX 分支）
 scripts/
-  gpui-ts.mjs       一键 CLI：TS → 单文件 EXE
+  gpui-ts.mjs       一键 CLI：TSX → 单文件 EXE
 build/            产物（dist/*.exe / 截图 / 协议流样本）
 ```
 
 ## 运行
 
-### 一键 CLI（gpui-ts：TS → 独立 EXE）
+### 一键 CLI（gpui-ts：TSX → 独立 EXE）
 
 ```bash
 node scripts/gpui-ts.mjs                        # 默认 ui/src/main.ts → build/dist/main.exe
-node scripts/gpui-ts.mjs app.ts -o out.exe
+node scripts/gpui-ts.mjs ui/src/main.ts -o out.exe
 node scripts/gpui-ts.mjs --backend perry        # 切历史 Perry 后端（对照）
 ```
 
-**默认（QuickJS）流程**：`esbuild` 把 TS 打包成单个 IIFE JS（`ui/dist/main.js`，
-`charset=ascii` 保证全 ASCII 转义）→ `include_str!` 编译期内嵌进 host →
+**默认（QuickJS）流程**：`esbuild` 把 TSX 打包成单个 IIFE JS（`ui/dist/main.js`，
+JSX → `h()`、`charset=ascii` 保证全 ASCII 转义）→ `include_str!` 编译期内嵌进 host →
 产出**单文件 EXE**，零 Node.js、零子进程、零 sidecar（拷到任意目录直接跑）。
 
-**`--backend perry` 流程**：`perry compile --output-type staticlib`（size-optimized
-stdlib）→ `cargo build --release` → 单文件 EXE（见下方 Perry 小节）。
+**`--backend perry` 流程**：esbuild 先把 TSX 预转成 `ui/build/gen/*.ts`（perry 解析器
+没有 JSX 分支）→ `perry compile --output-type staticlib`（size-optimized stdlib）→
+`cargo build --release` → 单文件 EXE（见下方 Perry 小节）。
 
 产物运行时可切传输（**同一个 exe 两种都支持**，见「内嵌 QuickJS 运行时层」）：
 
@@ -99,7 +138,7 @@ host/target/release/gpui-perryts-host.exe
 只换掉「谁的 JS 引擎在跑前端」，顺手甩掉 Perry 路线的一串怪病。
 
 ```
-ui/src/*.ts ──esbuild(IIFE, charset=ascii)──▶ ui/dist/main.js ──include_str!──▶ 编进 exe
+ui/src/*.tsx ──esbuild(IIFE, jsx→h, charset=ascii)──▶ ui/dist/main.js ──include_str!──▶ 编进 exe
                                                                                     │
                     QuickJS 独立线程（自驱 tick：microtask → timers → 事件派发） ◀────┘
                                     │   ▲
@@ -276,7 +315,8 @@ npm run build:perry            # PERRY_NO_SIZE_OPT=1 可跳过
 两个进程可以合一个：perry 支持 `--output-type staticlib`（上游 #1088），
 TS 前端编译成静态库，链入 gpui host。
 
-- `npx perry compile src/main.ts --output-type staticlib -o ../build/perry-app-static.lib`
+- `node ui/pretranspile-tsx.mjs` 等价步骤已内建：`npx perry compile build/gen/main.ts
+  --output-type staticlib -o ../build/perry-app-static.lib`（`build/gen` = esbuild 预转的 TSX）
   → **947KB** 纯 app 对象；入口 `void perry_module_init()`（无 main，无内嵌事件循环）
 - host 侧调用序列（已验证，见 `build/embed-proto/`）：
   1. 建 3 组匿名 pipe（in/out/err），在**任何 std 使用前** `SetStdHandle` 重定向

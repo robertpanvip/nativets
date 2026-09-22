@@ -390,6 +390,9 @@ impl Engine {
         for (k, v) in std::env::vars() {
             let _ = env.set(k, v);
         }
+        // Engine marker for the frontend: the app reports it in the status bar
+        // ("frontend: <engine>"). Perry/node runs see the ambient env instead.
+        let _ = env.set("GPUI_TS_ENGINE", "quickjs");
         let _ = process.set("env", env);
 
         let argv = Array::new(ctx.clone()).unwrap();

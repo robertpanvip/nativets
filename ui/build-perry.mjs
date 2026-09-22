@@ -1,4 +1,9 @@
-// Perry 原生编译脚本：把 TS 前端编译成原生可执行文件（不含 Node/V8）。
+// Perry 原生编译脚本：把 TSX 前端编译成原生可执行文件（不含 Node/V8）。
+//
+// TSX 前置步骤：perry 0.5.1520 的解析器没有 JSX 分支（`perry check x.tsx`
+// 直接报 "No TypeScript files found"），所以源码先过 esbuild 做纯语法降级
+// （JSX → h() 调用、擦类型、保留 ESM 结构），产物落 ui/build/gen/*.ts，
+// 再交给 perry 编译 —— 见 pretranspile-tsx.mjs。
 //
 // 绕过 perry 0.5.1520 在 Windows 上的两个已知问题：
 // 1) PERRY_RS4GC=0 —— RS4GC stackmap 生成的 .seh_* 指令会被 perry 自带汇编器
@@ -19,6 +24,8 @@ import { existsSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { pretranspileTsx } from "./pretranspile-tsx.mjs";
+
 const uiDir = path.dirname(fileURLToPath(import.meta.url));
 const libDir = path.join(uiDir, "node_modules", "@perryts", "perry-win32-x64", "lib");
 
@@ -30,7 +37,10 @@ const out =
     process.argv[2] && !process.argv[2].startsWith("--")
         ? process.argv[2]
         : path.join("..", "build", staticlib ? "perry-app-static" : "perry-app");
-const compileArgs = ["perry", "compile", "src/main.ts", "-o", out];
+
+console.log("[perry] TSX 预转译 → build/gen（esbuild，仅去 JSX/类型）");
+const gen = await pretranspileTsx(uiDir, "main.ts");
+const compileArgs = ["perry", "compile", gen.entryRel, "-o", out];
 if (staticlib) compileArgs.push("--output-type", "staticlib");
 
 if (!existsSync(path.join(libDir, "perry_runtime.lib"))) {

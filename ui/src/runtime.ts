@@ -220,13 +220,38 @@ export function createEffect(fn: () => void): void {
 // ---------------------------------------------------------------------------
 
 /**
- * Hyperscript element factory.
- * props: style keys directly on the object, plus optional `onClick` and
- * `text` (for leaf text nodes). children: El | string | number.
+ * JSX fragment marker. The classic runtime rewrites `<></>` to
+ * `h(Fragment, null, …)`, so this only has to be identity-comparable —
+ * a plain string keeps it free of any Symbol/runtime dependency.
  */
-export function h(tag: string, props: Record<string, any> | null, ...children: any[]): El {
+export const Fragment = "#fragment";
+
+/** Anything allowed as a JSX child (also accepted by `h`). */
+export type Child = El | string | number | boolean | null | undefined | Child[];
+
+/**
+ * Hyperscript element factory — also the JSX factory (classic runtime):
+ *
+ *     <div padding={16}>hi {name}</div>   ⟺   h("div", { padding: 16 }, "hi ", name)
+ *
+ * props: style keys directly on the object, plus optional `onClick` and
+ * `text` (for leaf text nodes). children: El | string | number | arrays.
+ */
+export function h(tag: any, props: Record<string, any> | null, ...children: Child[]): El {
+    if (typeof tag === "function") {
+        // `<Card …>…</Card>` — a capitalised tag is a component, called with
+        // its props (children merged into `props.children`).
+        return callComponent(tag, props, children);
+    }
+    if (tag === Fragment) {
+        // `<></>` — GPUI has no fragment, so a transparent flex-column box stands in.
+        const frag = create("div");
+        setStyle(frag, { flexDirection: "column" });
+        appendChildren(frag, children);
+        return frag;
+    }
     const e = create(
-        tag,
+        String(tag),
         props && props.text !== undefined ? String(props.text) : undefined
     );
     if (props) {
@@ -246,19 +271,32 @@ export function h(tag: string, props: Record<string, any> | null, ...children: a
         }
         if (hasStyle) setStyle(e, rest);
     }
+    appendChildren(e, children);
+    return e;
+}
+
+/**
+ * Mount JSX children in order. Arrays are flattened — `<div>{items.map(…)}</div>`
+ * hands the factory one array argument per interpolation, and a raw array would
+ * otherwise be pushed to the host as if it were an element.
+ */
+function appendChildren(parent: El, children: any[]): void {
     for (let ci = 0; ci < children.length; ci++) {
         const c = children[ci];
-        if (c === null || c === undefined || c === false) continue;
+        if (c === null || c === undefined || c === false || c === true) continue;
+        if (Array.isArray(c)) {
+            appendChildren(parent, c);
+            continue;
+        }
         if (typeof c === "string" || typeof c === "number") {
             // NOTE: 不能写成 appendChild(e, create(...)) —— perry 0.5.1520 下
             // 该形态生成的 append op 会丢 id（node 正常）。先绑定局部变量。
             const t = create("text", String(c));
-            appendChild(e, t);
+            appendChild(parent, t);
         } else {
-            appendChild(e, c as El);
+            appendChild(parent, c as El);
         }
     }
-    return e;
 }
 
 /** A text element whose content can be reactive. */
@@ -299,6 +337,24 @@ export function For<T>(items: () => T[], render: (item: T, index: number) => El)
         }
     });
     return container;
+}
+
+/**
+ * Invoke a JSX component: props are shallow-copied (the caller's object may be
+ * a shared literal) and JSX children are handed over as `props.children`.
+ */
+function callComponent(fn: (props: any) => El, props: Record<string, any> | null, children: Child[]): El {
+    const merged: Record<string, any> = {};
+    if (props !== null && props !== undefined) {
+        const keys = Object.keys(props);
+        for (let i = 0; i < keys.length; i++) merged[keys[i]] = props[keys[i]];
+    }
+    if (children.length === 1) {
+        merged.children = children[0];
+    } else if (children.length > 1) {
+        merged.children = children;
+    }
+    return fn(merged);
 }
 
 /** Styles applied to the implicit root container (id 0). */

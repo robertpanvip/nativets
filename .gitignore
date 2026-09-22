@@ -13,6 +13,8 @@ build/node_modules/
 # ---------- generated frontend bundles ----------
 ui/dist/
 build/dist/
+# esbuild 预转的 TS（perry 不解析 JSX，见 ui/pretranspile-tsx.mjs）
+ui/build/
 
 # ---------- native build artifacts ----------
 *.exe
@@ -20,6 +22,7 @@ build/dist/
 *.exp
 *.pdb
 *.obj
+*.o
 *.dll
 *.dylib
 *.so

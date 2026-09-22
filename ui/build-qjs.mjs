@@ -35,6 +35,12 @@ await build({
     bundle: true,
     format: "iife",
     target: "es2020",
+    // JSX is sugar for the runtime's `h()` factory (classic transform):
+    //   <div padding={16}>hi</div>  →  h("div", { padding: 16 }, "hi")
+    // A `.tsx` file must import `h` (and `Fragment` if it uses `<></>`).
+    jsx: "transform",
+    jsxFactory: "h",
+    jsxFragment: "Fragment",
     // charset: "ascii" escapes EVERY non-ASCII code point to \uXXXX — including
     // U+00D7 (×), which esbuild otherwise emits as a lone 0xD7 byte (invalid
     // UTF-8). The embedded QuickJS parser is strict about UTF-8 and rejects the

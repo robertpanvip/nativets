@@ -140,6 +140,74 @@ build/dist/main.exe --transport=direct        # 默认
 未知取值只警告并回落到 `direct`，不会拒绝启动。宿主两条路径共用同一个
 `main.rs::ingest_line`，所以载体不同不可能漂移出两套协议方言。
 
+## JSX / TSX 前端（2026-09-22 深夜）
+
+目标：「现在 TS 端还不是 TSX，我期望是 TSX」。JSX 只在**构建期**展开成运行时已有的
+`h()` 工厂，所以协议层、host、tree.rs 全部零改动：
+
+```
+<div padding={16}>hi {n}</div>
+  --esbuild(jsx: transform, jsxFactory: h)-->  h("div", { padding: 16 }, "hi ", n)
+```
+
+### runtime.ts 为 JSX 补的三件事
+
+| 新增 | 作用 |
+|---|---|
+| `Fragment`（字符串哨兵 `"#fragment"`） | `<></>` → `h(Fragment, null, …)`；host 没有 fragment 概念，落成透明 flex-column 容器 |
+| `h()` 的**函数 tag 分支** | 大写标签＝组件：`<Card title/>` → `h(Card, props, …)` → `Card({…props, children})` |
+| `appendChildren()`（递归展平数组） | `{items.map(…)}` 是把数组当**一个实参**交给工厂的，原来会被整块 append 给 host |
+
+`h()` 对元素节点的既有语义**完全没动**（props 平铺进 setStyle、`onClick` → setEvents、
+字符串 children → 子 text 节点），所以 JSX 版与手写 `h()` 版逐节点等价。
+
+### `app.ts` → `app.tsx`
+
+整份重写为 JSX 并顺手组件化（`Card` / `StatCard` / `PillBtn` / `NavItem` / `TaskRow` /
+`Header` / `Sidebar` …）：既贴近 TSX 习惯，也把嵌套压浅一层——perry 对实参位置的多层调用
+敏感（见「坑 #3」），组件化正好把调用链摊平。`App()` 里挂载用的 JSX 先绑局部变量再传参。
+
+### perry 后端：多一步预转（perry 0.5.1520 解析器没有 JSX 分支）
+
+`perry check src/app.tsx` 直接回 **"No TypeScript files found"**——入口只认 `.ts`，
+解析器也没有 JSX 分支。于是 perry 路径加了一步 `ui/pretranspile-tsx.mjs`：
+
+```bash
+# esbuild：不 bundle、保留 ESM 结构与 import 说明符（"./runtime" 原样保留），
+#          JSX → h()、擦类型、charset=ascii，产物落 ui/build/gen/*.ts
+npx esbuild <src/*.ts|tsx 全量> --outdir=ui/build/gen --format=esm \
+    --jsx=transform --jsx-factory=h --jsx-fragment=Fragment \
+    --charset=ascii --out-extension:.js=.ts
+# 再交给 perry（入口形态与以前完全一致）
+npx perry compile build/gen/main.ts --output-type staticlib -o ../build/app-main
+```
+
+两个易错点：
+1. **必须显式列出所有源文件**——`bundle: false` 时 esbuild 不跟随 import，只转点名的文件；
+   目录扫描要排除 `*.d.ts`（纯声明，不应产出）。
+2. 输出用 `outExtension: { ".js": ".ts" }` 改回 `.ts`，否则 perry 的入口校验不认。
+
+### 编辑器支持（不参与构建）
+
+`ui/tsconfig.json`（`jsx: "react"` classic + `jsxFactory: h` + `jsxFragmentFactory: Fragment`）
+与 `ui/src/globals.d.ts`（宿主 `process` shim 的最小声明 + 全局 `JSX` 命名空间）只为编辑器 /
+`tsc` 服务——esbuild、perry 都不读它们，项目也刻意不引 `@types/node`。
+
+### 验收
+
+| 项 | 结果 |
+|---|---|
+| QuickJS 后端 | `node scripts/gpui-ts.mjs` → **11.0MB** exe；UI 与改造前一致；点 `+` 计数 0→2；点「日志」导航高亮 + footer 同步为 `navigation: 日志` |
+| Perry 后端 | `--backend perry`：esbuild 预转 → perry staticlib → **15.7MB** exe；UI 一致；连点 `+` 两下 → 计数 **2** |
+| perry 静态检查 | `perry check build/gen` → All checks passed（3 files） |
+| 体积 / 延迟 | 与改造前一致（JSX 是编译期糖，运行时零开销） |
+
+> **截图读数教训**：Read 工具显示的图片是**缩放后**的，凭目测读坐标会严重错位（本次
+> 把 1180×760 的窗口看成约 660 宽，第一次点击落到了导航栏上）。要拿真实坐标请用像素
+> 扫描（`build/scan-row.py` / `build/find-block.py`），并用 `GetWindowRect` +
+> `ClientToScreen` 把点击换算成**客户区相对坐标**（`build/winclick.py`）——这样窗口被
+> 遮挡、被移动后点击依然落得准。
+
 ## 验收（C1-C7 全绿）
 
 | 项 | 判据 | 实测 |
