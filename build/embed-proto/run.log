@@ -1,0 +1,32 @@
+== pre-wrote stdin probe: {"t":"event","target":9,"kind":"click","ts":1790012170005}== calling perry_module_init()
+[1790012170019] {"t":"hello","proto":1,"title":"PerryTS × GPUI"}
+== perry_module_init() done in 100.4435ms
+== host -> perry: {"t":"event","target":9,"kind":"click","ts":1790012170106}== poll#10 microtasks=1 has_work=1 next_wake_ms=9.0
+== host -> perry: {"t":"event","target":9,"kind":"click","ts":1790012170212}== poll#20 microtasks=1 has_work=1 next_wake_ms=9.0
+== host -> perry: {"t":"event","target":9,"kind":"click","ts":1790012170316}== poll#30 microtasks=1 has_work=1 next_wake_ms=9.0
+== host -> perry: {"t":"event","target":9,"kind":"click","ts":1790012170419}== poll#40 microtasks=1 has_work=1 next_wake_ms=6.0
+== poll#50 microtasks=1 has_work=1 next_wake_ms=9.0
+== poll#60 microtasks=1 has_work=1 next_wake_ms=9.0
+== poll#70 microtasks=1 has_work=1 next_wake_ms=9.0
+== poll#80 microtasks=1 has_work=1 next_wake_ms=9.0
+== poll#90 microtasks=1 has_work=1 next_wake_ms=9.0
+== poll#100 microtasks=1 has_work=1 next_wake_ms=9.0
+== poll#110 microtasks=1 has_work=1 next_wake_ms=9.0
+== poll#120 microtasks=1 has_work=1 next_wake_ms=9.0
+== poll#130 microtasks=1 has_work=1 next_wake_ms=9.0
+== poll#140 microtasks=1 has_work=1 next_wake_ms=9.0
+== poll#150 microtasks=1 has_work=1 next_wake_ms=9.0
+== poll#160 microtasks=1 has_work=1 next_wake_ms=9.0
+== poll#170 microtasks=1 has_work=1 next_wake_ms=9.0
+== poll#180 microtasks=1 has_work=1 next_wake_ms=9.0
+== poll#190 microtasks=1 has_work=1 next_wake_ms=9.0
+== poll#200 microtasks=1 has_work=1 next_wake_ms=9.0
+== poll#210 microtasks=1 has_work=1 next_wake_ms=9.0
+== poll#220 microtasks=1 has_work=1 next_wake_ms=9.0
+== poll#230 microtasks=1 has_work=1 next_wake_ms=9.0
+== poll#240 microtasks=1 has_work=1 next_wake_ms=9.0
+== poll#250 microtasks=1 has_work=1 next_wake_ms=9.0
+== poll#260 microtasks=1 has_work=1 next_wake_ms=9.0
+== poll#270 microtasks=1 has_work=1 next_wake_ms=9.0
+== poll#280 microtasks=1 has_work=1 next_wake_ms=0.0
+== proto done

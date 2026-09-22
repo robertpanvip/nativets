@@ -1,0 +1,28 @@
+[host] embedded mode: perry staticlib in-process
+[host] perry_module_init done in 16.9041ms
+[host] frontend hello: {"t":"hello","proto":1,"title":"PerryTS × GPUI"}
+[host] window opened
+[host] click id=33 t=1790079844698
+[host] ev write: {"t":"event","target":33,"kind":"click"}
+[host] click id=55 t=1790079877354
+[host] ev write: {"t":"event","target":55,"kind":"click"}
+[host] click id=77 t=1790079878249
+[host] ev write: {"t":"event","target":77,"kind":"click"}
+[host] click id=63 t=1790079879377
+[host] ev write: {"t":"event","target":63,"kind":"click"}
+[host] click id=102 t=1790079880729
+[host] ev write: {"t":"event","target":102,"kind":"click"}
+[host] click id=117 t=1790079881697
+[host] ev write: {"t":"event","target":117,"kind":"click"}
+[host] click id=127 t=1790079882697
+[host] ev write: {"t":"event","target":127,"kind":"click"}
+[host] click id=63 t=1790079883755
+[host] ev write: {"t":"event","target":63,"kind":"click"}
+[host] click id=11 t=1790079886193
+[host] ev write: {"t":"event","target":11,"kind":"click"}
+[host] click id=138 t=1790079886745
+[host] ev write: {"t":"event","target":138,"kind":"click"}
+[host] click id=150 t=1790079887154
+[host] ev write: {"t":"event","target":150,"kind":"click"}
+[host] click id=162 t=1790079887545
+[host] ev write: {"t":"event","target":162,"kind":"click"}

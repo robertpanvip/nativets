@@ -1,0 +1,39 @@
+# ---------- Rust / host ----------
+**/target/
+host/target/
+host/target-noembed/
+build/embed-proto/target/
+Cargo.lock.bak
+
+# ---------- Node / ui ----------
+node_modules/
+ui/node_modules/
+build/node_modules/
+
+# ---------- generated frontend bundles ----------
+ui/dist/
+build/dist/
+
+# ---------- native build artifacts ----------
+*.exe
+*.lib
+*.exp
+*.pdb
+*.obj
+*.dll
+*.dylib
+*.so
+*.a
+*.wasm
+*.staticlib
+
+# ---------- agent / editor state ----------
+.workbuddy/
+.vscode/
+.idea/
+*.swp
+
+# ---------- os junk ----------
+.DS_Store
+Thumbs.db
+desktop.ini

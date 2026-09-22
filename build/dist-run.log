@@ -1,0 +1,4 @@
+[host] embedded mode: perry staticlib in-process
+[host] perry_module_init done in 17.2008ms
+[host] frontend hello: {"t":"hello","proto":1,"title":"PerryTS × GPUI"}
+[host] window opened

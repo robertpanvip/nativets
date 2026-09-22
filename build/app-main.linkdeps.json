@@ -1,0 +1,16 @@
+{
+  "archive": "\\\\?\\E:\\AI-workspace\\gpui-perryts\\build\\app-main.lib",
+  "entry_symbol": "perry_module_init",
+  "link_archives": [
+    {
+      "path": "\\\\?\\E:\\AI-workspace\\perry-src\\target\\perry-auto-916b20dd8314eb8d\\x86_64-pc-windows-msvc\\release\\perry_runtime.lib",
+      "role": "runtime"
+    },
+    {
+      "path": "\\\\?\\E:\\AI-workspace\\perry-src\\target\\perry-auto-916b20dd8314eb8d\\x86_64-pc-windows-msvc\\release\\perry_stdlib.lib",
+      "role": "stdlib"
+    }
+  ],
+  "target": "native",
+  "version": 1
+}

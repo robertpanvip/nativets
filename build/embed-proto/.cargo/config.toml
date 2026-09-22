@@ -1,0 +1,5 @@
+# perry_runtime.lib 自带一份 Rust std（含 rust_eh_personality 等单一符号），
+# 与宿主 Rust std 冲突。两份定义功能等价，用 /FORCE:MULTIPLE 取第一份。
+# 正式集成 gpui host 时沿用。
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "link-arg=/FORCE:MULTIPLE"]

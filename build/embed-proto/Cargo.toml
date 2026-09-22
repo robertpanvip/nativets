@@ -1,0 +1,10 @@
+[package]
+name = "embed-proto"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+
+[[bin]]
+name = "embed-proto"
+path = "src/main.rs"

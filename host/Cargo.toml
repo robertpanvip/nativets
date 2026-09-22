@@ -1,0 +1,16 @@
+[package]
+name = "gpui-perryts-host"
+version = "0.1.0"
+edition = "2024"
+description = "GPUI render host for PerryTS-compiled TypeScript frontends (mutation protocol over stdio)"
+
+[dependencies]
+gpui-pre = { version = "=0.3.3" }
+gpui-pre-platform = { version = "=0.3.3" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+async-channel = "2"
+rquickjs = { version = "0.14.0", features = ["std"] }
+
+[profile.dev]
+opt-level = 1
