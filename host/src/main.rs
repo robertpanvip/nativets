@@ -1,18 +1,28 @@
-//! gpui-perryts host
+//! nativets host — TypeScript frontend, native GPUI rendering.
 //!
-//! Architecture (two interchangeable transports, same JSONL protocol):
+//! One JSONL mutation protocol, three frontend topologies:
 //!
-//!   TypeScript/TSX frontend --Perry--> native binary   (child-process mode)
-//!   TypeScript/TSX frontend --Perry--> staticlib       (embedded mode)
+//! ```text
+//!   TypeScript/TSX frontend --Perry--> native binary   (child process)
+//!   TypeScript/TSX frontend --Perry--> staticlib       (embedded, perry runtime)
+//!   TypeScript/TSX frontend --esbuild-> JS bundle      (embedded, QuickJS runtime)
 //!        |                                        |  JSONL mutation protocol
 //!        v                                        v
-//!   React/Solid-style code              this host: retained tree -> GPUI (GPU)
+//!   Solid-style reactive code         this host: retained tree -> GPUI (GPU)
+//! ```
 //!
 //! Child mode spawns the frontend process and pipes its stdio. Embedded mode
 //! (cfg `embedded`, enabled by build.rs when perry staticlibs are present)
 //! links the frontend INTO this process: stdio is redirected into anonymous
 //! pipes, `perry_module_init()` runs the TS top level, and the host drives
 //! Perry's event loop with `perry_poll()` (upstream #1088).
+//!
+//! QuickJS mode (cfg `quickjs`, the default) links `rquickjs` instead and runs
+//! the bundle on a dedicated engine thread. Being in-process, it can carry the
+//! protocol two ways — `Transport::Direct` injects `__hostEmit` into the JS
+//! context and pushes events straight into the engine queue, while
+//! `Transport::Pipe` keeps the historical stdio carrier (see `quickjs.rs`).
+//! Both funnel through `ingest_line` below, so they cannot drift apart.
 
 mod tree;
 
@@ -84,6 +94,15 @@ fn log_line(s: &str) {
 
 macro_rules! log {
     ($($arg:tt)*) => { log_line(&format!($($arg)*)) };
+}
+
+/// Epoch milliseconds, aligned with the frontend's `Date.now()` so host and
+/// frontend trace lines can be paired directly to measure interaction latency.
+pub(crate) fn now_ms() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0)
 }
 
 // ---------------------------------------------------------------------------
@@ -272,11 +291,7 @@ impl HostView {
             s = s.on_click(cx.listener(move |this, _ev: &ClickEvent, _window, _cx| {
                 let msg = json!({ "t": "event", "target": id, "kind": "click" }).to_string();
                 // C3 latency: epoch ms aligned with the frontend's Date.now()
-                let now_ms = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_millis())
-                    .unwrap_or(0);
-                log!("[host] click id={id} t={now_ms}");
+                log!("[host] click id={id} t={}", now_ms());
                 let _ = this.event_tx.send(msg);
             }));
         }
@@ -305,6 +320,39 @@ impl Render for HostView {
 // writer ships event lines. `hello` lines are diagnostics only.
 // ---------------------------------------------------------------------------
 
+/// Parse one protocol line and hand the resulting batch to the UI.
+///
+/// This is THE protocol dialect — every carrier funnels through it, so the
+/// pipe transport (`run_ops_reader`) and the injected transport (the QuickJS
+/// `__hostEmit` host function) can never drift apart.
+pub(crate) fn ingest_line(line: &str, ops_tx: &async_channel::Sender<Vec<Op>>) {
+    let Ok(v) = serde_json::from_str::<Value>(line) else {
+        return;
+    };
+    match v.get("t").and_then(|t| t.as_str()) {
+        Some("hello") => {
+            log!("[host] frontend hello: {line}");
+        }
+        Some("batch") => {
+            if let Some(ops) = v.get("ops").and_then(|o| o.as_array()) {
+                let total = ops.len();
+                let parsed: Vec<Op> = ops.iter().filter_map(tree::parse_op).collect();
+                if parsed.len() != total {
+                    // 协议层告警：parse_op 静默丢弃说明前端发了不合法的 op
+                    log!(
+                        "[host] WARNING batch dropped {}/{} ops: {}",
+                        total - parsed.len(),
+                        total,
+                        line
+                    );
+                }
+                let _ = ops_tx.send_blocking(parsed);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn run_ops_reader<R: std::io::Read + Send + 'static>(
     r: R,
     ops_tx: async_channel::Sender<Vec<Op>>,
@@ -313,29 +361,7 @@ fn run_ops_reader<R: std::io::Read + Send + 'static>(
         let reader = BufReader::new(r);
         for line in reader.lines() {
             let Ok(line) = line else { break };
-            let Ok(v) = serde_json::from_str::<Value>(&line) else { continue };
-            match v.get("t").and_then(|t| t.as_str()) {
-                Some("hello") => {
-                    log!("[host] frontend hello: {line}");
-                }
-                Some("batch") => {
-                    if let Some(ops) = v.get("ops").and_then(|o| o.as_array()) {
-                        let total = ops.len();
-                        let parsed: Vec<Op> = ops.iter().filter_map(tree::parse_op).collect();
-                        if parsed.len() != total {
-                            // 协议层告警：parse_op 静默丢弃说明前端发了不合法的 op
-                            log!(
-                                "[host] WARNING batch dropped {}/{} ops: {}",
-                                total - parsed.len(),
-                                total,
-                                line
-                            );
-                        }
-                        let _ = ops_tx.send_blocking(parsed);
-                    }
-                }
-                _ => {}
-            }
+            ingest_line(&line, &ops_tx);
         }
         log!("[host] frontend stream closed");
     });
@@ -344,11 +370,28 @@ fn run_ops_reader<R: std::io::Read + Send + 'static>(
 fn run_event_writer<W: std::io::Write + Send + 'static>(mut w: W, ev_rx: mpsc::Receiver<String>) {
     std::thread::spawn(move || {
         for msg in ev_rx {
-            log!("[host] ev write: {msg}");
+            log!("[host] ev write t={}: {msg}", now_ms());
             if writeln!(w, "{msg}").and_then(|_| w.flush()).is_err() {
                 log!("[host] ev write FAILED (frontend stdin closed?)");
                 break;
             }
+        }
+    });
+}
+
+/// Injected transport (QuickJS `Direct` mode): hand each event straight to the
+/// engine's inbound queue and unpark its tick.
+///
+/// Compared with `run_event_writer` this drops a pipe write, a blocking read,
+/// a line split and a UTF-8 decode — and because `push` unparks the engine,
+/// dispatch happens immediately instead of on the next 10ms tick.
+#[cfg(quickjs)]
+fn run_event_injector(sink: quickjs::EventSink, ev_rx: mpsc::Receiver<String>) {
+    std::thread::spawn(move || {
+        log!("[host] event injector up");
+        for msg in ev_rx {
+            log!("[host] ev inject t={}: {msg}", now_ms());
+            sink.push(msg);
         }
     });
 }
@@ -366,11 +409,45 @@ enum Frontend {
     Embedded,
     /// QuickJS engine linked into this process (build.rs cfg=quickjs).
     #[cfg(quickjs)]
-    QuickJs,
+    QuickJs { transport: quickjs::Transport },
+}
+
+/// Transport selection: `--transport pipe|direct` wins over
+/// `GPUI_TS_TRANSPORT=pipe|direct`, default `direct`.
+#[cfg(quickjs)]
+fn transport_from_args() -> quickjs::Transport {
+    let mut it = std::env::args().skip(1);
+    while let Some(a) = it.next() {
+        if a == "--transport" {
+            if let Some(v) = it.next() {
+                return quickjs::Transport::parse(&v);
+            }
+        }
+        if let Some(v) = a.strip_prefix("--transport=") {
+            return quickjs::Transport::parse(v);
+        }
+    }
+    quickjs::Transport::from_env()
+}
+
+/// First positional argv (skipping transport flags), i.e. the frontend to run.
+fn positional_arg() -> Option<String> {
+    let mut it = std::env::args().skip(1);
+    while let Some(a) = it.next() {
+        if a == "--transport" {
+            let _ = it.next();
+            continue;
+        }
+        if a.starts_with("--transport=") {
+            continue;
+        }
+        return Some(a);
+    }
+    None
 }
 
 fn resolve_frontend() -> Frontend {
-    if let Some(arg) = std::env::args().nth(1) {
+    if let Some(arg) = positional_arg() {
         if arg.ends_with(".js") {
             return Frontend::Child { cmd: "node".to_string(), args: vec![arg] };
         }
@@ -378,7 +455,7 @@ fn resolve_frontend() -> Frontend {
     }
     #[cfg(quickjs)]
     {
-        return Frontend::QuickJs;
+        return Frontend::QuickJs { transport: transport_from_args() };
     }
     #[cfg(embedded)]
     {
@@ -483,20 +560,35 @@ fn main() {
             });
         }
         #[cfg(quickjs)]
-        Frontend::QuickJs => {
-            log!("[host] quickjs mode: embedded QuickJS engine");
-            let (ef, out_r) = quickjs::launch(quickjs::save_original_stderr());
+        Frontend::QuickJs { transport } => {
+            log!("[host] quickjs mode: embedded QuickJS engine (transport={transport:?})");
+            let host = quickjs::launch(quickjs::save_original_stderr(), transport, ops_tx.clone());
             log!("[host] quickjs engine booted in {:?}", t_start.elapsed());
 
-            run_event_writer(ef, ev_rx);
-            run_ops_reader(out_r, ops_tx);
+            // Pipe mode is byte-for-byte the historical path (kept as the
+            // regression baseline and the remote-debug path). Direct mode skips
+            // stdio entirely and is delivered through the injected sink.
+            if transport == quickjs::Transport::Pipe {
+                run_event_writer(
+                    host.frontend.expect("pipe transport: stdin handle"),
+                    ev_rx,
+                );
+                run_ops_reader(host.out_r.expect("pipe transport: stdout reader"), ops_tx);
+            } else {
+                run_event_injector(host.sink.clone(), ev_rx);
+            }
 
+            let sink = host.sink.clone();
             application().run(move |cx: &mut App| {
                 let handle = open_host_window(cx, ev_tx);
                 spawn_ops_apply(cx, handle, ops_rx);
-                // The QuickJS engine self-drives on its own thread (10ms tick);
-                // no perry_poll loop needed here.
+                // The QuickJS engine self-drives on its own thread (tick +
+                // park/unpark); no perry_poll loop needed here.
             });
+
+            // Window closed → let the app's stdin `end` handler run (it calls
+            // process.exit). Best-effort: the engine owns the exit.
+            sink.close();
         }
     }
 }

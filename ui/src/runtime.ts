@@ -1,9 +1,13 @@
 /**
- * gpui-perryts runtime — TypeScript side.
+ * nativets runtime — TypeScript side.
  *
  * A tiny Solid-style reactive runtime that emits element mutations to the
- * GPUI host over stdio (JSONL). Zero npm dependencies, conservative TS
- * subset — Perry-compilable by design:
+ * GPUI host, carrying the JSONL protocol over one of two interchangeable
+ * transports (chosen by the host at runtime, see `writeLine` below):
+ *   - injected host function (`__hostEmit`) when the engine is in-process
+ *   - JSONL over stdio for out-of-process frontends
+ *
+ * Zero npm dependencies, conservative TS subset — Perry-compilable by design:
  *   - no try/catch  (PERRY_RS4GC refuses WinEH funclet pads on Windows, #7354)
  *   - no for...of   (lowers to iterator close = try/finally shape)
  *   - no Proxy / generators / structuredClone
@@ -14,7 +18,7 @@
  *   Show(cond, render) / For(items, render)   control flow
  *
  * Every state change becomes a minimal mutation batch, so only what actually
- * changed crosses the stdio boundary.
+ * changed crosses the transport boundary.
  */
 
 // ---------------------------------------------------------------------------
@@ -54,7 +58,28 @@ function flush(): void {
     writeLine(JSON.stringify({ t: "batch", ops: ops }));
 }
 
+/**
+ * 出站传输：宿主在**运行时**决定走哪条路，前端只做特性探测，因此同一个
+ * bundle 同时适配两种传输（切传输不需要重新编译）。
+ *
+ *   __hostEmit 存在  → 宿主注入的原生函数（QuickJS `direct` 模式）：
+ *                      batch 行直接进宿主的 ops 通道，没有管道、没有行缓冲
+ *   __hostEmit 不存在 → JSONL over stdout（子进程 / Perry / `pipe` 模式）
+ *
+ * 用 `typeof` 探测而不是直接读：对未声明的全局名 `typeof` 永不抛错。
+ */
+const hostEmit: ((line: string) => void) | null = (function (): ((line: string) => void) | null {
+    if (typeof globalThis === "undefined") return null;
+    const g: any = globalThis;
+    if (typeof g.__hostEmit === "function") return g.__hostEmit;
+    return null;
+})();
+
 function writeLine(line: string): void {
+    if (hostEmit !== null) {
+        hostEmit(line);
+        return;
+    }
     process.stdout.write(line + "\n");
 }
 

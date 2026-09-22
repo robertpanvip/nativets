@@ -58,7 +58,13 @@ mod perry {
     unsafe extern "C" {
         pub fn perry_module_init();
         pub fn perry_poll() -> i32;
+        // Kept declared for the full perry C-ABI surface: `perry_has_work` /
+        // `perry_next_wake_ms` let a host decide whether to sleep or spin
+        // (we always poll on a fixed 10ms timer instead), so they are unused
+        // but worth keeping documented next to the ones we do call.
+        #[allow(dead_code)]
         pub fn perry_has_work() -> i32;
+        #[allow(dead_code)]
         pub fn perry_next_wake_ms() -> f64;
         /// The stdlib pump body (async_bridge: promise resolutions + readline
         /// / fs / ws / http event dispatch). In child-process mode perry's own
@@ -100,6 +106,9 @@ impl std::io::Write for EmbeddedFrontend {
     }
 }
 impl EmbeddedFrontend {
+    /// Kept API-parallel with `QuickJsFrontend`; the event writer goes through
+    /// the `Write` impl above, so this is unused today.
+    #[allow(dead_code)]
     pub fn write_line(&self, line: &str) -> std::io::Result<()> {
         let mut f = unsafe { File::from_raw_handle(self.stdin) };
         let r = f.write_all(line.as_bytes()).and_then(|_| f.write_all(b"\n"));

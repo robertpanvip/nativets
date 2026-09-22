@@ -64,6 +64,15 @@ node scripts/gpui-ts.mjs --backend perry        # 切历史 Perry 后端（对�
 **`--backend perry` 流程**：`perry compile --output-type staticlib`（size-optimized
 stdlib）→ `cargo build --release` → 单文件 EXE（见下方 Perry 小节）。
 
+产物运行时可切传输（**同一个 exe 两种都支持**，见「内嵌 QuickJS 运行时层」）：
+
+```bash
+build/dist/main.exe                      # direct（默认）：宿主注入通信函数
+build/dist/main.exe --transport=pipe     # pipe：stdio 管道（历史基线 / 排障）
+GPUI_TS_TRANSPORT=pipe build/dist/main.exe   # 等价的环境变量写法
+PERRY_UI_TRACE=1 build/dist/main.exe     # 打开前端 trace（写 stderr，不进协议流）
+```
+
 ### 双进程开发模式
 
 ```bash
@@ -90,26 +99,56 @@ host/target/release/gpui-perryts-host.exe
 只换掉「谁的 JS 引擎在跑前端」，顺手甩掉 Perry 路线的一串怪病。
 
 ```
-ui/src/*.ts ──esbuild(IIFE)──▶ ui/dist/main.js ──include_str!──▶ 编进 exe
-                                                                     │
-                        QuickJS 独立线程（10ms 自驱 tick） ──JSONL──▶ tree.rs ──▶ GPUI
+ui/src/*.ts ──esbuild(IIFE, charset=ascii)──▶ ui/dist/main.js ──include_str!──▶ 编进 exe
+                                                                                    │
+                    QuickJS 独立线程（自驱 tick：microtask → timers → 事件派发） ◀────┘
+                                    │   ▲
+                      ops 批 (__hostEmit)│   │ 事件 (EventSink::push + unpark)
+                                    ▼   │
+                              tree.rs 保留树 ──▶ GPUI
 ```
 
 - `process` 由宿主 shim 提供（QuickJS 无 `process` 全局）：`stdout/stderr.write`、
   `stdin.setEncoding/on`、`env`、`argv`、`exit`
 - 计时器与 `console.*` 在 JS bootstrap 里定义，回调存 JS 全局 —— 避免 Rust 侧注册
   回调时捕获 `Ctx` 触发借用逃逸
-- 线程模型：`Context` 是 `!Send`，引擎独享一个 OS 线程，宿主只通过 pipe + 共享队列通信
+- 线程模型：`Context` 是 `!Send`，引擎独享一个 OS 线程；宿主只经共享队列 + 注入的
+  宿主函数与它通信
+
+### 两条传输，同一个协议（运行时切换，**不需要重新编译**）
+
+引擎既然在**进程内**，就没必要假装有一条 stdio 管道。于是协议与载体解耦：
+
+| | `direct`（默认） | `pipe`（历史基线） |
+|---|---|---|
+| 出站 ops | 注入宿主函数 `__hostEmit(line)` → 直接进 ops 通道 | `process.stdout.write` → 管道 → 读线程逐行解析 |
+| 入站事件 | `EventSink::push` 直灌队列 + `unpark` 引擎线程 | 写线程 → 管道 → 读线程 → 队列（引擎下个 tick 才取） |
+| 额外线程 | 0 | 2（stdin reader + stderr tee） |
+| 额外系统调用 | 0 | 写+刷管道、阻塞读、行切分 |
+| 引擎 boot | **130µs** | 1.27ms |
+| 事件送达 | **avg 0.10ms / max 1ms** | avg 0.10ms，但偶发 191ms 停顿 |
+| 端到端派发 | **≤测量分辨率（12/20 样本为负，即 <±1ms 时钟偏差）** | p50 6ms，**明显 10ms 量化簇** + 偶发 200ms+ |
+
+延迟差异的来源是**唤醒方式**：`pipe` 只能等引擎下一个 10ms tick 去取队列（所以出现
+9/10/10/10ms 的量化簇）；`direct` 用 `unpark` 就地唤醒，事件一落地就派发。两侧都以
+同一个 bundle 跑（前端用 `typeof __hostEmit === "function"` 探测载体），所以切换只是
+一个启动参数：
+
+```bash
+build/dist/main.exe                          # direct（默认）
+build/dist/main.exe --transport=pipe         # 或 GPUI_TS_TRANSPORT=pipe
+```
 
 实测（详见 `docs/gpui-ts-plan.md`）：
 
 | 项 | 实测 |
 |---|---|
-| 体积 | **11.01MB**（Perry 单 exe 16.45MB，**-33%**） |
-| 冷启动 | 启动 → UI hello **254ms**（引擎 boot 345.6µs） |
-| 交互延迟 | click → 前端派发 **p50 8ms** / avg 7.5ms / max 16ms（判据 ≤50ms） |
-| 抗丢帧 | 8 连点 @161ms 间隔（<Perry 500ms 量子）**8/8 全中**，计数精确 |
+| 体积 | **11.03MB**（Perry 单 exe 16.45MB，**-33%**） |
+| 冷启动 | 启动 → UI hello **193~235ms**（5 次；引擎 boot 130~257µs） |
+| 交互延迟 | click → 前端派发 **≤测量分辨率**（direct）／ p50 6ms + 10ms 量化簇（pipe）（判据 ≤50ms） |
+| 抗丢帧 | 30 连点 @20ms 间隔 **30/30 全中**，计数精确等于点击数，零协议告警 |
 | 零子进程 | `node.exe` 计数启动前后不变；`quickjs.rs` 零 `spawn` 调用 |
+| 线程数 | direct 38 / pipe 41（全进程，含 GPUI 线程池；本栈差额 = 预测的 2 条） |
 | 单文件自洽 | 拷到空目录、任意 cwd 运行：hello + 239-op mount + 窗口正常 |
 
 集成时最隐蔽的坑：esbuild 的 `charset` 默认不转义 Latin-1 补充区码点（如标题里的
@@ -128,7 +167,11 @@ cd host && cargo run --release --example qjsprobe -- ../ui/dist/main.js
 
 ## Mutation 协议（v1）
 
-前端 → host（stdout，JSONL）：
+协议本身与载体无关：同一份 JSONL 既走 stdio 管道（`pipe`），也走宿主注入的函数
+（`direct`，ops 直进通道 / 事件直灌队列）。宿主侧两条路径共用同一个
+`main.rs::ingest_line` 解析入口，因此两种载体不可能漂移出两套方言。
+
+前端 → host（JSONL）：
 
 ```jsonc
 {"t":"hello","proto":1,"title":"App"}
@@ -144,7 +187,7 @@ cd host && cargo run --release --example qjsprobe -- ../ui/dist/main.js
 ]}
 ```
 
-host → 前端（stdin）：`{"t":"event","target":1,"kind":"click"}`
+host → 前端（JSONL）：`{"t":"event","target":1,"kind":"click"}`
 
 样式键：`flexDirection / gap / padding(+X/Y/L/R/T/B) / width / height / min* / max* /
 grow / shrink / alignItems / justifyContent / overflow(scroll) / background / color /

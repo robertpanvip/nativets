@@ -81,11 +81,12 @@ Perry 路线的怪病都来自它的事件循环与链接方式，不是 TS 前�
 
 | 问题 | 根因 | QuickJS 路线 |
 |---|---|---|
-| stdin 事件 ~500ms 量子聚簇 | 事件循环空闲时按 ~500ms 轮询 stdio | 自拥 10ms tick，直接 drain 队列 |
+| stdin 事件 ~500ms 量子聚簇 | 事件循环空闲时按 ~500ms 轮询 stdio | 自拥 tick + `unpark` 就地唤醒，不等 tick |
 | 嵌入模式 stdin 静默失效 | `STDLIB_PUMP_FN` 间接注册链在 `/FORCE:MULTIPLE` 下注册/读取分家 | 无此间接层，宿主直接派发 |
 | `/FORCE:MULTIPLE` 符号分家 | perry_runtime 内嵌第二份 Rust std | 不内嵌第二份 std，不再需要该开关 |
 | archive-stale 保护 | 改 perry-src 即拒绝打包 staticlib | 无 perry-src 依赖 |
 | `PERRY_RS4GC=0` | 上游 `.seh` 汇编 bug | 无 |
+| **传输被迫走 stdio 管道** | 引擎与宿主是两个进程/两套运行时 | **进程内引擎 → 注入宿主函数 + 直灌队列**（见下） |
 
 体积也顺带降了：QuickJS C 核远小于 perry runtime（5.9MB）。
 
@@ -95,30 +96,70 @@ Perry 路线的怪病都来自它的事件循环与链接方式，不是 TS 前�
 ui/src/*.ts ──esbuild(IIFE, charset=ascii)──▶ ui/dist/main.js
                                                     │ include_str! 编译期内嵌
                                                     ▼
-              host 内嵌 QuickJS（rquickjs）独立线程 ──JSONL──▶ tree.rs ──▶ GPUI
-                       10ms 自驱 tick：promise jobs + timers + stdin 派发
+              host 内嵌 QuickJS（rquickjs）独立线程 ──▶ tree.rs ──▶ GPUI
+                自驱 tick：microtask → timers → 事件派发
 ```
 
 - `process` 是宿主提供的 shim（QuickJS 无 `process` 全局）：`stdout/stderr.write`、
   `stdin.setEncoding/on`、`env`、`argv`、`exit`（真退出，`std::process::exit`）
 - 计时器（`setInterval/setTimeout/clear*`）与 `console.*` 全部在 **JS bootstrap** 里定义，
   回调存 JS 全局（`__stdinCbs`/`__timers`）——避免 Rust 侧注册回调时捕获 `Ctx` 造成借用逃逸
-- 线程模型：`Context` 是 `!Send`，引擎独享一个 OS 线程；宿主只能通过 pipe + 共享队列通信，
-  Windows raw handle 跨线程以 `usize` 传递
+- 线程模型：`Context` 是 `!Send`，引擎独享一个 OS 线程；宿主只经共享队列 + 注入的宿主
+  函数与它通信，Windows raw handle 跨线程以 `usize` 传递
+
+### 传输层：把「进程内」这件事用起来（2026-09-22 晚）
+
+换掉引擎后最该顺手改掉的是**传输层**：既然 QuickJS 在进程内，就没必要继续伪造一条
+stdio 管道。协议与载体解耦成两条，运行时二选一（**同一个 bundle / 同一个 exe**，
+前端用 `typeof __hostEmit === "function"` 探测载体，所以切换不需要重新编译）：
+
+| | `direct`（默认） | `pipe`（历史基线） |
+|---|---|---|
+| 出站 ops | 注入宿主函数 `__hostEmit(line)` → `ingest_line` → ops 通道 | `process.stdout.write` → 管道 → 读线程逐行解析 |
+| 入站事件 | `EventSink::push` 直灌队列 + `thread::unpark` | 写线程 → 管道 → 读线程 → 队列（引擎下个 tick 才取） |
+| 额外线程 | 0 | 2 |
+| 额外 syscall | 0 | 管道写+flush、阻塞读、行切分 |
+| 引擎 boot | **129.6µs** | 1.27ms |
+| 事件送达（宿主时钟） | **avg 0.10ms / max 1ms** | avg 0.10ms 但偶发 **191ms** 停顿 |
+| 端到端派发 | **≤测量分辨率**（20 样本中 12 个为负，即落在 ±1ms 时钟偏差内） | p50 6ms，**醒目的 10ms 量化簇**（9/10/10/10…）+ 偶发 202/234ms |
+
+两点值得记：
+
+1. **延迟差异来自唤醒方式，不是带宽**。`pipe` 侧 click→写入管道只要 ~0ms，但事件要等
+   引擎下一个 tick 去取队列，于是端到端出现 10ms 量化簇 —— 那正是 tick 周期。
+   `direct` 用 `unpark` 就地唤醒，事件一落地就派发。tick 仍保留（驱动 timers）。
+2. **微任务要分相位 drain**。前端用 `Promise.resolve().then(flush)` 批处理 ops，而
+   `pump()` 原先是「先 drain 再派发事件」，于是点击处理器产生的 flush 要等到**下一个
+   tick** 才跑，白加一个 TICK 的可见延迟。现在 timers 之后、事件派发之后再各 drain 一次。
+
+传输选择：
+```bash
+build/dist/main.exe --transport=pipe          # 或 GPUI_TS_TRANSPORT=pipe
+build/dist/main.exe --transport=direct        # 默认
+```
+未知取值只警告并回落到 `direct`，不会拒绝启动。宿主两条路径共用同一个
+`main.rs::ingest_line`，所以载体不同不可能漂移出两套协议方言。
 
 ## 验收（C1-C7 全绿）
 
 | 项 | 判据 | 实测 |
 |---|---|---|
 | C1 零子进程 | 不 spawn node | `node.exe` 计数启动前后 4→4；`quickjs.rs` 零 spawn 调用 |
-| C2 UI+交互 | 点击闭环 | 8 次点击 → 计数 0→**8** 精确匹配；mutation 批 33→100、累计 292→412 |
-| C3 延迟 | click→前端派发 p50 ≤50ms | n=8 **min 2 / p50 8 / avg 7.5 / max 16 ms** |
-| C4 体积 | — | **11.01MB**（perry 16.45MB，**-5.4MB / -33%**） |
-| C5 冷启动 | — | 启动→UI hello **254ms**（引擎 boot 345.6µs） |
+| C2 UI+交互 | 点击闭环 | direct：30 次点击 → 计数 **30** 精确匹配（20ms 间隔）；pipe：15 次 → 15 |
+| C3 延迟 | click→前端派发 p50 ≤50ms | direct **≤测量分辨率**；pipe p50 6ms（10ms 量化簇）；判据均满足 |
+| C4 体积 | — | **11.03MB**（perry 16.45MB，**-5.4MB / -33%**） |
+| C5 冷启动 | — | 启动→UI hello **193~235ms**（5 次；引擎 boot 130~257µs） |
 | C6 CLI | 一键出 exe | `node scripts/gpui-ts.mjs` → `build/dist/main.exe` 11.0MB |
 | C7 文档 | — | 本节 + README |
-| 抗丢帧 | 快速连点不丢 | 8 连点 @161ms 间隔（<perry 500ms 量子）**8/8 全中** |
+| 抗丢帧 | 快速连点不丢 | 30 连点 @20ms 间隔（<perry 500ms 量子）**30/30 全中**，协议告警 0 |
+| 线程 | — | direct 38 / pipe 41（全进程含 GPUI 线程池，差额 = 预测的 2 条） |
 | 单文件自洽 | 无 sidecar | 拷到空目录从任意 cwd 运行：hello + 239-op mount + 窗口正常 |
+
+> 测量方法：宿主在 click handler 与出站投递处各打一个 epoch ms（同一时钟，无跨时钟偏差），
+> 前端在 `EVT_RECV` 打 `Date.now()`。前者是严格的宿主侧度量，后者端到端但受
+> host/JS 两次取时钟的影响，分辨率约 ±1ms —— 这也是 direct 下 20 个样本里有 12 个
+> 出现负值的原因（值小到被时钟抖动淹没），并非丢帧。
+
 
 ## 集成时踩到的坑（都已修）
 
@@ -139,6 +180,13 @@ ui/src/*.ts ──esbuild(IIFE, charset=ascii)──▶ ui/dist/main.js
    UTF-8，但 grep/diff 等工具会当成二进制。改用 `"\u{0}..."` 转义。
 7. `rquickjs` 细节：`Args::push_arg`（非 `push`）；`Rest`/`Args` 在 `rquickjs::function::`
    子模块；`Function::new` 的闭包返回类型必须实现 `IntoJs`。
+8. **`pump()` 的相位顺序会直接变成可见延迟**：前端用 `Promise.resolve().then(flush)` 批处理
+   ops，若 `pump()` 只在开头 drain 一次微任务，点击处理器产生的 flush 就要等到**下一个
+   tick** 才发出 —— 每个交互白加一个 TICK（~10ms）。现在 timers 之后、事件派发之后再各
+   drain 一次（微任务在空队列时开销为一次布尔返回）。
+9. **别把 `process.stdout.write` 在 direct 模式下也删掉**：前端只在探测到 `__hostEmit`
+   时才改走注入路径，其余（含用户自己的 `console`/打印代码）仍可能写 stdout。direct 模式
+   把 stdout 改道到诊断 stderr 并加 `[stdout]` 前缀，既保留可观测性又保证它进不了协议通道。
 
 ### 排障工具：`qjsprobe`
 
@@ -164,4 +212,13 @@ stub 后 eval，从而把「解析失败」与「运行时缺全局」区分开�
 - **默认 quickjs**：`node scripts/gpui-ts.mjs`（或 `GPUI_TS_BACKEND`）
 - perry 后端保留为对照：`node scripts/gpui-ts.mjs --backend perry`
 - 亦可用环境变量直接驱动 host：`QUICKJS_EMBED=1 cargo build --release`（host 目录下）
+
+正交的一个开关是**传输**（仅 quickjs 后端有，运行期生效、不需要重编译）：
+
+| 取值 | 行为 |
+|---|---|
+| `direct`（默认） | 宿主注入 `__hostEmit`；事件直灌队列 + `unpark` |
+| `pipe` | stdio 匿名管道 + 读写线程（历史基线，便于对照/远程排障） |
+
+选择方式：`--transport=pipe` 或 `GPUI_TS_TRANSPORT=pipe`；未知取值警告后回落 `direct`。
 

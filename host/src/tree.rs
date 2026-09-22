@@ -97,6 +97,11 @@ pub fn parse_op(v: &Value) -> Option<Op> {
 
 #[derive(Debug, Clone)]
 pub struct Node {
+    /// Retained for protocol fidelity and debugging only. GPUI has no notion of
+    /// an HTML tag — every node renders as `div()`, and semantics live entirely
+    /// in `style`. Keeping the tag makes the retained tree legible when dumped
+    /// and leaves room for a future per-tag mapping.
+    #[allow(dead_code)]
     pub tag: String,
     pub text: Option<String>,
     pub style: Map<String, Value>,

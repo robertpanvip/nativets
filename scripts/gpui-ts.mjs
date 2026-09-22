@@ -7,8 +7,14 @@
 //   ── quickjs（默认）──────────────────────────────────────────────────────
 //   1. esbuild 把 TS 打包成单个 IIFE JS（ui/dist/main.js，charset=ascii）
 //   2. host 内嵌 QuickJS 引擎（rquickjs），bundle 用 include_str! 编进 exe，
-//      10ms 自驱事件循环（promise jobs + timers + stdin 派发）
+//      自驱事件循环（promise jobs + timers + 事件派发；Direct 传输下事件到达
+//      即唤醒，不必等下一个 tick）
 //   产物 ~11MB，零 Node、零子进程、零 sidecar 文件。
+//
+//   运行时传输（**编译期无关**，同一个 exe 两种都支持）：
+//     direct（默认）— 宿主注入 __hostEmit / 事件直灌队列：无管道、无线程
+//     pipe          — stdio 管道 + 读写线程：历史基线，远程排障用
+//   切换：GPUI_TS_TRANSPORT=pipe 或 host 参数 --transport=pipe
 //
 //   ── perry（历史后端，--backend perry）────────────────────────────────────
 //   1. perry compile <entry> --output-type staticlib
@@ -81,6 +87,12 @@ function emit() {
     const mb = (statSync(out).size / 1024 / 1024).toFixed(1);
     console.log(`[gpui-ts] ✔ ${out}  ${mb} MB · 单文件 · 零子进程 · 无 Node/V8 依赖`);
     console.log(`[gpui-ts]   运行：直接执行即可；GPUI 窗口即 TS 应用 UI`);
+    if (backend === "quickjs") {
+        console.log(
+            `[gpui-ts]   运行时传输（默认 direct，无需重新编译）：` +
+                ` GPUI_TS_TRANSPORT=pipe 或 --transport=pipe 切回 stdio 管道`
+        );
+    }
 }
 
 // ===========================================================================
