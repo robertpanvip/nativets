@@ -9,12 +9,25 @@ fn main() {
     println!("cargo:rustc-check-cfg=cfg(quickjs)");
     println!("cargo:rustc-check-cfg=cfg(embedded)");
     println!("cargo:rustc-check-cfg=cfg(has_embedded_frontend)");
+    println!("cargo:rustc-check-cfg=cfg(scriptc)");
 
     // These env vars must be tracked UNCONDITIONALLY (before the early return
     // below) so cargo always re-runs this script when they flip — otherwise it
     // caches the Perry-mode cfg and ignores QUICKJS_EMBED on later builds.
     println!("cargo:rerun-if-env-changed=QUICKJS_EMBED");
     println!("cargo:rerun-if-env-changed=QUICKJS_EMBED_BUNDLE");
+
+    // quickjs.rs embeds this file with include_str!; without the declaration
+    // cargo would not rebuild when the bootstrap JS changes.
+    println!("cargo:rerun-if-changed=src/bootstrap.js");
+
+    // scriptc DLL backend: cfg enabled purely by the DLL's presence at build
+    // time (runtime resolution re-checks both locations and can also be forced
+    // with `host.exe scriptc`). LoadLibrary means nothing is linked here.
+    println!("cargo:rerun-if-changed=../build/scriptc_fe.dll");
+    if std::env::var("GPUI_TS_NO_SCRIPTC").is_err() && std::path::Path::new("../build/scriptc_fe.dll").exists() {
+        println!("cargo:rustc-cfg=scriptc");
+    }
 
     // QuickJS-embedded mode: link the rquickjs engine instead of Perry's
     // staticlib. No perry archives needed. Set QUICKJS_EMBED=1 to force it.
@@ -28,8 +41,36 @@ fn main() {
     }
 
     let build_dir = PathBuf::from("../build");
-    let app_src = build_dir.join("perry-app-static.lib");
-    let manifest = build_dir.join("perry-app-static.linkdeps.json");
+
+    // ── 选哪个 app archive ────────────────────────────────────────────────
+    // 这里以前写死 "perry-app-static.lib"，而 `scripts/gpui-ts.mjs --backend
+    // perry` 产出的是 `app-main.lib`（名字由入口文件推出来）。于是 CLI 每轮
+    // 新编的 archive 被完全忽略，链接的始终是上一次遗留的那份——而且
+    // /FORCE:MULTIPLE 会把它变成**无声**的：exe 正常生成、应用正常运行，
+    // 只是静止在旧版本源码上。见 docs/gpui-ts-plan.md 坑 #7。
+    //
+    // 解析顺序：env 明确指定 → 否则取两份候选里**较新**的一份。
+    let lib_base = std::env::var("PERRY_STATIC_LIB_BASE")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| {
+            let cands = ["app-main", "perry-app-static"];
+            let newest = cands
+                .iter()
+                .filter_map(|b| {
+                    let p = build_dir.join(format!("{b}.lib"));
+                    let t = std::fs::metadata(&p).ok()?.modified().ok()?;
+                    Some((t, *b))
+                })
+                .max();
+            match newest {
+                Some((_, b)) => b.to_string(),
+                None => cands[1].to_string(), // 都不存在时按旧名走，好让下面的 ok 判定回落
+            }
+        });
+    let app_src = build_dir.join(format!("{lib_base}.lib"));
+    let manifest = build_dir.join(format!("{lib_base}.linkdeps.json"));
     let fallback_lib_dir =
         PathBuf::from("../ui/node_modules/@perryts/perry-win32-x64/lib");
 
@@ -38,8 +79,23 @@ fn main() {
         && std::env::var("PERRY_NO_EMBED").is_err();
 
     if ok {
-        // perry-app-static.lib 复制成无连字符名（rustc link-lib 解析更稳）
-        let _ = std::fs::copy(&app_src, build_dir.join("perry_app_static.lib"));
+        // 复制成无连字符名（rustc 的 link-lib 解析更稳）。这一步失败不能吞：
+        // 吞掉就会退化成「链接上一轮的旧副本」，正是上面那条无声故障。
+        let link_archive = build_dir.join("perry_app_static.lib");
+        if let Err(e) = std::fs::copy(&app_src, &link_archive) {
+            println!(
+                "cargo:warning=复制 app archive 失败（{} → {}）: {e}",
+                app_src.display(),
+                link_archive.display()
+            );
+        }
+        // 没显式指定 base 时（手工 cargo build）把选择结果说出来，不然只能猜
+        if std::env::var("PERRY_STATIC_LIB_BASE").is_err() {
+            let size = std::fs::metadata(&app_src).map(|m| m.len()).unwrap_or(0);
+            println!(
+                "cargo:warning=perry app archive: {lib_base}.lib（{size} B）— 用 PERRY_STATIC_LIB_BASE 可覆盖"
+            );
+        }
         println!("cargo:rustc-link-search=native={}", build_dir.display());
 
         // 从 linkdeps.json 取 runtime/stdlib 路径（role 字段）

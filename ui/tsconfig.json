@@ -3,7 +3,10 @@
     "target": "ES2020",
     "module": "ESNext",
     "moduleResolution": "Bundler",
-    "lib": ["ES2020", "DOM"],
+    // No "DOM" on purpose: this is not a browser. The host provides a specific
+    // BOM subset (see src/globals.d.ts), and `lib.dom` would type `document`,
+    // `fetch`, `localStorage` … as available when they are not.
+    "lib": ["ES2020"],
     "jsx": "react",
     "jsxFactory": "h",
     "jsxFragmentFactory": "Fragment",
@@ -11,6 +14,11 @@
     "skipLibCheck": true,
     "isolatedModules": true,
     "strict": false,
+    // scriptc (library mode) models null/undefined as distinct static types
+    // and refuses configs below this floor (SC0002). The QuickJS/node builds
+    // don't consult this file's strictness for codegen, so this stays on for
+    // both worlds.
+    "strictNullChecks": true,
     "types": []
   },
   "include": ["src"]

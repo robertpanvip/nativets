@@ -11,6 +11,9 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 async-channel = "2"
 rquickjs = { version = "0.14.0", features = ["std"] }
+# OS CSPRNG behind crypto.getRandomValues / crypto.randomUUID (bom.rs).
+# Already in the graph transitively, so this pulls in no new download.
+getrandom = "0.2"
 
 [profile.dev]
 opt-level = 1

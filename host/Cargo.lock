@@ -1895,6 +1895,7 @@ name = "gpui-perryts-host"
 version = "0.1.0"
 dependencies = [
  "async-channel",
+ "getrandom 0.2.17",
  "gpui-pre",
  "gpui-pre-platform",
  "rquickjs",
