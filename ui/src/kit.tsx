@@ -53,7 +53,7 @@ function ControlLabel(label: string): El {
 }
 
 // ---------------------------------------------------------------------------
-// TextField
+// Input / TextField
 // ---------------------------------------------------------------------------
 
 /** Border color is the only thing focus changes, and it is driven by the host's
@@ -73,7 +73,7 @@ function fieldStyle(focused: boolean): Style {
     };
 }
 
-export function TextField(props: {
+export function Input(props: {
     value: () => string;
     onInput: (v: string) => void;
     onChange?: (v: string) => void;
@@ -115,6 +115,77 @@ export function TextField(props: {
     );
     return col;
 }
+
+// `TextField` is kept as a deprecated alias so existing call sites keep working.
+export const TextField = Input;
+
+// ---------------------------------------------------------------------------
+// Button (native)
+// ---------------------------------------------------------------------------
+// Native button: the host renders this tag as a real gpui-component `Button`
+// (see main.rs `build_native`). The label is emitted as a text child, which the
+// host gathers and passes to the component — JSX `<button>label</button>`
+// mounts a child `text` node, so the tag's own text field stays empty.
+
+export function Button(props: {
+    onClick: () => void;
+    label?: string;
+    children?: Child;
+    style?: Style;
+}): El {
+    const style: Style = {
+        height: 32,
+        paddingX: 14,
+        borderRadius: 8,
+        fontSize: 13,
+        background: C.accent,
+        color: "#ffffff",
+    };
+    if (props.style !== undefined) mergeStyleInto(style, props.style);
+    const clickRef = new CtxFnRef();
+    clickRef.fn = () => props.onClick();
+    const inner = props.label !== undefined ? text(props.label, { fontSize: 13 }) : props.children;
+    return (
+        <button
+            style={style}
+            onClick={(ev: HostEvent) => {
+                const f = clickRef.fn;
+                if (f !== null) f(undefined as unknown as Ctx);
+            }}
+        >
+            {inner}
+        </button>
+    );
+}
+
+// ---------------------------------------------------------------------------
+// DatePicker (native)
+// ---------------------------------------------------------------------------
+// Native date picker: the host renders this tag as a real gpui-component
+// `time::DatePicker` (see main.rs `build_native`). Controlled like `input` —
+// `value` is the selected date as an ISO string ("YYYY-MM-DD" or ""), picking
+// emits `change` with the new date, and the app's `onChange` decides what to
+// keep and pushes it back via `setValue`.
+
+export function DatePicker(props: {
+    value: () => string;
+    onChange: (v: string) => void;
+    placeholder?: string;
+    style?: Style;
+}): El {
+    const chgRef = new StrFnRef();
+    chgRef.fn = props.onChange;
+    return h("date", {
+        style: props.style,
+        value: props.value,
+        placeholder: props.placeholder,
+        onChange: (ev: HostEvent) => {
+            const f = chgRef.fn;
+            if (f !== null) f(String(ev.value));
+        },
+    });
+}
+
 
 // ---------------------------------------------------------------------------
 // Radio / Checkbox / Switch

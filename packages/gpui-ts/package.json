@@ -1,0 +1,46 @@
+{
+  "name": "nativets",
+  "version": "0.1.0",
+  "description": "Write a desktop app in TypeScript/TSX and get one self-contained native executable — no Rust toolchain, no Electron, no browser engine.",
+  "keywords": [
+    "gpui",
+    "typescript",
+    "tsx",
+    "desktop",
+    "native",
+    "quickjs",
+    "gui",
+    "rust"
+  ],
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "node": ">=18"
+  },
+  "bin": {
+    "nativets": "./bin/gpui-ts.mjs"
+  },
+  "exports": {
+    ".": {
+      "types": "./types/index.d.ts",
+      "import": "./runtime/index.js",
+      "default": "./runtime/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "types": "./types/index.d.ts",
+  "files": [
+    "bin/",
+    "lib/",
+    "runtime/",
+    "types/",
+    "vendor/",
+    "README.md"
+  ],
+  "dependencies": {
+    "esbuild": "^0.25.0"
+  },
+  "scripts": {
+    "build:runtime": "node ../../scripts/build-package.mjs"
+  }
+}

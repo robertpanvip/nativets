@@ -38,7 +38,7 @@ import {
 } from "./io";
 import type { El, Child, HostEvent, Style, Props } from "./io";
 import { C } from "./theme";
-import { CanvasView, Checkbox, RadioGroup, ScrollArea, Select, Switch, TextField } from "./kit";
+import { CanvasView, Checkbox, DatePicker, Input, RadioGroup, ScrollArea, Select, Switch } from "./kit";
 import type { Ctx } from "./canvas2d";
 import {
     windowSize,
@@ -101,6 +101,8 @@ const [keyword, setKeyword] = createSignal("");
 /** What the field reported on Enter — proves `change` is a separate event. */
 const [committed, setCommitted] = createSignal("-");
 const [fieldEvents, setFieldEvents] = createSignal(0);
+/** Selected date from the native DatePicker (ISO "YYYY-MM-DD" or ""). */
+const [pickedDate, setPickedDate] = createSignal("");
 
 // --- scroll state ---
 
@@ -495,7 +497,7 @@ function FormCard(_props: Props): El {
         <Card title="表单控件 · input / radio / checkbox / switch / select">
             <div style={{ flexDirection: "row", gap: 24, alignItems: "start" }}>
                 <div style={{ flexDirection: "column", gap: 12, width: 300 }}>
-                    <TextField
+                    <Input
                         label="关键字（回车提交，Ctrl+V 粘贴）"
                         value={keyword}
                         placeholder="输入后回车…"
@@ -504,6 +506,14 @@ function FormCard(_props: Props): El {
                             setFieldEvents(fieldEvents() + 1);
                         }}
                         onChange={(v: string) => setCommitted(v)}
+                    />
+                    <DatePicker
+                        value={pickedDate}
+                        placeholder="选择日期…"
+                        onChange={(v: string) => {
+                            setPickedDate(v);
+                            console.log("[app] date picked:", v);
+                        }}
                     />
                     <div style={{ flexDirection: "row", alignItems: "center", gap: 14 }}>
                         <Select options={REGIONS} value={region} onChange={setRegion} />

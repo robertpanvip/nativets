@@ -55,11 +55,14 @@ use tree::{is_native_tag, Node, Op, Tree};
 
 use gpui::{
     canvas, deferred, div, fill, point, prelude::*, px, relative, rgb, rgba, size, AnyElement, App,
-    BorderStyle, Bounds, ClipboardItem, ClickEvent, Context, Corners, Edges, ElementId,
-    FocusHandle, Font, FontWeight, InteractiveElement, KeyDownEvent, ParentElement, PathBuilder,
+    BorderStyle, Bounds, ClickEvent, Context, Corners, Edges, ElementId, Entity, Focusable,
+    FocusHandle, Font, FontWeight, InteractiveElement, ParentElement, PathBuilder,
     Render, ScrollHandle, SharedString, StatefulInteractiveElement, Styled, TextAlign, TextRun,
     Window, WindowBounds, WindowOptions, TitlebarOptions,
 };
+use chrono::NaiveDate;
+use gpui_base::Date as GpuiDate;
+use gpui_component::date_picker::{DatePicker as GpuiDatePicker, DatePickerEvent, DatePickerState};
 use gpui_platform::application;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
@@ -428,6 +431,20 @@ struct HostView {
     /// Same idea for text-field focus, which the frontend uses to style its own
     /// focus ring (`focus` / `blur` events).
     focus_reported: HashMap<u64, bool>,
+    /// One gpui-component `InputState` per `input` node. The state is the
+    /// editing engine (text buffer, caret, selection, undo); the `Input`
+    /// element built each frame is just a view of it. Like the focus handles,
+    /// entities must be *stable* across renders — recreating per frame would
+    /// drop the text, the caret and the focus on every repaint.
+    input_states: HashMap<u64, Entity<gpui_component::input::InputState>>,
+    /// Last value pushed down per input node, so a controlled `setValue` echo
+    /// (the app writes back exactly what the user typed) does not clobber the
+    /// field mid-keystroke.
+    input_reported: HashMap<u64, String>,
+    /// One gpui-component `DatePickerState` per `date` node. Same stability
+    /// contract as `input_states`: recreate-per-frame would drop the open/
+    /// closed state, the selected date and the calendar entity.
+    date_states: HashMap<u64, Entity<DatePickerState>>,
 }
 
 /// Deterministic application order for style keys (HashMap iteration is
@@ -467,7 +484,7 @@ impl HostView {
         &mut self,
         id: u64,
         no_shrink: bool,
-        window: &Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         // The node is cloned: the tree must stay borrowable while the subtree
@@ -479,8 +496,9 @@ impl HostView {
         if node.is_input() {
             return Some(self.build_input(&node, id, no_shrink, window, cx));
         }
+
         if is_native_tag(&node.tag) {
-            return Some(self.build_native(&node, id, cx));
+            return Some(self.build_native(&node, id, window, cx));
         }
         Some(self.build_plain(&node, id, no_shrink, window, cx))
     }
@@ -497,7 +515,7 @@ impl HostView {
         node: &Node,
         id: u64,
         no_shrink: bool,
-        window: &Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let scroll = is_scroll_container(node);
@@ -610,104 +628,167 @@ impl HostView {
         }
     }
 
-    /// A text field: a styled box plus a hand-painted line and caret.
+    /// A text field: a gpui-component `Input` bound to a per-node `InputState`.
     ///
-    /// Why a canvas instead of a text child: the caret has to sit *between*
-    /// glyphs, and its x is the advance width of the text up to the caret — a
-    /// number only the text system knows. Shaping the line ourselves gets that
-    /// for free (see `paint_field_text`), and keeps the field's text position
-    /// independent of layout rounding.
+    /// The state (text buffer, caret, selection, undo) is created once per node
+    /// and kept in `input_states`; the element built every frame is just a view
+    /// of it. User edits are echoed back as `input` events (each keystroke) and
+    /// `change` events (Enter) — the same contract the hand-painted field had,
+    /// so the frontend's controlled loop does not change.
+    ///
+    /// Protocol styles land on the *wrapper*: `Input` is `Styled` too, but its
+    /// own chrome (border, background, focus ring) comes from the theme, and
+    /// letting arbitrary protocol colors fight it produced broken visuals. The
+    /// wrapper carries size/padding/flow; the field fills it.
     fn build_input(
         &mut self,
         node: &Node,
         id: u64,
         no_shrink: bool,
-        window: &Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let fh = self.focus_handle(id, cx);
-        let focused = fh.is_focused(window);
+        let state = self.input_state(id, node, window, cx);
 
-        let font_size = num_of(node, "fontSize").unwrap_or(DEFAULT_FONT_SIZE);
-        let line_h = font_size * LINE_RATIO;
+        // Controlled push-down: a `setValue` that differs from what the state
+        // already holds (and from what we last echoed up) is an external
+        // correction — apply it. Our own echo comes back with the same value
+        // the state already has, so the comparison is what makes editing
+        // mid-string possible (no caret snap per keystroke).
+        let tree_value = node.value.clone().unwrap_or_default();
+        let live = state.read(cx).value().to_string();
+        let echoed = self.input_reported.get(&id).map(|s| *s == live).unwrap_or(false);
+        if tree_value != live && !(echoed && tree_value == live) {
+            state.update(cx, |st, cx| st.set_value(tree_value.clone(), window, cx));
+        }
 
-        let mut d = div().flex().flex_row().items_center();
-        // Both box dimensions must be definite: the inner canvas is a canvas,
-        // so it has no content to size itself from (a browser's `<input>` has an
-        // intrinsic ~20-character width — this is that number, written down).
+        let mut wrap = div().flex().flex_row().items_center().overflow_hidden();
         if !node.style.contains_key("width") {
-            d = d.w(px(DEFAULT_INPUT_W));
+            wrap = wrap.w(px(DEFAULT_INPUT_W));
         }
         if !node.style.contains_key("height") {
-            d = d.h(px(line_h + v_padding(node)));
+            wrap = wrap.h(px(num_of(node, "fontSize").unwrap_or(DEFAULT_FONT_SIZE) * LINE_RATIO + 12.0));
         }
-        if !node.style.contains_key("cursor") {
-            d = d.cursor_text();
-        }
-        // Fields clip by definition (so does a browser's `<input>`): it is what
-        // keeps a long value from painting outside the box when the caret is at
-        // the end and the text is shifted left.
-        d = d.overflow_hidden();
         for (k, v) in sorted_style(node) {
-            d = apply_style(d, k, v);
+            // The field's text/border colors are the component theme's job;
+            // height fights the component's own line layout.
+            if matches!(k.as_str(), "color" | "fontSize" | "height") {
+                continue;
+            }
+            wrap = apply_style(wrap, k, v);
         }
         if no_shrink && !node.style.contains_key("shrink") {
-            d = d.flex_shrink(0.0);
+            wrap = wrap.flex_shrink(0.0);
         }
 
-        let text = node.display_text().unwrap_or("").to_string();
-        let placeholder = node.value.as_deref().map_or(true, |v| v.is_empty());
-        let base_color = color_of(node, "color").unwrap_or(0xE8EA_F2FF);
-        let text_color = if placeholder {
-            draw::with_alpha(base_color, 0.45)
-        } else {
-            base_color
-        };
-        let weight = font_weight_of(node.style.get("fontWeight"));
-        let caret = if focused {
-            Some(node.caret.min(text.chars().count()))
-        } else {
-            None
-        };
-        let caret_color = base_color;
-
-        let field = canvas(
-            move |_bounds, _window, _cx| (),
-            move |bounds, _state, window, cx| {
-                paint_field_text(
-                    bounds, &text, text_color, font_size, weight, caret, caret_color, window, cx,
-                );
-            },
-        )
-        .flex_grow(1.0)
-        .min_w(px(0.0))
-        .h_full();
-
         let element_id = ElementId::from(SharedString::from(format!("node-{id}")));
-        let mut s = d.id(element_id).track_focus(&fh).child(field);
-        // Listeners are `'static`, so what they need is copied out of the node
-        // first (the node itself is rebuilt every frame and may be gone).
-        let report_click = wants(node, "click");
-        // Clicking the box puts the caret at the end and takes text focus. Caret
-        // *positioning* from the click x would need the element's bounds at
-        // click time, which the listener does not get — see README 已知缺口.
-        s = s.on_click(cx.listener(move |this, _ev: &ClickEvent, window, cx| {
-            if let Some(fh) = this.focus_handles.get(&id).cloned() {
-                window.focus(&fh, cx);
+        use gpui_component::Sizable;
+        let input = gpui_component::input::Input::new(&state)
+            .id(element_id)
+            .small()
+            .appearance(true)
+            .bordered(true)
+            .flex_grow(1.0)
+            .min_w(px(0.0))
+            .h_full();
+        wrap.child(input).into_any_element()
+    }
+
+    /// The `InputState` for an input node: created on first sight with a
+    /// placeholder and the current value, and subscribed once to echo user
+    /// edits back to the frontend. Everything else (focus reporting) stays
+    /// with the focus-handle poll, which already works for these fields
+    /// because `InputState` exposes its own `FocusHandle` — we register it in
+    /// `focus_handles` so `sync_focus` sees it.
+    fn input_state(
+        &mut self,
+        id: u64,
+        node: &Node,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<gpui_component::input::InputState> {
+        if let Some(st) = self.input_states.get(&id) {
+            return st.clone();
+        }
+        let placeholder = node.placeholder.clone().unwrap_or_default();
+        let value = node.value.clone().unwrap_or_default();
+        let tx = self.event_tx.clone();
+        let seed = value.clone();
+        let state = cx.new(|cx| {
+            let mut st = gpui_component::input::InputState::new(window, cx)
+                .placeholder(placeholder);
+            st.set_value(seed, window, cx);
+            st
+        });
+        // Subscribe BEFORE the state is ever rendered: `Change` fires on every
+        // user edit; `PressEnter` is the commit. Both are echoed with the
+        // state's live value — the frontend's controlled setter decides what
+        // to keep and pushes it back via `setValue`, where the `input_reported`
+        // bookkeeping collapses the echo into a no-op.
+        let echo_tx = tx.clone();
+        cx.subscribe(&state, move |_this: &mut HostView, st, ev: &gpui_component::input::InputEvent, _cx| {
+            let (kind, value) = match ev {
+                gpui_component::input::InputEvent::Change => ("input", st.read(_cx).value().to_string()),
+                gpui_component::input::InputEvent::PressEnter { .. } => {
+                    ("change", st.read(_cx).value().to_string())
+                }
+                _ => return,
+            };
+            let msg = json!({ "t": "event", "target": id, "kind": kind, "value": value }).to_string();
+            log!("[host] ev {kind} id={id} t={} {msg}", now_ms());
+            let _ = echo_tx.send(msg);
+        })
+        .detach();
+        // Route the component's focus handle through the existing poll so
+        // `focus`/`blur` events keep flowing without a second mechanism.
+        let fh = state.read(cx).focus_handle(cx).clone();
+        self.focus_handles.insert(id, fh);
+        self.focus_reported.insert(id, false);
+        self.input_reported.insert(id, value.clone());
+        self.input_states.insert(id, state.clone());
+        state
+    }
+
+    /// One gpui-component `DatePickerState` per `date` node (mirrors
+    /// `input_state`). The state owns the selected date, the open/closed flag
+    /// and the calendar entity; the `DatePicker` element built each frame is a
+    /// view of it. Picking echoes `DatePickerEvent::Change` up as a `change`
+    /// event carrying the date's ISO string.
+    fn date_state(
+        &mut self,
+        id: u64,
+        node: &Node,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<DatePickerState> {
+        if let Some(st) = self.date_states.get(&id) {
+            return st.clone();
+        }
+        let value = node.value.clone().unwrap_or_default();
+        let tx = self.event_tx.clone();
+        let state = cx.new(|cx| {
+            let mut st = DatePickerState::new(window, cx);
+            if let Some(nd) = parse_date_value(&value) {
+                st.set_date(GpuiDate::from(nd), window, cx);
             }
-            this.set_caret(id, usize::MAX);
-            // The focus event itself is emitted by the `sync_focus` poll in
-            // `render`, so it cannot be forgotten on a path that focuses without
-            // going through this handler.
-            if report_click {
-                this.send_event(id, "click", None);
-            }
-            cx.notify();
-        }));
-        s = s.on_key_down(cx.listener(
-            move |this, ev: &KeyDownEvent, window, cx| this.input_key(id, ev, window, cx),
-        ));
-        s.into_any_element()
+            st
+        });
+        cx.subscribe(&state, move |_this: &mut HostView, _st, ev: &DatePickerEvent, _cx| {
+            let DatePickerEvent::Change(d) = ev;
+            let value = d.to_string();
+            let msg = json!({ "t": "event", "target": id, "kind": "change", "value": value })
+                .to_string();
+            log!("[host] ev change(id=date) id={id} t={} {msg}", now_ms());
+            let _ = tx.send(msg);
+        })
+        .detach();
+        // Route the component's focus handle through the existing poll so
+        // `focus`/`blur` events keep flowing without a second mechanism.
+        let fh = state.read(cx).focus_handle(cx).clone();
+        self.focus_handles.insert(id, fh);
+        self.focus_reported.insert(id, false);
+        self.date_states.insert(id, state.clone());
+        state
     }
 
     /// A native-widget node (`checkbox` / `switch` / `button` / `select`):
@@ -723,7 +804,8 @@ impl HostView {
         &mut self,
         node: &Node,
         id: u64,
-        _cx: &mut Context<Self>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
     ) -> AnyElement {
         let element_id = ElementId::from(SharedString::from(format!("node-{id}")));
         let checked = node.value.as_deref() == Some("true");
@@ -828,6 +910,31 @@ impl HostView {
                     })
                     .into_any_element()
             }
+            "date" => {
+                // Native date picker: a real gpui-component `time::DatePicker`
+                // driven by a per-node `DatePickerState`. Controlled like `input`
+                // — `value` is the selected date as an ISO "YYYY-MM-DD" (or ""),
+                // the user picks a day, and `DatePickerEvent::Change` echoes it
+                // back as a `change` event with that string.
+                let state = self.date_state(id, node, window, cx);
+                // Controlled push-down: a `setValue` that differs from what the
+                // state holds is an external correction — apply it.
+                let tree_value = node.value.clone().unwrap_or_default();
+                let live = state.read(cx).date().to_string();
+                if !tree_value.is_empty() && tree_value != live {
+                    if let Some(nd) = parse_date_value(&tree_value) {
+                        let date = GpuiDate::from(nd);
+                        state.update(cx, |st, cx| st.set_date(date, window, cx));
+                    }
+                }
+                let mut picker = GpuiDatePicker::new(&state);
+                if let Some(ph) = &node.placeholder {
+                    if !ph.is_empty() {
+                        picker = picker.placeholder(ph.clone());
+                    }
+                }
+                picker.appearance(true).cleanable(false).into_any_element()
+            }
             _ => div().into_any_element(),
         }
     }
@@ -872,135 +979,6 @@ impl HostView {
             }));
         }
         s.into_any_element()
-    }
-
-    /// Text editing for one keystroke. See `Node::value` for who owns what.
-    fn input_key(
-        &mut self,
-        id: u64,
-        ev: &KeyDownEvent,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(node) = self.tree.node(id).cloned() else {
-            return;
-        };
-        if !node.is_input() {
-            return;
-        }
-        let ks = &ev.keystroke;
-        let mut chars: Vec<char> = node.value.clone().unwrap_or_default().chars().collect();
-        let mut caret = node.caret.min(chars.len());
-        let before = (chars.len(), caret);
-        let mut commit = false;
-        let mut handled = true;
-
-        if ks.modifiers.control || ks.modifiers.platform {
-            match ks.key.as_str() {
-                "v" => {
-                    // The one path that lets CJK text into the field: this build
-                    // has no IME composition (see README 已知缺口).
-                    if let Some(text) = cx.read_from_clipboard().and_then(|i| i.text()) {
-                        let ins: Vec<char> = single_line(&text).chars().collect();
-                        for (i, c) in ins.iter().enumerate() {
-                            chars.insert(caret + i, *c);
-                        }
-                        caret += ins.len();
-                    }
-                }
-                "c" => {
-                    let all: String = chars.iter().collect();
-                    cx.write_to_clipboard(ClipboardItem::new_string(all));
-                }
-                // No selection model, so "select all" is "caret to the end".
-                "a" => caret = chars.len(),
-                _ => handled = false,
-            }
-        } else if ks.modifiers.alt {
-            handled = false;
-        } else {
-            match ks.key.as_str() {
-                "backspace" => {
-                    if caret > 0 {
-                        chars.remove(caret - 1);
-                        caret -= 1;
-                    }
-                }
-                "delete" => {
-                    if caret < chars.len() {
-                        chars.remove(caret);
-                    }
-                }
-                "left" => caret = caret.saturating_sub(1),
-                "right" => caret = (caret + 1).min(chars.len()),
-                "home" => caret = 0,
-                "end" => caret = chars.len(),
-                // Enter commits (a `change` event) and stays in the field, so the
-                // demo can show the difference between "edited" and "committed".
-                "enter" => commit = true,
-                "escape" => {
-                    window.blur(cx);
-                    handled = false;
-                }
-                _ => match ks.key_char.as_deref() {
-                    Some(s) if !s.is_empty() && !s.chars().any(|c| c.is_control()) => {
-                        let ins: Vec<char> = s.chars().collect();
-                        for (i, c) in ins.iter().enumerate() {
-                            chars.insert(caret + i, *c);
-                        }
-                        caret += ins.len();
-                    }
-                    _ => handled = false,
-                },
-            }
-        }
-        if !handled {
-            return;
-        }
-        let value: String = chars.into_iter().collect();
-        let changed = (value.chars().count(), caret) != before;
-        if !changed && !commit {
-            return;
-        }
-        if let Some(n) = self.tree.node_mut(id) {
-            n.value = Some(value.clone());
-            n.caret = caret;
-        }
-        cx.notify();
-        // Only a real edit is an `input`. Enter on an unchanged field must not
-        // re-announce the same value — the frontend would treat that as another
-        // keystroke. A browser's `<input>` fires `change` on Enter either way.
-        if changed {
-            self.send_event(id, "input", Some(("value", value.clone())));
-        }
-        if commit {
-            self.send_event(id, "change", Some(("value", value)));
-        }
-    }
-
-    /// Move a field's caret (`usize::MAX` = end of value).
-    fn set_caret(&mut self, id: u64, caret: usize) {
-        let len = self
-            .tree
-            .node(id)
-            .and_then(|n| n.value.as_deref())
-            .map(|v| v.chars().count())
-            .unwrap_or(0);
-        if let Some(n) = self.tree.node_mut(id) {
-            n.caret = caret.min(len);
-        }
-    }
-
-    /// Focus handle for a node, created once and reused (`FocusHandle` identity
-    /// is what focus tracking keys on).
-    fn focus_handle(&mut self, id: u64, cx: &mut Context<Self>) -> FocusHandle {
-        if let Some(fh) = self.focus_handles.get(&id) {
-            return fh.clone();
-        }
-        let fh = cx.focus_handle();
-        self.focus_handles.insert(id, fh.clone());
-        self.focus_reported.insert(id, false);
-        fh
     }
 
     fn scroll_handle(&mut self, id: u64) -> ScrollHandle {
@@ -1092,6 +1070,9 @@ impl HostView {
         self.scroll_handles.retain(|k, _| live.contains(k));
         self.scroll_reported.retain(|k, _| live.contains(k));
         self.focus_reported.retain(|k, _| live.contains(k));
+        self.input_states.retain(|k, _| live.contains(k));
+        self.input_reported.retain(|k, _| live.contains(k));
+        self.date_states.retain(|k, _| live.contains(k));
     }
 
     /// Push window geometry to the engine when it changed.
@@ -1235,23 +1216,23 @@ fn num_of(node: &Node, key: &str) -> Option<f32> {
     node.style.get(key).and_then(num)
 }
 
-fn color_of(node: &Node, key: &str) -> Option<u32> {
-    node.style.get(key).and_then(|v| v.as_str()).and_then(parse_color)
-}
-
-/// Vertical padding of a box, used to give a text field a definite default
-/// height (`padding` + `paddingY` + explicit top/bottom, the same sum GPUI's
-/// style engine applies).
-fn v_padding(node: &Node) -> f32 {
-    let p = num_of(node, "padding").unwrap_or(0.0) * 2.0;
-    let py = num_of(node, "paddingY").unwrap_or(0.0) * 2.0;
-    let pt = num_of(node, "paddingTop").unwrap_or(0.0);
-    let pb = num_of(node, "paddingBottom").unwrap_or(0.0);
-    let border = match num_of(node, "borderWidth") {
-        Some(n) if n > 0.0 => 2.0,
-        _ => 0.0,
-    };
-    p + py + pt + pb + border
+/// Parse a `YYYY-MM-DD` string (the `Date` Display form) into a `NaiveDate`.
+/// Returns `None` for empty or unparseable strings — the picker's default state
+/// is already cleared, so `None` means "don't touch". We never construct a
+/// `Date` variant directly (its tuple field is private outside gpui-base); the
+/// public `Date::from(NaiveDate)` is the only way to build one here.
+fn parse_date_value(s: &str) -> Option<NaiveDate> {
+    let parts: Vec<&str> = s.split('-').collect();
+    if parts.len() == 3 {
+        if let (Ok(y), Ok(m), Ok(d)) = (
+            parts[0].parse::<i32>(),
+            parts[1].parse::<u32>(),
+            parts[2].parse::<u32>(),
+        ) {
+            return NaiveDate::from_ymd_opt(y, m, d);
+        }
+    }
+    None
 }
 
 /// Keys that place a node in its parent rather than describe the node's own
@@ -1274,21 +1255,6 @@ fn wants_node(tree: &Tree, id: u64, kind: &str) -> bool {
     tree.node(id).map(|n| wants(n, kind)).unwrap_or(false)
 }
 
-/// Fields are single-line: newlines and tabs pasted into one become spaces
-/// (wrapping a text field would need a layout pass the canvas path does not do).
-fn single_line(s: &str) -> String {
-    s.chars()
-        .map(|c| if c == '\n' || c == '\r' || c == '\t' { ' ' } else { c })
-        .collect()
-}
-
-/// Byte offset of the `n`-th character. Carets are counted in **characters**
-/// because that is what a user counts — bytes and UTF-16 units both disagree
-/// with it for CJK, and disagree with each other for emoji.
-fn byte_index(text: &str, n: usize) -> usize {
-    text.char_indices().nth(n).map(|(i, _)| i).unwrap_or(text.len())
-}
-
 /// One decimal place, for the numbers in scroll events (a raw f32 prints as
 /// `123.00000762939453`, which makes the protocol stream unreadable).
 fn round1(v: f32) -> f32 {
@@ -1305,7 +1271,12 @@ fn paint_text(
     window: &mut Window,
     cx: &mut App,
 ) -> Option<gpui::ShapedLine> {
-    let text = single_line(text);
+    // Canvas text is single-line: newlines and tabs become spaces (wrapping
+    // would need a layout pass the hand-painted path does not do).
+    let text: String = text
+        .chars()
+        .map(|c| if c == '\n' || c == '\r' || c == '\t' { ' ' } else { c })
+        .collect();
     if text.is_empty() {
         return None;
     }
@@ -1332,83 +1303,6 @@ fn paint_text(
         cx,
     );
     Some(line)
-}
-
-/// Paint a text field's content and, when focused, its caret.
-///
-/// The caret's x is the advance width of the text *up to* the caret, which is
-/// exactly what `ShapedLine::split_at` returns — this is why the field shapes
-/// its own line instead of using a text child.
-fn paint_field_text(
-    bounds: Bounds<gpui::Pixels>,
-    text: &str,
-    color: u32,
-    font_size: f32,
-    weight: FontWeight,
-    caret: Option<usize>,
-    caret_color: u32,
-    window: &mut Window,
-    cx: &mut App,
-) {
-    let box_w = f32::from(bounds.size.width);
-    let box_h = f32::from(bounds.size.height);
-    let line_h = font_size * LINE_RATIO;
-    let y = bounds.origin.y + px(((box_h - line_h) / 2.0).max(0.0));
-
-    let mut caret_x = 0.0f32;
-    let mut shift = 0.0f32;
-    if !text.is_empty() {
-        let system = window.text_system().clone();
-        let run = TextRun {
-            len: text.len(),
-            font: Font {
-                weight,
-                ..Font::default()
-            },
-            color: rgba(color).into(),
-            background_color: None,
-            underline: None,
-            strikethrough: None,
-        };
-        let line = system.shape_line(
-            SharedString::from(text.to_string()),
-            px(font_size),
-            &[run],
-            None,
-        );
-        if let Some(c) = caret {
-            let (prefix, _) = line.split_at(byte_index(text, c));
-            caret_x = f32::from(prefix.width());
-            // A field scrolls its content sideways to keep the caret visible
-            // instead of wrapping (same as a browser); the box clips
-            // (`overflow: hidden` is forced in `build_input`).
-            let margin = 4.0;
-            if caret_x > box_w - margin {
-                shift = caret_x - (box_w - margin);
-            }
-        }
-        let _ = line.paint(
-            point(bounds.origin.x - px(shift), y),
-            px(line_h),
-            TextAlign::Left,
-            None,
-            window,
-            cx,
-        );
-    }
-
-    if caret.is_some() {
-        let caret_h = font_size * 1.15;
-        let cy = f32::from(bounds.origin.y) + ((box_h - caret_h) / 2.0).max(0.0);
-        let cx_px = f32::from(bounds.origin.x) + (caret_x - shift);
-        window.paint_quad(fill(
-            Bounds {
-                origin: point(px(cx_px), px(cy)),
-                size: size(px(1.5), px(caret_h)),
-            },
-            rgba(caret_color),
-        ));
-    }
 }
 
 /// Ellipse as a polyline: 48 segments is smooth at the sizes a dashboard
@@ -2003,6 +1897,9 @@ fn open_host_window(
                 scroll_handles: HashMap::new(),
                 scroll_reported: HashMap::new(),
                 focus_reported: HashMap::new(),
+                input_states: HashMap::new(),
+                input_reported: HashMap::new(),
+                date_states: HashMap::new(),
             })
         })
         .expect("failed to open window");

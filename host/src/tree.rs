@@ -216,15 +216,6 @@ impl Node {
     pub fn is_canvas(&self) -> bool {
         self.tag == "canvas"
     }
-
-    /// What the field currently shows: the value, or the placeholder when the
-    /// value is empty. `None` means "nothing to draw at all".
-    pub fn display_text(&self) -> Option<&str> {
-        match self.value.as_deref() {
-            Some(v) if !v.is_empty() => Some(v),
-            _ => self.placeholder.as_deref(),
-        }
-    }
 }
 
 pub struct Tree {
@@ -349,12 +340,6 @@ impl Tree {
         self.nodes.get(&id)
     }
 
-    /// Mutable access for **host-side** node state (the caret, see `Node::caret`).
-    /// Protocol mutations go through `apply` so they stay ordered in one batch.
-    pub fn node_mut(&mut self, id: u64) -> Option<&mut Node> {
-        self.nodes.get_mut(&id)
-    }
-
     /// Every live node id. Used to prune host-side per-node state (focus
     /// handles, scroll handles) that would otherwise leak for removed nodes.
     pub fn ids(&self) -> Vec<u64> {
@@ -415,5 +400,5 @@ impl Tree {
 /// Which tags render as native `gpui_component` controls (see
 /// `main.rs::build_native`). Everything else stays a styled `div`.
 pub fn is_native_tag(tag: &str) -> bool {
-    matches!(tag, "checkbox" | "switch" | "button" | "select")
+    matches!(tag, "checkbox" | "switch" | "button" | "select" | "date")
 }

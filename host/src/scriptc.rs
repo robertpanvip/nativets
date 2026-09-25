@@ -60,6 +60,7 @@ type InitFn = unsafe extern "C" fn();
 type TickFn = unsafe extern "C" fn();
 type PollFn = unsafe extern "C" fn(*mut *const u8, *mut usize);
 type EventFn = unsafe extern "C" fn(*const u8, usize);
+#[allow(dead_code)] // set via GetProcAddress below, not via this alias (yet)
 type PanicSinkFn = unsafe extern "C" fn(*mut c_void, *const u8, usize, u64);
 
 struct ScriptcApi {

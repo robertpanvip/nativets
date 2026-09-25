@@ -8,13 +8,20 @@ description = "GPUI render host for PerryTS-compiled TypeScript frontends (mutat
 gpui-pre = { version = "=0.3.3" }
 gpui-pre-platform = { version = "=0.3.3" }
 # Real component library for the native widget tags (checkbox/switch/button/
-# select). Its `gpui` dependency IS gpui-pre (renamed), so both share our
+# select/date). Its `gpui` dependency IS gpui-pre (renamed), so both share our
 # pinned 0.3.3 tree — no forked GPUI.
 gpui-component = "0.6.1"
+# Pulled in explicitly so the adapter layer can use gpui-base primitives
+# directly (VirtualList, DatePicker base types, Calendar) rather than only
+# through gpui-component's re-exports.
+gpui-base = "0.6.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 async-channel = "2"
 rquickjs = { version = "0.14.0", features = ["std"] }
+# Date string parsing for the native DatePicker's controlled `setValue`.
+# Already in the graph transitively (via gpui-component), no new download.
+chrono = "0.4"
 # OS CSPRNG behind crypto.getRandomValues / crypto.randomUUID (bom.rs).
 # Already in the graph transitively, so this pulls in no new download.
 getrandom = "0.2"
