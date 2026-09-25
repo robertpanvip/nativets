@@ -21,12 +21,30 @@ fn main() {
     // cargo would not rebuild when the bootstrap JS changes.
     println!("cargo:rerun-if-changed=src/bootstrap.js");
 
-    // scriptc DLL backend: cfg enabled purely by the DLL's presence at build
-    // time (runtime resolution re-checks both locations and can also be forced
-    // with `host.exe scriptc`). LoadLibrary means nothing is linked here.
+    // ── scriptc backend ───────────────────────────────────────────────────
+    // Two shapes, chosen by what ui/build-scriptc.mjs left in build/:
+    //   * STATIC (preferred): build/scriptc/sc-main.lib.c — the program TU
+    //     scriptc emits with profile `emission:"c"`. It is compiled together
+    //     with the vendored MSVC runtime (vendor/scriptc-runtime) straight into
+    //     THIS binary via the cc crate, so the scriptc backend shares rustc's
+    //     UCRT instance — the same embedding shape as the QuickJS backend, and
+    //     a single self-contained exe (no DLL).
+    //   * DLL (legacy fallback): build/scriptc_fe.dll — a mingw-CRT shared
+    //     library resolved at runtime with LoadLibraryExA.
+    println!("cargo:rustc-check-cfg=cfg(scriptc_static)");
+    println!("cargo:rustc-check-cfg=cfg(scriptc_dll)");
+    println!("cargo:rerun-if-env-changed=GPUI_TS_NO_SCRIPTC");
+    println!("cargo:rerun-if-changed=../build/scriptc");
     println!("cargo:rerun-if-changed=../build/scriptc_fe.dll");
-    if std::env::var("GPUI_TS_NO_SCRIPTC").is_err() && std::path::Path::new("../build/scriptc_fe.dll").exists() {
-        println!("cargo:rustc-cfg=scriptc");
+    if std::env::var("GPUI_TS_NO_SCRIPTC").is_err() {
+        if std::path::Path::new("../build/scriptc/sc-main.lib.c").exists() {
+            build_scriptc_static();
+            println!("cargo:rustc-cfg=scriptc");
+            println!("cargo:rustc-cfg=scriptc_static");
+        } else if std::path::Path::new("../build/scriptc_fe.dll").exists() {
+            println!("cargo:rustc-cfg=scriptc");
+            println!("cargo:rustc-cfg=scriptc_dll");
+        }
     }
 
     // QuickJS-embedded mode: link the rquickjs engine instead of Perry's
@@ -201,4 +219,151 @@ fn serde_json_lite(txt: &str) -> Option<Vec<std::collections::HashMap<String, St
         out.push(map);
     }
     Some(out)
+}
+
+/// Compile the vendored scriptc runtime + the generated program TU into this
+/// binary with the MSVC toolchain (`cc` crate → `cl.exe`), so the scriptc
+/// backend shares rustc's UCRT instance instead of crossing a mingw-CRT DLL
+/// boundary.
+///
+/// The runtime file list is exactly the set scriptc's library-mode archive
+/// contains — verified with `zig ar t entry.lib.a` on a real app graph. Library
+/// mode is async-free by construction, so `scr_async` / `scr_crypto_async` /
+/// `scr_child` / `scr_ffi` are absent, as are the zlib/regex/TLS gated units.
+/// Keep this list in sync if a frontend graph ever reaches a new capability.
+fn build_scriptc_static() {
+    let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
+    let root = manifest.join("../vendor/scriptc-runtime");
+    let src = root.join("src");
+    let shim = root.join("shim");
+    let program_c = manifest.join("../build/scriptc/sc-main.lib.c");
+
+    // cc-rs normally injects the MSVC INCLUDE/LIB/PATH itself, but when the
+    // build starts from a bare shell (no vcvars) the Windows SDK include dirs
+    // can be missing, and the vendored shim needs UCRT headers (direct.h …).
+    // Apply the discovered toolchain env explicitly so the build is
+    // independent of the caller's shell.
+    let msvc_env = msvc_tool_env();
+    // cc-rs's `.env()` does not reliably reach cl.exe here, so also hand the
+    // toolchain's INCLUDE dirs to the compiler as explicit include flags
+    // (parsed from the very same env value).
+    let sys_includes: Vec<PathBuf> = msvc_env
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("INCLUDE"))
+        .map(|(_, v)| {
+            v.to_string_lossy()
+                .split(';')
+                .filter(|s| !s.trim().is_empty())
+                .map(|s| PathBuf::from(s.trim()))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    // The library-mode runtime: the executable lane's base set minus the
+    // fiber/loop + child + outbound-FFI units, plus scr_library.c (sink, arena,
+    // reset registry, the host-pull funnel) and the Win32 arm.
+    let runtime = [
+        "scr_number.c",
+        "scr_string.c",
+        "scr_array.c",
+        "scr_bytes.c",
+        "scr_bytes_io.c",
+        "scr_map.c",
+        "scr_closure.c",
+        "scr_object.c",
+        "scr_union.c",
+        "scr_exception.c",
+        "scr_error.c",
+        "scr_console.c",
+        "scr_lib.c",
+        "scr_path.c",
+        "scr_url.c",
+        "scr_json.c",
+        "scr_cycle.c",
+        "scr_library.c",
+        "scr_win.c",
+    ];
+
+    let mut build = cc::Build::new();
+    for (k, v) in &msvc_env {
+        build.env(k, v);
+    }
+    for d in &sys_includes {
+        build.include(d);
+    }
+    for f in runtime {
+        build.file(src.join(f));
+    }
+    // MSVC shims the vendored runtime needs: unistd/dirent/clock + the
+    // GCC/Clang builtin shims (popcount/clz/ctz) scr_string.c et al. call.
+    for f in ["scr_msvc_builtins.c", "scr_msvc_clock.c", "dirent-shim.c"] {
+        build.file(shim.join(f));
+    }
+    build
+        .include(&src)
+        .include(&shim)
+        .include(root.join("vendor/ryu")) // scr_number.c pulls ../vendor/ryu/d2s.c
+        .std("c17")
+        .define("SCR_LIB", None) // library flavor discipline (scr_runtime.h)
+        .define("_CRT_SECURE_NO_WARNINGS", None)
+        .define("NOMINMAX", None)
+        .define("WIN32_LEAN_AND_MEAN", None)
+        .define("_WIN32_WINNT", "0x0A00")
+        .define("QUICKJS_NG_BUILD", None)
+        .define("_GNU_SOURCE", None)
+        .flag("/utf-8") // generated C carries UTF-8 string literals
+        .warnings(false)
+        .opt_level(2)
+        .compile("scriptc_runtime");
+
+    // The generated program TU — defines gpts_init / gpts_tick / gpts_poll /
+    // gpts_event / gpts_set_panic_sink / gpts_reset. No main() to rename: the
+    // library ABI's entry IS gpts_init.
+    let mut prog = cc::Build::new();
+    for (k, v) in &msvc_env {
+        prog.env(k, v);
+    }
+    for d in &sys_includes {
+        prog.include(d);
+    }
+    prog.file(&program_c)
+        .include(&src)
+        .include(&shim)
+        .std("c17")
+        .define("SCR_LIB", None)
+        .define("_CRT_SECURE_NO_WARNINGS", None)
+        .define("NOMINMAX", None)
+        .define("WIN32_LEAN_AND_MEAN", None)
+        .define("_WIN32_WINNT", "0x0A00")
+        .flag("/utf-8")
+        .warnings(false)
+        .opt_level(2)
+        .compile("scriptc_program");
+
+    for l in ["advapi32", "iphlpapi", "ws2_32", "bcrypt", "userenv"] {
+        println!("cargo:rustc-link-lib={l}");
+    }
+    println!("cargo:rerun-if-changed={}", src.display());
+    println!("cargo:rerun-if-changed={}", shim.display());
+    println!("cargo:rerun-if-changed={}", program_c.display());
+}
+
+/// The MSVC toolchain's INCLUDE/LIB/PATH, discovered through the same registry
+/// lookup cc-rs performs for cl.exe. Returned as owned pairs so they can be
+/// applied to a `cc::Build` via `.env()`. Empty off-Windows / when no VS is
+/// found (then cc-rs's own detection is all we have).
+fn msvc_tool_env() -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
+    #[cfg(windows)]
+    {
+        let target =
+            std::env::var("TARGET").unwrap_or_else(|_| "x86_64-pc-windows-msvc".to_string());
+        if let Some(tool) = cc::windows_registry::find_tool(&target, "cl.exe") {
+            return tool
+                .env()
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+        }
+    }
+    Vec::new()
 }

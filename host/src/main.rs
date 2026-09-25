@@ -44,9 +44,10 @@ mod embedded;
 #[cfg(quickjs)]
 mod quickjs;
 
-/// scriptc DLL backend (cfg `scriptc`): LoadLibrary + FFI over
-/// `build/scriptc_fe.dll` (built by `ui/build-scriptc.mjs`; needs zig at
-/// BUILD time only — the host never does).
+/// scriptc AOT backend (cfg `scriptc`): either a statically linked MSVC
+/// runtime + program TU (cfg `scriptc_static`, built by `ui/build-scriptc.mjs`
+/// — no DLL, shares the rustc UCRT), or the legacy mingw DLL loaded with
+/// LoadLibrary (cfg `scriptc_dll`).
 #[cfg(scriptc)]
 mod scriptc;
 
@@ -1667,21 +1668,31 @@ fn resolve_frontend() -> Frontend {
         return Frontend::Child { cmd: arg, args: vec![] };
     }
     // Explicit selection only: GPUI_TS_BACKEND=scriptc. QuickJS stays the
-    // default even when the DLL ships next to the exe — a stale DLL must not
-    // silently hijack the primary backend.
+    // default even when a scriptc artifact ships next to the exe — a stale one
+    // must not silently hijack the primary backend.
     #[cfg(scriptc)]
     {
         if std::env::var("GPUI_TS_BACKEND").as_deref() == Ok("scriptc") {
-            let exe_dir = std::env::current_exe()
-                .ok()
-                .and_then(|p| p.parent().map(|d| d.to_path_buf()));
-            let dll_next_to_exe =
-                exe_dir.map(|d| d.join("scriptc_fe.dll")).is_some_and(|p| p.exists());
-            if dll_next_to_exe || std::path::Path::new("build/scriptc_fe.dll").exists() {
+            // Static build (scriptc_static): the engine is linked into this
+            // binary — nothing to resolve.
+            #[cfg(scriptc_static)]
+            {
                 return Frontend::Scriptc;
             }
-            log!("[host] GPUI_TS_BACKEND=scriptc but scriptc_fe.dll not found next to exe or in ./build");
-            std::process::exit(2);
+            // Legacy DLL build (scriptc_dll): the shared library must exist.
+            #[cfg(scriptc_dll)]
+            {
+                let exe_dir = std::env::current_exe()
+                    .ok()
+                    .and_then(|p| p.parent().map(|d| d.to_path_buf()));
+                let dll_next_to_exe =
+                    exe_dir.map(|d| d.join("scriptc_fe.dll")).is_some_and(|p| p.exists());
+                if dll_next_to_exe || std::path::Path::new("build/scriptc_fe.dll").exists() {
+                    return Frontend::Scriptc;
+                }
+                log!("[host] GPUI_TS_BACKEND=scriptc but scriptc_fe.dll not found next to exe or in ./build");
+                std::process::exit(2);
+            }
         }
     }
     #[cfg(quickjs)]
@@ -1827,13 +1838,16 @@ fn main() {
         }
         #[cfg(scriptc)]
         Frontend::Scriptc => {
+            #[cfg(scriptc_static)]
+            log!("[host] scriptc mode: static AOT runtime (linked in-process)");
+            #[cfg(scriptc_dll)]
             log!("[host] scriptc mode: AOT DLL via LoadLibrary FFI");
             let host = scriptc::launch(ops_tx.clone());
             log!("[host] scriptc engine loaded in {:?}", t_start.elapsed());
 
             // Ops flow through the driver thread into the shared channel
-            // (the DLL pushes them via ingest_line inside scriptc.rs);
-            // events are queued and drained by the same driver quantum.
+            // (scriptc.rs pushes them via ingest_line); events are queued and
+            // drained by the same driver quantum.
             run_event_queuer(host.sink.clone(), ev_rx);
 
             application().run(move |cx: &mut App| {

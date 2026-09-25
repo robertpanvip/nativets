@@ -28,5 +28,10 @@ chrono = "0.4"
 # Already in the graph transitively, so this pulls in no new download.
 getrandom = "0.2"
 
+[build-dependencies]
+# Compiles the vendored scriptc runtime + the generated program TU with the
+# MSVC toolchain (cl.exe) into this binary's static link — see build.rs.
+cc = "1"
+
 [profile.dev]
 opt-level = 1
