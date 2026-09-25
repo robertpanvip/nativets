@@ -51,7 +51,7 @@ mod quickjs;
 mod scriptc;
 
 use draw::Cmd as DrawCmd;
-use tree::{Node, Op, Tree};
+use tree::{is_native_tag, Node, Op, Tree};
 
 use gpui::{
     canvas, deferred, div, fill, point, prelude::*, px, relative, rgb, rgba, size, AnyElement, App,
@@ -479,6 +479,9 @@ impl HostView {
         if node.is_input() {
             return Some(self.build_input(&node, id, no_shrink, window, cx));
         }
+        if is_native_tag(&node.tag) {
+            return Some(self.build_native(&node, id, cx));
+        }
         Some(self.build_plain(&node, id, no_shrink, window, cx))
     }
 
@@ -705,6 +708,128 @@ impl HostView {
             move |this, ev: &KeyDownEvent, window, cx| this.input_key(id, ev, window, cx),
         ));
         s.into_any_element()
+    }
+
+    /// A native-widget node (`checkbox` / `switch` / `button` / `select`):
+    /// rendered as a real `gpui_component` control instead of a styled div.
+    ///
+    /// The controlled contract is the same as `input`'s: the frontend owns
+    /// the state and pushes it through `setValue` (checkbox/switch spell it
+    /// `"true"`/`"false"`, select carries the option text), and the control's
+    /// user interaction is echoed back as an event — the app decides what the
+    /// new state is, its setter re-runs the getter, and the next frame
+    /// reflects it. The host never flips a bit on its own.
+    fn build_native(
+        &mut self,
+        node: &Node,
+        id: u64,
+        _cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let element_id = ElementId::from(SharedString::from(format!("node-{id}")));
+        let checked = node.value.as_deref() == Some("true");
+        // Label: the node's own text if set, else the concatenated text of its
+        // `text`-tag children. JSX spells `<button>＋</button>` as a child text
+        // node (mountText), so the button's own `text` field stays empty and
+        // the label has to be gathered from the subtree.
+        let mut label = node
+            .text
+            .clone()
+            .or_else(|| node.placeholder.clone())
+            .unwrap_or_default();
+        if label.is_empty() {
+            for child_id in &node.children {
+                if let Some(child) = self.tree.node(*child_id) {
+                    if child.tag == "text" {
+                        if let Some(t) = &child.text {
+                            label.push_str(t);
+                        }
+                    }
+                }
+            }
+        }
+
+        match node.tag.as_str() {
+            "checkbox" | "switch" => {
+                // Switch and Checkbox are distinct types; each branch finishes
+                // its own control and shares only the event handler.
+                let is_switch = node.tag == "switch";
+                let tx = self.event_tx.clone();
+                if is_switch {
+                    let mut ctl = gpui_component::switch::Switch::new(element_id).checked(checked);
+                    if !label.is_empty() {
+                        ctl = ctl.label(label);
+                    }
+                    ctl.on_click(toggle_handler(id, tx)).into_any_element()
+                } else {
+                    let mut ctl =
+                        gpui_component::checkbox::Checkbox::new(element_id).checked(checked);
+                    if !label.is_empty() {
+                        ctl = ctl.label(label);
+                    }
+                    ctl.on_click(toggle_handler(id, tx)).into_any_element()
+                }
+            }
+            "button" => {
+                let tx = self.event_tx.clone();
+                let mut b = gpui_component::button::Button::new(element_id)
+                    .when(!label.is_empty(), |b| b.label(label));
+                // Protocol styles pass straight through (Button is Styled);
+                // the component's own rounded chrome is kept.
+                for (k, v) in sorted_style(node) {
+                    if k == "borderRadius" {
+                        continue;
+                    }
+                    b = apply_style(b, k, v);
+                }
+                b.on_click(move |_ev: &ClickEvent, _window, _cx| {
+                    let msg = json!({ "t": "event", "target": id, "kind": "click" })
+                        .to_string();
+                    log!("[host] ev click id={id} t={} {msg}", now_ms());
+                    let _ = tx.send(msg);
+                })
+                .into_any_element()
+            }
+            "select" => {
+                // A plain styled trigger that opens the host's own popup menu
+                // is a bigger cut; for now render the options as a button
+                // showing the current value and cycle through the list on
+                // click — the controlled contract (value down, change up) is
+                // identical to the final dropdown.
+                let options = node.select_options();
+                let current = node
+                    .value
+                    .as_deref()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| options.first().cloned().unwrap_or_default());
+                let tx = self.event_tx.clone();
+                let mut b = gpui_component::button::Button::new(element_id)
+                    .when(!current.is_empty(), |b| b.label(current.clone()));
+                for (k, v) in sorted_style(node) {
+                    if k == "borderRadius" {
+                        continue;
+                    }
+                    b = apply_style(b, k, v);
+                }
+                b.on_click(move |_ev: &ClickEvent, _window, _cx| {
+                        // Cycle: pick the option after the current one.
+                        let next = options
+                            .iter()
+                            .position(|o| *o == current)
+                            .map(|i| (i + 1) % options.len())
+                            .unwrap_or(0);
+                        let value = options.get(next).cloned().unwrap_or_default();
+                        let msg = json!({
+                            "t": "event", "target": id, "kind": "change",
+                            "value": value
+                        })
+                        .to_string();
+                        log!("[host] ev change id={id} t={} {msg}", now_ms());
+                        let _ = tx.send(msg);
+                    })
+                    .into_any_element()
+            }
+            _ => div().into_any_element(),
+        }
     }
 
     /// A `canvas` node: a wrapper for placement + interactivity, and the canvas
@@ -1086,6 +1211,24 @@ fn sorted_style(node: &Node) -> Vec<(&String, &Value)> {
     let mut pairs: Vec<(&String, &Value)> = node.style.iter().collect();
     pairs.sort_by_key(|(k, _)| style_rank(k));
     pairs
+}
+
+/// Shared `on_click` handler for checkbox/switch: echoes the *new* state back
+/// to the frontend as a `change` event. The app decides what to keep — the
+/// host never flips a bit on its own (same controlled contract as `input`).
+fn toggle_handler(
+    id: u64,
+    tx: mpsc::Sender<String>,
+) -> impl Fn(&bool, &mut Window, &mut App) + 'static {
+    move |checked: &bool, _window, _cx| {
+        let msg = json!({
+            "t": "event", "target": id, "kind": "change",
+            "value": if *checked { "true" } else { "false" }
+        })
+        .to_string();
+        log!("[host] ev change id={id} t={} {msg}", now_ms());
+        let _ = tx.send(msg);
+    }
 }
 
 fn num_of(node: &Node, key: &str) -> Option<f32> {
@@ -1828,6 +1971,13 @@ fn open_host_window(
     ev_tx: mpsc::Sender<String>,
     metrics: Option<Arc<bom::WindowMetrics>>,
 ) -> gpui::WindowHandle<HostView> {
+    // gpui-component's global state (theme, root rendering, input machinery).
+    // Idempotent per-process; called once before any window opens.
+    gpui_component::init(cx);
+    // `init` pins Light mode; the dashboard's palette is dark, so flip the
+    // component theme to match — otherwise native buttons come out white-on-
+    // white against the dark cards.
+    gpui_component::Theme::change(gpui_component::ThemeMode::Dark, None, cx);
     let bounds = Bounds {
         origin: point(px(80.0), px(50.0)),
         size: size(px(WINDOW_W), px(WINDOW_H)),
@@ -1912,6 +2062,11 @@ fn spawn_ops_apply(
                     }
                     if dump_tree_enabled() && ops.len() >= 32 {
                         log!("[host] tree after {} ops:\n{}", ops.len(), view.tree.dump());
+                    }
+                    // AOT 前端把挂载摊成单 op 行（batch ops=1），≥32 阈值永不触发；
+                    // 早期批次（前 400 个 op）也 dump，便于排障。
+                    if dump_tree_enabled() && OPS_SEEN.load(Ordering::Relaxed) < 400 {
+                        log!("[host] early tree after {} ops:\n{}", ops.len(), view.tree.dump());
                     }
                     cx.notify();
                 });

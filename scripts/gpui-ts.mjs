@@ -7,14 +7,10 @@
 //   ── quickjs（默认）──────────────────────────────────────────────────────
 //   1. esbuild 把 TS 打包成单个 IIFE JS（ui/dist/main.js，charset=ascii）
 //   2. host 内嵌 QuickJS 引擎（rquickjs），bundle 用 include_str! 编进 exe，
-//      自驱事件循环（promise jobs + timers + 事件派发；Direct 传输下事件到达
-//      即唤醒，不必等下一个 tick）
+//      自驱事件循环（promise jobs + timers + 事件派发；事件到达即唤醒，
+//      不必等下一个 tick）
+//   3. 协议不走 stdio：宿主注入 __hostEmit 收 op，事件直灌引擎入站队列
 //   产物 ~11MB，零 Node、零子进程、零 sidecar 文件。
-//
-//   运行时传输（**编译期无关**，同一个 exe 两种都支持）：
-//     direct（默认）— 宿主注入 __hostEmit / 事件直灌队列：无管道、无线程
-//     pipe          — stdio 管道 + 读写线程：历史基线，远程排障用
-//   切换：GPUI_TS_TRANSPORT=pipe 或 host 参数 --transport=pipe
 //
 //   ── perry（历史后端，--backend perry）────────────────────────────────────
 //   1. perry compile <entry> --output-type staticlib
@@ -26,7 +22,7 @@
 //
 // 产物运行：直接双击 / 命令行执行即可，GPUI 窗口即 TS 应用 UI。
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, copyFileSync, statSync } from "node:fs";
+import { existsSync, mkdirSync, copyFileSync, statSync, readFileSync, readdirSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -89,12 +85,6 @@ function emit() {
     const mb = (statSync(out).size / 1024 / 1024).toFixed(1);
     console.log(`[gpui-ts] ✔ ${out}  ${mb} MB · 单文件 · 零子进程 · 无 Node/V8 依赖`);
     console.log(`[gpui-ts]   运行：直接执行即可；GPUI 窗口即 TS 应用 UI`);
-    if (backend === "quickjs") {
-        console.log(
-            `[gpui-ts]   运行时传输（默认 direct，无需重新编译）：` +
-                ` GPUI_TS_TRANSPORT=pipe 或 --transport=pipe 切回 stdio 管道`
-        );
-    }
 }
 
 // ===========================================================================
@@ -127,6 +117,54 @@ if (backend === "quickjs") {
     }
     emit();
     process.exit(0);
+}
+
+/**
+ * 断言 exe 里真的含有这一版前端的代码（仅 perry 后端需要）。
+ *
+ * perry 的 app archive 是在 /FORCE:MULTIPLE 下链进宿主的：archive 名字与
+ * build.rs 期望的路径一旦对不上，链接照样成功、应用照样启动，只是跑的是
+ * **上一版冻结的源码**——界面一动不动，且宿主日志里没有任何告警。
+ * 这个坑花掉过一整轮排查（docs/gpui-ts-plan.md 坑 #7）。
+ *
+ * 哨兵选法：从 gen 产物（即真正喂给 perry 的那份代码）里抽带 CJK 的字符串
+ * 字面量，均匀取几条去 exe 二进制里找。CJK 字面量在 perry 运行时是原样
+ * UTF-8 存储的，所以 indexOf 就能验证。全部命中才算通过——陈旧 archive
+ * 必然缺掉新版才有的字面量。
+ */
+function verifyEmbeddedApp(exePath, genDir) {
+    if (process.env.PERRY_SKIP_EMBED_VERIFY === "1") return;
+    const literals = [];
+    for (const f of readdirSync(genDir).filter((f) => f.endsWith(".ts"))) {
+        const src = readFileSync(path.join(genDir, f), "utf8");
+        for (const m of src.matchAll(/"([^"\n]{4,})"/g)) {
+            // gen 产物是 charset=ascii，CJK 全部写成 \uXXXX / \xNN
+            const s = m[1].replace(
+                /\\(?:u([0-9a-fA-F]{4})|x([0-9a-fA-F]{2}))/g,
+                (_, u, x) => String.fromCharCode(parseInt(u ?? x, 16))
+            );
+            if (/[\u3400-\u9fff]/.test(s) && !s.includes("\\")) literals.push(s);
+        }
+    }
+    const uniq = [...new Set(literals)];
+    if (uniq.length === 0) return; // 没有可用哨兵（非 CJK 项目），跳过
+
+    const step = Math.max(1, Math.floor(uniq.length / 5));
+    const probes = [];
+    for (let i = 0; i < uniq.length && probes.length < 5; i += step) probes.push(uniq[i]);
+
+    const buf = readFileSync(exePath);
+    const missing = probes.filter((p) => buf.indexOf(Buffer.from(p, "utf8")) < 0);
+    if (missing.length === 0) {
+        console.log(`[gpui-ts] ✔ 嵌入校验：exe 命中当前前端字符串 ${probes.length}/${probes.length}`);
+        return;
+    }
+    console.error(`[gpui-ts] ✘ 嵌入校验失败：exe 缺少当前前端的 ${missing.length} 条字符串`);
+    for (const p of missing) console.error(`[gpui-ts]     · ${p}`);
+    console.error("[gpui-ts]   说明：链接成功但内容陈旧 —— 多半是 build.rs 链到了别的 app archive。");
+    console.error("[gpui-ts]   检查 build/ 下各 .lib 的时间戳，以及 build.rs 解析的 PERRY_STATIC_LIB_BASE。");
+    console.error("[gpui-ts]   确认无误时可用 PERRY_SKIP_EMBED_VERIFY=1 跳过。");
+    process.exit(1);
 }
 
 // ===========================================================================
@@ -187,3 +225,4 @@ if (!existsSync(HOST_EXE)) {
 
 console.log("[gpui-ts] 4/4 拷贝产物");
 emit();
+verifyEmbeddedApp(out, gen.dir);

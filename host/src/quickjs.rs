@@ -11,16 +11,16 @@
 //!   * no duplicate Rust std in the link (Perry bundles one) → /FORCE:MULTIPLE
 //!     and its symbol-splitting hazards disappear
 //!   * QuickJS C core is ~1-2MB vs Perry's 5.9MB runtime → smaller exe
-//!   * because the engine is *in process*, we can inject the transport as host
-//!     functions instead of faking a stdio pipe (see `Transport`)
+//!   * because the engine is *in process*, the transport is an injected host
+//!     function rather than a faked stdio pipe (see the Transport note below)
 //!
 //! Threading: a `QuickJS Context` is `!Send`, so the engine runs on its own
 //! dedicated OS thread. The host communicates with it only through an inbound
-//! queue (`Arc<Mutex<Vec<String>>>`) and — depending on `Transport` — an
-//! injected `__hostEmit` host function.
+//! queue (`Arc<Mutex<Vec<String>>>`) and the injected `__hostEmit` host
+//! function.
 
 use std::fs::File;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::windows::io::{FromRawHandle, RawHandle};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -29,18 +29,15 @@ use std::time::Duration;
 use rquickjs::function::Args;
 use rquickjs::{Array, Context, Ctx, Function, Object, Runtime};
 
+use crate::bom;
 use crate::tree::Op;
 
 // --- minimal Win32 surface (no external deps) ---
 type Handle = *mut core::ffi::c_void;
-const STD_INPUT_HANDLE: u32 = 0xFFFF_FFF6;
-const STD_OUTPUT_HANDLE: u32 = 0xFFFF_FFF5;
 const STD_ERROR_HANDLE: u32 = 0xFFFF_FFF4;
 
 unsafe extern "system" {
-    fn CreatePipe(r: *mut Handle, w: *mut Handle, attrs: *const u32, size: u32) -> i32;
     fn GetStdHandle(which: u32) -> Handle;
-    fn SetStdHandle(which: u32, h: Handle) -> i32;
 }
 
 /// Sentinel pushed to the inbound queue when the host shuts down, so the app's
@@ -52,58 +49,38 @@ const QJS_EOF_MARKER: &str = "\u{0}__qjs_eof__\u{0}";
 /// Engine tick cadence. Also the idle wake-up period when parked.
 const TICK: Duration = Duration::from_millis(10);
 
+/// Prefix that marks a host-internal BOM geometry push on the event channel.
+/// `{"t":"bom"` — checked instead of parsing every line, and can never collide
+/// with an app event line (those are `{"t":"event"…}`) or with `QJS_EOF_MARKER`.
+const BOM_LINE_PREFIX: &str = "{\"t\":\"bom\"";
+
+/// The JS environment installed before the app bundle runs (timers, `process`
+/// shim, console, and the BOM). Kept as a real `.js` file rather than a Rust
+/// raw string so it is editable/lintable and so the node test suite can load
+/// the exact same source. `build.rs` declares a rerun-if-changed on it.
+const BOOTSTRAP_JS: &str = include_str!("bootstrap.js");
+
 // ---------------------------------------------------------------------------
-// Transport: how the host and the engine exchange protocol lines
+// Transport
 // ---------------------------------------------------------------------------
-
-/// Both transports carry the *same* JSONL protocol lines; only the carrier
-/// differs.
-///
-/// `Pipe` — the historical path, and the only one possible for an
-/// **out-of-process** frontend (child mode, Perry child). stdio is redirected
-/// into anonymous pipes (`SetStdHandle`), a reader thread parses lines off the
-/// out pipe, and a writer thread pushes events into the in pipe where a second
-/// reader thread turns them back into lines for the engine to drain.
-///
-/// `Direct` — only possible *because* the engine is in-process, and the reason
-/// it is the default: the TS side gets a `__hostEmit` host function, so a batch
-/// goes straight from JS into the host's ops channel (no pipe, no reader
-/// thread, no line round-trip), and events are pushed straight into the
-/// engine's inbound queue plus an `unpark` — so dispatch happens on the spot
-/// instead of on the next tick.
-///
-/// The frontend picks its carrier at runtime (`typeof __hostEmit`), so a single
-/// compiled bundle works with both — switching transports needs no rebuild.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Transport {
-    Direct,
-    Pipe,
-}
-
-impl Transport {
-    /// Parse a user-supplied transport name. Unknown values fall back to the
-    /// default (Direct) rather than failing the boot.
-    pub fn parse(s: &str) -> Transport {
-        match s.trim().to_ascii_lowercase().as_str() {
-            "pipe" | "stdio" | "pipes" => Transport::Pipe,
-            "direct" | "inject" | "injected" => Transport::Direct,
-            other => {
-                crate::log_line(&format!(
-                    "[qjs] unknown transport `{other}` (expected `direct` or `pipe`); using direct"
-                ));
-                Transport::Direct
-            }
-        }
-    }
-
-    /// `GPUI_TS_TRANSPORT=pipe|direct` (default `direct`).
-    pub fn from_env() -> Transport {
-        match std::env::var("GPUI_TS_TRANSPORT") {
-            Ok(v) if !v.is_empty() => Transport::parse(&v),
-            _ => Transport::Direct,
-        }
-    }
-}
+//
+// There is exactly one carrier now: the host injects `__hostEmit` as a JS
+// global, so a batch of ops goes straight from the engine into the host's ops
+// channel, and events are pushed straight into the engine's inbound queue plus
+// an `unpark`.
+//
+// The historical alternative — faking a stdio pipe between the host and an
+// in-process engine (`SetStdHandle` redirection, a reader thread parsing lines
+// off the out pipe, a writer thread pushing events into the in pipe, then a
+// second reader turning them back into lines) — has been removed. It existed
+// because the Perry-era frontend was a real child process, but once the engine
+// moved in-process it bought nothing and cost two threads plus one full tick of
+// latency per event (see docs/gpui-ts-plan.md). It also kept the misleading
+// "stdio *is* the protocol" framing alive.
+//
+// Out-of-process frontends (`Frontend::Child`, `Frontend::Embedded`) keep their
+// own stdio/pipe wiring in `main.rs` and `embedded.rs`; nothing here applies to
+// them.
 
 // ---------------------------------------------------------------------------
 // Host-side handles
@@ -132,65 +109,15 @@ impl EventSink {
     }
 }
 
-/// Everything `main` needs from the QuickJS backend. In `Direct` mode both pipe
-/// handles are `None` — the transport never touches stdio.
+/// Everything `main` needs from the QuickJS backend.
 pub struct QuickJsHost {
-    /// Writable end of the frontend's stdin pipe (`Pipe` mode only).
-    pub frontend: Option<QuickJsFrontend>,
-    /// Readable end of the frontend's stdout pipe (`Pipe` mode only).
-    pub out_r: Option<File>,
-    /// Always available: the injected event channel.
+    /// The injected event channel — the only carrier there is.
     pub sink: EventSink,
-}
-
-fn make_pipe() -> (Handle, Handle) {
-    let mut r: Handle = std::ptr::null_mut();
-    let mut w: Handle = std::ptr::null_mut();
-    let ok = unsafe { CreatePipe(&mut r, &mut w, std::ptr::null(), 0) };
-    assert!(ok != 0 && !r.is_null() && !w.is_null(), "CreatePipe failed");
-    (r, w)
 }
 
 /// Save the original stderr BEFORE any redirection so host diagnostics survive.
 pub fn save_original_stderr() -> Handle {
     unsafe { GetStdHandle(STD_ERROR_HANDLE) }
-}
-
-/// Host → frontend event writer over a pipe (`Pipe` mode only).
-pub struct QuickJsFrontend {
-    stdin: RawHandle,
-}
-// Windows pipe handles have no thread affinity; the writer thread owns it.
-unsafe impl Send for QuickJsFrontend {}
-
-impl std::io::Write for QuickJsFrontend {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        let mut f = unsafe { File::from_raw_handle(self.stdin) };
-        let r = f.write(buf);
-        std::mem::forget(f); // keep the pipe open across calls
-        r
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        let mut f = unsafe { File::from_raw_handle(self.stdin) };
-        let r = f.flush();
-        std::mem::forget(f);
-        r
-    }
-}
-
-impl QuickJsFrontend {
-    /// Kept API-parallel with `embedded::EmbeddedFrontend`; the event writer
-    /// itself goes through the `Write` impl above, so this is unused today.
-    #[allow(dead_code)]
-    pub fn write_line(&self, line: &str) -> std::io::Result<()> {
-        let mut f = unsafe { File::from_raw_handle(self.stdin) };
-        let r = f
-            .write_all(line.as_bytes())
-            .and_then(|_| f.write_all(b"\n"))
-            .and_then(|_| f.flush());
-        std::mem::forget(f); // keep the pipe open across calls
-        r
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -206,22 +133,22 @@ struct Engine {
     ctx: Context,
     /// host → engine, drained every tick.
     queue: Arc<Mutex<Vec<String>>>,
-    /// engine → host, handed to the injected `__hostEmit` (Direct mode).
+    /// engine → host, handed to the injected `__hostEmit`.
     ops_tx: async_channel::Sender<Vec<Op>>,
-    /// Write end of the frontend's stdout pipe; `None` in Direct mode, where
-    /// stdout is no longer a protocol channel.
-    out_w: Option<usize>,
     stderr_tee: usize,
-    transport: Transport,
+    /// BOM: window/display geometry, written by the GPUI thread.
+    metrics: Arc<bom::WindowMetrics>,
+    /// BOM: `alert`/`confirm` requests → UI thread.
+    dialogs: async_channel::Sender<bom::DialogRequest>,
 }
 
 impl Engine {
     fn new(
-        out_w: Option<usize>,
         stderr_tee: usize,
         queue: Arc<Mutex<Vec<String>>>,
         ops_tx: async_channel::Sender<Vec<Op>>,
-        transport: Transport,
+        metrics: Arc<bom::WindowMetrics>,
+        dialogs: async_channel::Sender<bom::DialogRequest>,
     ) -> Self {
         let rt = Runtime::new().expect("[qjs] Runtime::new failed");
         let ctx = Context::full(&rt).expect("[qjs] Context::full failed");
@@ -230,64 +157,18 @@ impl Engine {
             ctx,
             queue,
             ops_tx,
-            out_w,
             stderr_tee,
-            transport,
+            metrics,
+            dialogs,
         }
     }
 
     /// Boot the engine: register host globals, eval bootstrap + app bundle,
     /// then drive the event loop forever on this thread.
     fn start(&self, bundle: String) {
-        let bootstrap = r#"
-            globalThis.__stdinCbs = {};
-            globalThis.__timers = [];
-            globalThis.__tid = 0;
-            // timers (driven by the host tick via __hostTick)
-            globalThis.__hostTick = function () {
-                var now = Date.now();
-                var ts = globalThis.__timers;
-                for (var i = 0; i < ts.length; i++) {
-                    var t = ts[i];
-                    if (t.due <= now) {
-                        try { t.cb(); } catch (e) {}
-                        if (t.interval > 0) { t.due = now + t.interval; }
-                        else { ts.splice(i, 1); i--; }
-                    }
-                }
-            };
-            globalThis.setInterval = function (cb, ms) {
-                var id = ++globalThis.__tid;
-                globalThis.__timers.push({ id: id, cb: cb, due: Date.now() + (ms || 0), interval: ms || 0 });
-                return id;
-            };
-            globalThis.setTimeout = function (cb, ms) {
-                var id = ++globalThis.__tid;
-                globalThis.__timers.push({ id: id, cb: cb, due: Date.now() + (ms || 0), interval: 0 });
-                return id;
-            };
-            globalThis.clearInterval = globalThis.clearTimeout = function (id) {
-                var ts = globalThis.__timers;
-                for (var i = 0; i < ts.length; i++) if (ts[i].id === id) { ts.splice(i, 1); return; }
-            };
-            // inbound event registration (callbacks stored in JS, no Rust Persistent)
-            process.stdin.setEncoding = function () {};
-            process.stdin.on = function (ev, cb) { globalThis.__stdinCbs[ev] = cb; };
-            // process.exit really exits (the app calls it from stdin 'end')
-            process.exit = function (code) { globalThis.__hostExit(code || 0); };
-            // console → original stderr (never the protocol channel)
-            globalThis.console = {
-                log: function () { globalThis.__hostTrace("log", Array.prototype.map.call(arguments, String).join(" ")); },
-                info: function () { globalThis.__hostTrace("info", Array.prototype.map.call(arguments, String).join(" ")); },
-                warn: function () { globalThis.__hostTrace("warn", Array.prototype.map.call(arguments, String).join(" ")); },
-                error: function () { globalThis.__hostTrace("error", Array.prototype.map.call(arguments, String).join(" ")); },
-                debug: function () { globalThis.__hostTrace("debug", Array.prototype.map.call(arguments, String).join(" ")); }
-            };
-        "#;
-
         self.ctx.with(|ctx| {
             self.register_globals(ctx.clone());
-            if let Err(e) = ctx.eval::<(), _>(bootstrap.to_string()) {
+            if let Err(e) = ctx.eval::<(), _>(BOOTSTRAP_JS) {
                 trace(self.stderr_tee, &format!("[qjs] bootstrap eval error: {:?}", e));
             }
             if bundle.is_empty() {
@@ -319,13 +200,10 @@ impl Engine {
             }
         });
 
-        // Event loop. In Direct mode we park instead of sleep, so an inbound
-        // event wakes us the moment it arrives (worst case still one tick).
+        // Event loop. We *park* rather than sleep, so an inbound event wakes us
+        // the moment it arrives (worst case still one tick).
         loop {
-            match self.transport {
-                Transport::Direct => thread::park_timeout(TICK),
-                Transport::Pipe => thread::sleep(TICK),
-            }
+            thread::park_timeout(TICK);
             self.pump();
         }
     }
@@ -336,12 +214,11 @@ impl Engine {
     /// callback (stdin.on, console) is defined in the bootstrap to avoid
     /// capturing `Ctx` (which would be a borrow escape).
     fn register_globals(&self, ctx: Ctx<'_>) {
-        let out_w = self.out_w;
         let stderr_tee = self.stderr_tee;
 
         // --- host primitives (capture usize handles / a channel; no Ctx) ---
         let host_write = Function::new(ctx.clone(), move |s: String| {
-            stdout_sink(out_w, stderr_tee, &s);
+            stdout_sink(stderr_tee, &s);
         });
         let host_trace = Function::new(ctx.clone(), move |level: String, msg: String| {
             trace(stderr_tee, &format!("[console.{}] {}", level, msg));
@@ -349,24 +226,26 @@ impl Engine {
         let _ = ctx.globals().set("__hostWrite", host_write);
         let _ = ctx.globals().set("__hostTrace", host_trace);
 
-        // --- injected transport (Direct mode only) ---
+        // --- the transport ---
         // `__hostEmit(line)` hands one protocol line to the host's ops channel
         // on the calling (engine) thread: no pipe write, no reader thread, no
         // line re-splitting. Ops are parsed here rather than downstream because
         // this thread is idle ~99% of the time anyway.
-        if self.transport == Transport::Direct {
-            let tx = self.ops_tx.clone();
-            let host_emit = Function::new(ctx.clone(), move |line: String| {
-                crate::ingest_line(&line, &tx);
-            });
-            let _ = ctx.globals().set("__hostEmit", host_emit);
-        }
+        //
+        // This global is *the* carrier — the frontend requires it (it used to
+        // feature-detect `typeof __hostEmit` and fall back to writing JSONL on
+        // stdout, which is gone; see the Transport note at the top).
+        let tx = self.ops_tx.clone();
+        let host_emit = Function::new(ctx.clone(), move |line: String| {
+            crate::ingest_line(&line, &tx);
+        });
+        let _ = ctx.globals().set("__hostEmit", host_emit);
 
         // --- process ---
         let process = Object::new(ctx.clone()).unwrap();
         let stdout = Object::new(ctx.clone()).unwrap();
         let stdout_write = Function::new(ctx.clone(), move |s: String| {
-            stdout_sink(out_w, stderr_tee, &s);
+            stdout_sink(stderr_tee, &s);
         });
         let _ = stdout.set("write", stdout_write);
         let _ = process.set("stdout", stdout);
@@ -406,6 +285,45 @@ impl Engine {
             std::process::exit(code);
         });
         let _ = ctx.globals().set("__hostExit", host_exit);
+
+        // --- BOM primitives (consumed by bootstrap.js) ---
+        // Window geometry: pull once at boot. Live updates ride the event
+        // channel as `{"t":"bom",…}` lines (see `pump`).
+        let metrics = self.metrics.clone();
+        let host_window = Function::new(ctx.clone(), move || -> String { metrics.json() });
+        let _ = ctx.globals().set("__hostWindow", host_window);
+
+        // Monotonic clock for `performance.now()`.
+        let host_perf = Function::new(ctx.clone(), || -> f64 { bom::perf_now_ms() });
+        let _ = ctx.globals().set("__hostPerfNow", host_perf);
+
+        // OS CSPRNG for `crypto.getRandomValues` / `crypto.randomUUID`.
+        // Clamped: JS must not be able to ask for an unbounded allocation.
+        let host_entropy = Function::new(ctx.clone(), |n: i32| -> String {
+            bom::entropy_hex(n.clamp(0, 65536) as usize)
+        });
+        let _ = ctx.globals().set("__hostEntropy", host_entropy);
+
+        // alert/confirm. `bom::show` BLOCKS until the user answers — that is
+        // the browser semantic (`confirm()` really does stop JS). It returns
+        // `None` only when the UI side is gone, and then we must not block.
+        let dialogs = self.dialogs.clone();
+        let host_dialog = Function::new(
+            ctx.clone(),
+            move |kind: String, message: String, _title: String| -> i32 {
+                let k = bom::DialogKind::parse(&kind);
+                match bom::show(&dialogs, k, message) {
+                    Some(v) => v,
+                    None if k.is_confirm() => 0,
+                    None => 1,
+                }
+            },
+        );
+        let _ = ctx.globals().set("__hostDialog", host_dialog);
+
+        // The host is Windows-only today (the pipe/handle FFI above is Win32),
+        // so `navigator.platform`/`userAgent` can report it honestly.
+        let _ = process.set("platform", "win32");
         let _ = ctx.globals().set("process", process);
     }
 
@@ -441,6 +359,18 @@ impl Engine {
                         }
                         continue;
                     }
+                    // BOM geometry pushes are host-internal. Apply them and keep
+                    // them off the app's stdin stream — the app would only see
+                    // an unknown `t` it has no handler for, and a future app
+                    // that switches on `t` would be surprised by a private one.
+                    if line.starts_with(BOM_LINE_PREFIX) {
+                        if let Ok(f) = ctx.globals().get::<_, Function>("__bomLine") {
+                            let mut a = Args::new(ctx.clone(), 1);
+                            let _ = a.push_arg(line);
+                            let _ = f.call_arg::<()>(a);
+                        }
+                        continue;
+                    }
                     if let Ok(cb) = cbs.get::<_, Function>("data") {
                         let mut a = Args::new(ctx.clone(), 1);
                         let _ = a.push_arg(line + "\n");
@@ -454,69 +384,34 @@ impl Engine {
     }
 }
 
-/// Boot the QuickJS engine on its own thread and return the host-side handles
-/// for the chosen transport. Mirrors `embedded::launch` for the `Pipe` case.
+/// Boot the QuickJS engine on its own thread and return the host-side handle.
+///
+/// Nothing is redirected: the engine reaches the host through injected
+/// functions (`__hostEmit` for outbound ops, `__hostWrite`/`__hostTrace` for
+/// diagnostics) and the shared queue, and stderr keeps pointing at the real
+/// terminal so JS `console` output flows through.
 pub fn launch(
     frontend_stderr_tee: RawHandle,
-    transport: Transport,
     ops_tx: async_channel::Sender<Vec<Op>>,
+    metrics: Arc<bom::WindowMetrics>,
+    dialogs: async_channel::Sender<bom::DialogRequest>,
 ) -> QuickJsHost {
     let queue: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let bundle = load_bundle();
-    let tee = frontend_stderr_tee as usize;
-
-    // --- transport-specific wiring (must happen before the engine thread) ---
-    let out_w: Option<usize>;
-    let stderr_tee: usize;
-    let mut pipe_in_w: Option<RawHandle> = None;
-    let mut pipe_out_r: Option<File> = None;
-
-    match transport {
-        Transport::Pipe => {
-            let (out_r, out_w_h) = make_pipe();
-            let (in_r, in_w) = make_pipe();
-            let (err_r, err_w) = make_pipe();
-
-            unsafe {
-                assert!(SetStdHandle(STD_OUTPUT_HANDLE, out_w_h) != 0);
-                assert!(SetStdHandle(STD_ERROR_HANDLE, err_w) != 0);
-                assert!(SetStdHandle(STD_INPUT_HANDLE, in_r) != 0);
-            }
-
-            // tee frontend stderr → original stderr (keep diagnostics off the
-            // ops pipe)
-            spawn_stderr_tee(err_r as usize, tee);
-            // reader: host → frontend events land in the queue (engine drains)
-            spawn_stdin_reader(in_r as usize, queue.clone());
-
-            out_w = Some(out_w_h as usize);
-            stderr_tee = tee;
-            pipe_in_w = Some(in_w);
-            pipe_out_r = Some(unsafe { File::from_raw_handle(out_r) });
-        }
-        Transport::Direct => {
-            // Nothing to redirect: the engine reaches the host through injected
-            // functions and the shared queue. stderr is used directly (never
-            // replaced), so js console output keeps flowing to the terminal.
-            out_w = None;
-            stderr_tee = tee;
-        }
-    }
+    let stderr_tee = frontend_stderr_tee as usize;
 
     let engine_thread = thread::Builder::new()
         .name("quickjs".to_string())
         .spawn({
             let queue = queue.clone();
             move || {
-                let engine = Engine::new(out_w, stderr_tee, queue, ops_tx, transport);
+                let engine = Engine::new(stderr_tee, queue, ops_tx, metrics, dialogs);
                 engine.start(bundle);
             }
         })
         .expect("[qjs] failed to spawn engine thread");
 
     QuickJsHost {
-        frontend: pipe_in_w.map(|stdin| QuickJsFrontend { stdin }),
-        out_r: pipe_out_r,
         sink: EventSink {
             queue,
             engine: engine_thread.thread().clone(),
@@ -528,51 +423,57 @@ pub fn launch(
 // plumbing helpers
 // ---------------------------------------------------------------------------
 
-fn spawn_stderr_tee(err_r: usize, tee: usize) {
-    std::thread::spawn(move || {
-        let mut f = unsafe { File::from_raw_handle(err_r as RawHandle) };
-        let mut buf = [0u8; 4096];
-        loop {
-            match f.read(&mut buf) {
-                Ok(0) | Err(_) => break,
-                Ok(n) => {
-                    let h = tee as RawHandle;
-                    if !h.is_null() {
-                        let mut t = unsafe { File::from_raw_handle(h) };
-                        let _ = t.write_all(&buf[..n]);
-                        let _ = t.flush();
-                        std::mem::forget(t);
-                    }
-                }
-            }
-        }
-    });
-}
+/// Marker appended by `gpui-ts build` to a copy of the host, immediately before
+/// the application's JS bundle. Picked so a JS source file cannot contain it by
+/// accident.
+pub const TAIL_MARKER: &[u8] = b"\n<<<GPUI_TS_BUNDLE_v1>>>\n";
 
-fn spawn_stdin_reader(in_r: usize, queue: Arc<Mutex<Vec<String>>>) {
-    std::thread::spawn(move || {
-        let f = unsafe { File::from_raw_handle(in_r as RawHandle) };
-        let reader = BufReader::new(f);
-        for line in reader.lines() {
-            match line {
-                Ok(l) => queue.lock().unwrap().push(l),
-                Err(_) => break,
-            }
+/// How much of the executable is scanned for the marker. The bundle is a few
+/// hundred KB and the host ~11MB, so there is no point reading all of it.
+const TAIL_SCAN_BYTES: u64 = 8 * 1024 * 1024;
+
+/// Read a bundle appended to *this* executable.
+///
+/// This is what makes the published package toolchain-free: `gpui-ts build`
+/// copies the prebuilt host and appends marker + bundle, so someone with no Rust
+/// toolchain still ends up with one self-contained exe (Windows' PE loader
+/// ignores trailing bytes). It wins over the compiled-in bundle on purpose — a
+/// *published* host carries this repo's demo app, and the appended one is the
+/// user's.
+fn bundle_from_self() -> Option<String> {
+    let exe = std::env::current_exe().ok()?;
+    let mut f = File::open(&exe).ok()?;
+    let len = f.metadata().ok()?.len();
+    let start = len.saturating_sub(TAIL_SCAN_BYTES);
+    if start > 0 {
+        f.seek(SeekFrom::Start(start)).ok()?;
+    }
+    let mut buf = Vec::new();
+    f.read_to_end(&mut buf).ok()?;
+    // The *last* marker wins, so a bundle that itself contains the marker (in a
+    // string literal, say) still resolves to the real trailing one.
+    let at = buf.windows(TAIL_MARKER.len()).rposition(|w| w == TAIL_MARKER)?;
+    let js = &buf[at + TAIL_MARKER.len()..];
+    // A linker may pad the file; trailing NULs are not part of the bundle.
+    let end = js.iter().rposition(|b| *b != 0).map_or(0, |i| i + 1);
+    let js = &js[..end];
+    if js.is_empty() {
+        return None;
+    }
+    match std::str::from_utf8(js) {
+        Ok(s) => Some(s.to_string()),
+        Err(_) => {
+            crate::log_line("[qjs] appended bundle is not valid UTF-8 — ignored");
+            None
         }
-        // EOF: signal the app's stdin 'end' handler (it calls process.exit).
-        queue.lock().unwrap().push(QJS_EOF_MARKER.to_string());
-    });
+    }
 }
 
 fn load_bundle() -> String {
-    // 0) bundle compiled-in at build time → truly self-contained exe (no sidecar
-    //    file, no env-var fragility). Path is relative to THIS source file.
-    //    Regenerate via `node build-qjs.mjs` BEFORE `cargo build` when the TS
-    //    frontend changes. (A `cargo:rustc-env` bake of a multi-line bundle
-    //    mangles newlines under Windows, so include_str! is the reliable path.)
-    const EMBEDDED: &str = include_str!("../../ui/dist/main.js");
-    if !EMBEDDED.is_empty() {
-        return EMBEDDED.to_string();
+    // 0) Bundle appended to this executable by `gpui-ts build` — the shape the
+    //    npm package ships (prebuilt host + user JS, no Rust toolchain needed).
+    if let Some(js) = bundle_from_self() {
+        return js;
     }
     // 1) explicit override via env (handy for live-reload during dev)
     if let Ok(p) = std::env::var("QUICKJS_BUNDLE") {
@@ -582,34 +483,30 @@ fn load_bundle() -> String {
             }
         }
     }
+    // 2) bundle compiled-in at build time → truly self-contained exe (no sidecar
+    //    file, no env-var fragility). Path is relative to THIS source file.
+    //    Regenerate via `node build-qjs.mjs` BEFORE `cargo build` when the TS
+    //    frontend changes. (A `cargo:rustc-env` bake of a multi-line bundle
+    //    mangles newlines under Windows, so include_str! is the reliable path.)
+    const EMBEDDED: &str = include_str!("../../ui/dist/main.js");
+    if !EMBEDDED.is_empty() {
+        return EMBEDDED.to_string();
+    }
     crate::log_line(
         "[qjs] embedded bundle empty — run `node build-qjs.mjs` then rebuild the host",
     );
     String::new()
 }
 
-/// Where `process.stdout.write` goes. In `Pipe` mode it *is* the protocol
-/// channel. In `Direct` mode stdout is no longer transport, but app code may
-/// still print — route it to the diagnostic stderr (prefixed) so it can never
-/// corrupt the ops stream.
-fn stdout_sink(out_w: Option<usize>, stderr_tee: usize, s: &str) {
-    match out_w {
-        Some(h) => write_handle(h, s),
-        None => {
-            for part in s.split('\n') {
-                if !part.is_empty() {
-                    trace(stderr_tee, &format!("[stdout] {part}"));
-                }
-            }
+/// Where `process.stdout.write` goes: the diagnostic stderr, prefixed, so app
+/// prints can never be mistaken for (or corrupt) protocol traffic. stdout used
+/// to be the ops channel; it is now a plain output sink.
+fn stdout_sink(stderr_tee: usize, s: &str) {
+    for part in s.split('\n') {
+        if !part.is_empty() {
+            trace(stderr_tee, &format!("[stdout] {part}"));
         }
     }
-}
-
-fn write_handle(h: usize, s: &str) {
-    let mut f = unsafe { File::from_raw_handle(h as RawHandle) };
-    let _ = f.write_all(s.as_bytes());
-    let _ = f.flush();
-    std::mem::forget(f);
 }
 
 fn trace(h: usize, s: &str) {

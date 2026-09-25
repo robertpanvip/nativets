@@ -68,6 +68,19 @@ function desugar(sourceText, fileName) {
         const props = buildProps(opening.attributes);
         const children = (ts.isJsxSelfClosingElement(node) ? [] : node.children.map((c) => desugarChild(c, ctx)))
             .filter((n) => !(ts.isStringLiteral(n) && n.text === ""));
+
+        // Component tags become DIRECT calls: <Card title="x">{y}</Card> ->
+        // Card({ title: "x", children: y }). scriptc's checker refuses every
+        // diverse component signature against h()'s `string | AnyComponent`
+        // tag union (SC2003), so the AOT graph must never route components
+        // through h(); each call is checked against the component's own
+        // declared props instead. Intrinsic (lowercase) tags keep going
+        // through h(tag, props, ...children).
+        if (ts.isIdentifier(tagName) && isCapitalized(tagName.text)) {
+            const withChildren = attachChildren(props, children);
+            return ts.factory.createCallExpression(
+                ts.factory.createIdentifier(tagName.text), undefined, [withChildren]);
+        }
         return ts.factory.createCallExpression(ts.factory.createIdentifier("h"), undefined, [tagExpr, props, ...children]);
     }
 
@@ -128,6 +141,34 @@ function desugar(sourceText, fileName) {
 
     function isCapitalized(s) {
         return /^[A-Z]/.test(s);
+    }
+
+    // Merge JSX children into a props expression as `children`:
+    //   0 children  -> props unchanged
+    //   1 child     -> { ...props, children: <child> }
+    //   n children  -> { ...props, children: [<c1>, <c2>, ...] }
+    // Works for both plain object literals and Object.assign(...) calls.
+    function attachChildren(props, children) {
+        if (children.length === 0) return props;
+        let value;
+        if (children.length === 1) {
+            value = children[0];
+        } else {
+            value = ts.factory.createArrayLiteralExpression(children, true);
+        }
+        const childProp = ts.factory.createPropertyAssignment(
+            ts.factory.createStringLiteral("children"), value);
+        if (ts.isObjectLiteralExpression(props)) {
+            return ts.factory.createObjectLiteralExpression([...props.properties, childProp], true);
+        }
+        // Object.assign call — append one more source object.
+        if (ts.isCallExpression(props) && props.arguments.length >= 2) {
+            return ts.factory.createCallExpression(props.expression, undefined, [
+                ...props.arguments,
+                ts.factory.createObjectLiteralExpression([childProp], true),
+            ]);
+        }
+        return props;
     }
 
     const result = ts.transform(sf, [transformer]);

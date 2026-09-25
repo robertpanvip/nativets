@@ -1,8 +1,16 @@
 /**
- * scriptc DLL build pipeline — ui/src/scriptc-entry.ts → build/scriptc_fe.dll
+ * scriptc DLL build pipeline — the REAL app graph → build/scriptc_fe.dll
+ *
+ * The graph is not hand-written any more: `scripts/jsx-keep-types.mjs`
+ * desugars every `src/*.tsx` to TS (JSX → h()/Fragment() calls, types KEPT),
+ * which is the only way scriptc's checker sees a typed graph (esbuild always
+ * erases types → SC4005).
  *
  * Steps (each one proven in sc-spike; see .workbuddy/memory):
- *   1. sync the entry source into the graph dir (ui/build/scriptc/)
+ *   1. regenerate the typed graph into ui/build/sc-graph/ and drop the
+ *      dynamic-engine-only modules (runtime.ts/main.ts probe `process` and
+ *      call setInterval — outside scriptc's static subset BY CONSTRUCTION;
+ *      the graph starts at sc-main.ts, which imports io.ts directly)
  *   2. `scriptc build --lib --profile` (zigcc, x86_64-windows-gnu) →
  *      entry.lib.a — a gnu-flavored archive: program object + the runtime
  *      objects the profile's graph actually reaches (tree-shaken, SCR_LIB ABI)
@@ -22,7 +30,7 @@ import { fileURLToPath } from "node:url";
 
 const here = path.dirname(fileURLToPath(import.meta.url)); // ui/
 const repo = path.dirname(here);
-const graphDir = path.join(here, "build", "scriptc");
+const graphDir = path.join(here, "build", "sc-graph");
 const profile = path.join(here, "build", "scriptc.profile.json");
 const archive = path.join(graphDir, "entry.lib.a");
 const outDll = path.join(repo, "build", "scriptc_fe.dll");
@@ -36,22 +44,29 @@ function run(cmd, args, opts = {}) {
     execFileSync(cmd, args, { stdio: "inherit", ...opts });
 }
 
-// 1. fresh graph dir with the current entry source + a generated profile.
-//    The profile lives inside ui/build/ (gitignored) so it is rebuilt from
-//    these constants on every run — no stale tracked copy to drift.
-rmSync(graphDir, { recursive: true, force: true });
-mkdirSync(graphDir, { recursive: true });
-cpSync(path.join(here, "src", "scriptc-entry.ts"), path.join(graphDir, "entry.ts"));
+// 1. regenerate the typed graph from src/, then strip the modules that may
+//    never enter a scriptc graph (they exist for the dynamic engines).
+run(nodeExe, [path.join(here, "scripts", "jsx-keep-types.mjs")], { cwd: here });
 
+const DYNAMIC_ONLY = ["runtime.ts", "main.ts", "scriptc-entry.ts"];
+for (const f of DYNAMIC_ONLY) {
+    rmSync(path.join(graphDir, f), { force: true });
+}
+if (!existsSync(path.join(graphDir, "sc-main.ts"))) {
+    throw new Error(`graph entry missing: ${path.join(graphDir, "sc-main.ts")}`);
+}
+
+// The profile lives inside ui/build/ (gitignored) so it is rebuilt from
+// these constants on every run — no stale tracked copy to drift.
 const profileJson = {
     profile_format: 1,
     name: "gpui-ts-frontend",
-    entry: "scriptc/entry.ts", // relative to the profile file's directory
+    entry: "sc-graph/sc-main.ts", // relative to the profile file's directory
     emission: "llvm",
     abi: {
         prefix: "gpts",
-        // init runs the module top-level (reset + initial emit); appInit is
-        // NOT a scriptc export — gpts_init is the whole story (see entry).
+        // init runs the module top-level (sink wiring + createRoot(App));
+        // appInit is NOT a scriptc export — gpts_init is the whole story.
         init_symbol: "gpts_init",
         sink_register_symbol: "gpts_set_panic_sink",
         collect_symbol: null,
