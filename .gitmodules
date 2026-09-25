@@ -1,0 +1,3 @@
+[submodule "vendor/gpui-kit"]
+	path = vendor/gpui-kit
+	url = https://github.com/longbridge/gpui-kit

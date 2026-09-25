@@ -8,13 +8,15 @@ description = "GPUI render host for PerryTS-compiled TypeScript frontends (mutat
 gpui-pre = { version = "=0.3.3" }
 gpui-pre-platform = { version = "=0.3.3" }
 # Real component library for the native widget tags (checkbox/switch/button/
-# select/date). Its `gpui` dependency IS gpui-pre (renamed), so both share our
-# pinned 0.3.3 tree — no forked GPUI.
-gpui-component = "0.6.1"
+# select/date). Vendored as a git submodule (vendor/gpui-kit @ v0.6.1) and
+# consumed via the local path so we build the real upstream source — its
+# `gpui` dependency IS gpui-pre (renamed), so both share our pinned 0.3.3
+# tree — no forked GPUI.
+gpui-component = { path = "../vendor/gpui-kit/crates/component", version = "0.6.1" }
 # Pulled in explicitly so the adapter layer can use gpui-base primitives
 # directly (VirtualList, DatePicker base types, Calendar) rather than only
 # through gpui-component's re-exports.
-gpui-base = "0.6.1"
+gpui-base = { path = "../vendor/gpui-kit/crates/base", version = "0.6.1" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 async-channel = "2"
