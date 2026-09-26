@@ -29,6 +29,7 @@ import {
     h,
     text,
     For,
+    Show,
     onHostEvent,
     onPulse,
     setRootStyle,
@@ -38,7 +39,7 @@ import {
 } from "./io";
 import type { El, Child, HostEvent, Style, Props } from "./io";
 import { C } from "./theme";
-import { CanvasView, Checkbox, DatePicker, Input, RadioGroup, ScrollArea, Select, Switch } from "./kit";
+import { Button, CanvasView, Checkbox, DatePicker, Input, Progress, RadioGroup, Rating, ScrollArea, Select, Slider, Spinner, Switch } from "./kit";
 import type { Ctx } from "./canvas2d";
 import {
     windowSize,
@@ -838,6 +839,85 @@ function DelegationCard(_props: Props): El {
     );
 }
 
+// ---------------------------------------------------------------------------
+// 原生组件补全 demo：Progress / Spinner / Rating / Slider
+// ---------------------------------------------------------------------------
+
+const [progress, setProgress] = createSignal(64);
+const [sliderVal, setSliderVal] = createSignal(30);
+const [sliderLog, setSliderLog] = createSignal("");
+const [stars, setStars] = createSignal(3);
+const [spinnerRun, setSpinnerRun] = createSignal(true);
+
+/** 原生控件扩展演示卡：
+ *  - Progress：受控 value（0..=100），按钮步进；loading 行是转圈动画。
+ *  - Slider：真拖动，input 每帧回传、change 松手回传（受控 value 下推）。
+ *  - Rating：星级点击，change 带新值。
+ *  - Spinner：纯动画展示。 */
+function WidgetsCard(_props: Props): El {
+    const stepProgress = (d: number): void => {
+        const next = Math.max(0, Math.min(100, progress() + d));
+        setProgress(next);
+    };
+    const onSliderInput = (v: number): void => {
+        setSliderVal(v);
+        setSliderLog("input " + String(v));
+    };
+    const onSliderChange = (v: number): void => {
+        setSliderVal(v);
+        setSliderLog("change " + String(v));
+    };
+    return (
+        <Card title="原生组件 · Progress / Slider / Rating / Spinner">
+            <div style={{ flexDirection: "column", gap: 12 }}>
+                {/* Progress：确定性 + 不定态 */}
+                <div style={{ flexDirection: "column", gap: 6 }}>
+                    {text(() => "进度 " + String(progress()) + "%", { fontSize: 12, color: C.textSecondary })}
+                    <Progress value={progress} height={8} style={{ width: "100%" }} />
+                    <div style={{ flexDirection: "row", gap: 8, alignItems: "center" }}>
+                        <Button label="-10" onClick={() => stepProgress(-10)} style={{ height: 26, paddingX: 10 }} />
+                        <Button label="+10" onClick={() => stepProgress(10)} style={{ height: 26, paddingX: 10 }} />
+                        <Button label="重置" onClick={() => setProgress(0)} style={{ height: 26, paddingX: 10 }} />
+                        {Show(spinnerRun, () => (
+                            <div style={{ flexDirection: "row", gap: 8, alignItems: "center", grow: 1 }}>
+                                <Progress value={() => 0} loading height={6} style={{ width: "100%" }} />
+                            </div>
+                        ))}
+                    </div>
+                </div>
+                {/* Slider：拖动 */}
+                <div style={{ flexDirection: "column", gap: 6 }}>
+                    <div style={{ flexDirection: "row", gap: 10, alignItems: "center" }}>
+                        {text("音量", { fontSize: 12, color: C.textSecondary })}
+                        <Slider
+                            value={sliderVal}
+                            min={0}
+                            max={100}
+                            step={1}
+                            width={240}
+                            onInput={onSliderInput}
+                            onChange={onSliderChange}
+                        />
+                        {text(() => String(sliderVal()), { fontSize: 13, color: C.textPrimary })}
+                    </div>
+                    {text(() => sliderLog() === "" ? "（拖动滑块）" : sliderLog(), { fontSize: 11, color: C.textMuted })}
+                </div>
+                {/* Rating + Spinner */}
+                <div style={{ flexDirection: "row", gap: 24, alignItems: "center" }}>
+                    <div style={{ flexDirection: "column", gap: 4 }}>
+                        {text(() => "评分 " + String(stars()) + "/5", { fontSize: 12, color: C.textSecondary })}
+                        <Rating value={stars} onChange={(v: number) => setStars(v)} />
+                    </div>
+                    <div style={{ flexDirection: "column", gap: 4 }}>
+                        {text("加载中", { fontSize: 12, color: C.textSecondary })}
+                        <Spinner size={18} />
+                    </div>
+                </div>
+            </div>
+        </Card>
+    );
+}
+
 function MainPanel(_props: Props): El {
     return (
         <div style={{ flexDirection: "column", gap: 14, grow: 1, height: "100%", minWidth: 0 }}>
@@ -865,6 +945,7 @@ function MainPanel(_props: Props): El {
                 <CanvasCard />
                 <ScrollCard />
                 <DelegationCard />
+                <WidgetsCard />
                 <TasksCard />
             </ScrollArea>
         </div>

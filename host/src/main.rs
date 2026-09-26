@@ -64,6 +64,7 @@ use gpui::{
 use chrono::NaiveDate;
 use gpui_base::Date as GpuiDate;
 use gpui_component::date_picker::{DatePicker as GpuiDatePicker, DatePickerEvent, DatePickerState};
+use gpui_component::slider::{Slider as GpuiSlider, SliderEvent, SliderState};
 use gpui_platform::application;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
@@ -394,6 +395,8 @@ const MIN_WINDOW_H: f32 = 480.0;
 /// a bare `<input>` in CSS does the same thing, just with a different number.
 const DEFAULT_INPUT_W: f32 = 220.0;
 const DEFAULT_FONT_SIZE: f32 = 13.0;
+/// Default width of a native `slider` when the protocol gives no `width`.
+const DEFAULT_SLIDER_W: f32 = 220.0;
 /// Line box relative to font size, for the single-line fields and canvas text
 /// we shape by hand. GPUI's text elements use a similar ratio, so a hand-painted
 /// field does not sit visually tighter than the labels around it.
@@ -446,6 +449,12 @@ struct HostView {
     /// contract as `input_states`: recreate-per-frame would drop the open/
     /// closed state, the selected date and the calendar entity.
     date_states: HashMap<u64, Entity<DatePickerState>>,
+    /// One gpui-component `SliderState` per `slider` node (drag position,
+    /// min/max/step). Same stability contract as the other state maps.
+    slider_states: HashMap<u64, Entity<SliderState>>,
+    /// Last slider value echoed up per node, so a controlled `setValue` echo
+    /// does not fight a drag that is still in progress.
+    slider_reported: HashMap<u64, String>,
 }
 
 /// Deterministic application order for style keys (HashMap iteration is
@@ -843,6 +852,57 @@ impl HostView {
         state
     }
 
+    /// One gpui-component `SliderState` per `slider` node (mirrors
+    /// `date_state`). The state owns the drag position and the min/max/step
+    /// scale; the `Slider` element built each frame is a view of it. Dragging
+    /// echoes `SliderEvent::Change` up as an `input` event and `Release` as a
+    /// `change` event, both carrying the numeric value.
+    ///
+    /// min/max/step are creation-time: like the select option list they fix
+    /// the scale for the node's lifetime (a different scale is a new slider).
+    fn slider_state(
+        &mut self,
+        id: u64,
+        node: &Node,
+        cx: &mut Context<Self>,
+    ) -> Entity<SliderState> {
+        if let Some(st) = self.slider_states.get(&id) {
+            return st.clone();
+        }
+        let min = num_of(node, "min").unwrap_or(0.0);
+        let max = num_of(node, "max").unwrap_or(100.0);
+        let step = num_of(node, "step").unwrap_or(1.0);
+        let seed = node
+            .value
+            .clone()
+            .and_then(|v| v.parse::<f32>().ok())
+            .unwrap_or(min);
+        let tx = self.event_tx.clone();
+        let state = cx.new(|_| {
+            SliderState::new()
+                .min(min)
+                .max(max)
+                .step(step)
+                .default_value(seed)
+        });
+        cx.subscribe(&state, move |_this: &mut HostView, _st, ev: &SliderEvent, _cx| {
+            let value = match ev {
+                SliderEvent::Change(v) => ("input", v.end()),
+                SliderEvent::Release(v) => ("change", v.end()),
+            };
+            let text = format_value(value.1);
+            let msg = json!({ "t": "event", "target": id, "kind": value.0, "value": text })
+                .to_string();
+            log!("[host] ev {}(slider) id={id} t={} {msg}", value.0, now_ms());
+            let _ = tx.send(msg);
+        })
+        .detach();
+        let live = slider_value_text(&state, cx);
+        self.slider_reported.insert(id, live);
+        self.slider_states.insert(id, state.clone());
+        state
+    }
+
     /// A native-widget node (`checkbox` / `switch` / `button` / `select`):
     /// rendered as a real `gpui_component` control instead of a styled div.
     ///
@@ -987,6 +1047,122 @@ impl HostView {
                 }
                 picker.appearance(true).cleanable(false).into_any_element()
             }
+            "progress" => {
+                // Stateless display widget: `value` (0..=100) drives the bar,
+                // `loading: 1` flips it into the indeterminate animation. The
+                // bar re-reads every prop per frame, so no host-side state is
+                // needed — the controlled contract is just `setValue` down.
+                let value = node
+                    .value
+                    .as_deref()
+                    .and_then(|v| v.parse::<f32>().ok())
+                    .unwrap_or(0.0);
+                use gpui_component::Sizable;
+                let mut bar = gpui_component::progress::Progress::new(element_id)
+                    .value(value)
+                    .loading(num_of(node, "loading").unwrap_or(0.0) != 0.0)
+                    .w_full();
+                // `height` maps to the bar's thickness (the pill), not the box
+                // height — a progress bar with a `height: 12` style expects a
+                // 12px-thick bar, which is what Size::Size spells.
+                if let Some(h) = num_of(node, "height") {
+                    bar = bar.with_size(gpui_component::Size::Size(px(h.clamp(2.0, 20.0))));
+                }
+                // Placement keys belong on the wrapper (mirrors `build_canvas`):
+                // the parent flexes the wrapper, the bar fills it.
+                let mut wrap = div().flex().flex_row().items_center();
+                for (k, v) in sorted_style(node) {
+                    if is_placement_key(k) || k == "height" {
+                        wrap = apply_style(wrap, k, v);
+                    } else {
+                        bar = apply_style(bar, k, v);
+                    }
+                }
+                wrap.child(bar).into_any_element()
+            }
+            "spinner" => {
+                // Fully stateless: the rotation is a gpui animation. `size`
+                // style scales the icon, `color` tints it.
+                let mut sp = gpui_component::spinner::Spinner::new();
+                if let Some(s) = num_of(node, "fontSize") {
+                    use gpui_component::Sizable;
+                    sp = sp.with_size(gpui_component::Size::Size(px(s)));
+                }
+                let mut wrap = div().flex().flex_row().items_center().justify_center();
+                for (k, v) in sorted_style(node) {
+                    wrap = apply_style(wrap, k, v);
+                }
+                wrap.child(sp).into_any_element()
+            }
+            "rating" => {
+                // Star rating; the state lives in the widget's keyed window
+                // state, seeded from `value` per render when it changes. A
+                // click emits the new value as `change`.
+                let value = node
+                    .value
+                    .as_deref()
+                    .and_then(|v| v.parse::<f32>().ok())
+                    .unwrap_or(0.0) as usize;
+                let max = num_of(node, "max").unwrap_or(5.0).max(1.0) as usize;
+                let tx = self.event_tx.clone();
+                let mut r = gpui_component::rating::Rating::new(element_id)
+                    .value(value)
+                    .max(max);
+                if wants(node, "change") || wants(node, "input") {
+                    r = r.on_click(move |new: &usize, _window, _cx| {
+                        let msg = json!({
+                            "t": "event", "target": id, "kind": "change",
+                            "value": new.to_string()
+                        })
+                        .to_string();
+                        log!("[host] ev change(rating) id={id} t={} {msg}", now_ms());
+                        let _ = tx.send(msg);
+                    });
+                }
+                r.into_any_element()
+            }
+            "slider" => {
+                // Real drag slider bound to a per-node `SliderState`. min/max/
+                // step ride the style map; `value` is the thumb position as a
+                // number string. Dragging echoes `input` per tick and `change`
+                // on release (see `slider_state`).
+                let state = self.slider_state(id, node, cx);
+                // Controlled push-down: an external `setValue` that differs
+                // from the live value (and from our last echo) is applied.
+                // During a drag the host's own echo arrives while the drag is
+                // still moving, so comparing against `slider_reported` keeps
+                // the thumb from fighting the pointer.
+                let tree_value = node.value.clone().unwrap_or_default();
+                let live = slider_value_text(&state, cx);
+                let echoed = self.slider_reported.get(&id).map(|s| *s == live).unwrap_or(false);
+                if tree_value != live && !(echoed && tree_value == live) {
+                    if let Some(v) = tree_value.parse::<f32>().ok() {
+                        state.update(cx, |st, cx| {
+                            let clamped = st.min_value().max(v.min(st.max_value()));
+                            let stepped = if st.step_value() > 0.0 {
+                                let steps = ((clamped - st.min_value()) / st.step_value()).round();
+                                st.min_value() + steps * st.step_value()
+                            } else {
+                                clamped
+                            };
+                            st.set_value(stepped, window, cx);
+                        });
+                        self.slider_reported.insert(id, tree_value.clone());
+                    }
+                }
+                let s = GpuiSlider::new(&state).w_full();
+                let mut wrap = div().flex().flex_row().items_center();
+                if !node.style.contains_key("width") && !node.style.contains_key("grow") {
+                    wrap = wrap.w(px(DEFAULT_SLIDER_W));
+                }
+                for (k, v) in sorted_style(node) {
+                    if matches!(k.as_str(), "min" | "max" | "step") {
+                        continue; // scale keys: creation-time (see `slider_state`)
+                    }
+                    wrap = apply_style(wrap, k, v);
+                }
+                wrap.child(s).into_any_element()
+            }
             _ => div().into_any_element(),
         }
     }
@@ -1125,6 +1301,8 @@ impl HostView {
         self.input_states.retain(|k, _| live.contains(k));
         self.input_reported.retain(|k, _| live.contains(k));
         self.date_states.retain(|k, _| live.contains(k));
+        self.slider_states.retain(|k, _| live.contains(k));
+        self.slider_reported.retain(|k, _| live.contains(k));
     }
 
     /// Push window geometry to the engine when it changed.
@@ -1266,6 +1444,25 @@ fn toggle_handler(
 
 fn num_of(node: &Node, key: &str) -> Option<f32> {
     node.style.get(key).and_then(num)
+}
+
+/// The live value of a slider state, formatted the way the protocol carries
+/// slider values (`input`/`change` payloads and `setValue` echoes all share
+/// this spelling — an echo comparison on differently-rounded text would
+/// re-apply the value mid-drag forever).
+fn slider_value_text(state: &Entity<SliderState>, cx: &App) -> String {
+    format_value(state.read(cx).value().end())
+}
+
+/// One decimal place max, trailing `.0` trimmed — `37.5` stays `37.5`, `37.0`
+/// becomes `"37"` so the round-trip against a frontend `String(n)` matches.
+fn format_value(v: f32) -> String {
+    let r = (v * 10.0).round() / 10.0;
+    if (r - r.trunc()).abs() < f32::EPSILON {
+        format!("{}", r as i64)
+    } else {
+        format!("{r}")
+    }
 }
 
 /// Parse a `YYYY-MM-DD` string (the `Date` Display form) into a `NaiveDate`.
@@ -1800,7 +1997,9 @@ fn main() {
             run_event_writer(stdin, ev_rx);
             run_ops_reader(stdout, ops_tx);
 
-            application().run(move |cx: &mut App| {
+            application()
+                .with_assets(gpui_kit_assets::Assets)
+                .run(move |cx: &mut App| {
                 let handle = open_host_window(cx, ev_tx, None);
                 spawn_ops_apply(cx, handle, ops_rx);
 
@@ -1829,7 +2028,9 @@ fn main() {
             run_event_writer(ef, ev_rx);
             run_ops_reader(out_r, ops_tx);
 
-            application().run(move |cx: &mut App| {
+            application()
+                .with_assets(gpui_kit_assets::Assets)
+                .run(move |cx: &mut App| {
                 let handle = open_host_window(cx, ev_tx, None);
                 spawn_ops_apply(cx, handle, ops_rx);
 
@@ -1875,7 +2076,9 @@ fn main() {
             run_event_injector(host.sink.clone(), ev_rx);
 
             let sink = host.sink.clone();
-            application().run(move |cx: &mut App| {
+            application()
+                .with_assets(gpui_kit_assets::Assets)
+                .run(move |cx: &mut App| {
                 let handle = open_host_window(cx, ev_tx, Some(metrics));
                 spawn_ops_apply(cx, handle, ops_rx);
                 spawn_dialog_host(cx, handle, dialog_rx);
@@ -1901,7 +2104,9 @@ fn main() {
             // drained by the same driver quantum.
             run_event_queuer(host.sink.clone(), ev_rx);
 
-            application().run(move |cx: &mut App| {
+            application()
+                .with_assets(gpui_kit_assets::Assets)
+                .run(move |cx: &mut App| {
                 let handle = open_host_window(cx, ev_tx, None);
                 spawn_ops_apply(cx, handle, ops_rx);
                 // The scriptc driver thread self-drives (fixed 10 ms quantum);
@@ -1965,6 +2170,8 @@ fn open_host_window(
                 input_states: HashMap::new(),
                 input_reported: HashMap::new(),
                 date_states: HashMap::new(),
+                slider_states: HashMap::new(),
+                slider_reported: HashMap::new(),
             })
         })
         .expect("failed to open window");

@@ -400,5 +400,9 @@ impl Tree {
 /// Which tags render as native `gpui_component` controls (see
 /// `main.rs::build_native`). Everything else stays a styled `div`.
 pub fn is_native_tag(tag: &str) -> bool {
-    matches!(tag, "checkbox" | "switch" | "button" | "select" | "date")
+    matches!(
+        tag,
+        "checkbox" | "switch" | "button" | "select" | "date" | "progress" | "slider" | "spinner"
+            | "rating"
+    )
 }

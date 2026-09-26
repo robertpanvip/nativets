@@ -13,6 +13,10 @@ gpui-pre-platform = { version = "=0.3.3" }
 # `gpui` dependency IS gpui-pre (renamed), so both share our pinned 0.3.3
 # tree — no forked GPUI.
 gpui-component = { path = "../vendor/gpui-kit/crates/component", version = "0.6.1" }
+# Lucide icon SVGs (RustEmbed) behind Rating's stars / Spinner's loader icon.
+# Without registering `Assets` as the app's AssetSource those icons render
+# blank — the components ask GPUI for "icons/…svg" and get nothing.
+gpui-kit-assets = { path = "../vendor/gpui-kit/crates/assets", version = "0.6.1" }
 # Pulled in explicitly so the adapter layer can use gpui-base primitives
 # directly (VirtualList, DatePicker base types, Calendar) rather than only
 # through gpui-component's re-exports.

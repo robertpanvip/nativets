@@ -164,6 +164,15 @@ export interface Style {
     fontSize?: number;
     fontWeight?: number | string;
     elevate?: number;
+    // --- native-widget scale keys (host reads them off `node.style`) ---
+    /** Native slider: scale minimum (creation-time). */
+    min?: number;
+    /** Native slider: scale maximum (creation-time). */
+    max?: number;
+    /** Native slider: step quantum (creation-time). */
+    step?: number;
+    /** Native progress: truthy shows the indeterminate animation. */
+    loading?: number;
 }
 
 /**
@@ -219,6 +228,10 @@ export function mergeStyleInto(base: Style, over: Style): void {
     if (over.fontSize !== undefined) base.fontSize = over.fontSize;
     if (over.fontWeight !== undefined) base.fontWeight = over.fontWeight;
     if (over.elevate !== undefined) base.elevate = over.elevate;
+    if (over.min !== undefined) base.min = over.min;
+    if (over.max !== undefined) base.max = over.max;
+    if (over.step !== undefined) base.step = over.step;
+    if (over.loading !== undefined) base.loading = over.loading;
 }
 
 export type StyleInput = Style;
@@ -727,7 +740,7 @@ export interface Props {
     // --- intrinsic surface: read by h() itself, so typed precisely ---
     style?: Style;
     text?: string;
-    value?: string | (() => string);
+    value?: string | number | (() => string) | (() => number);
     placeholder?: string;
     children?: Child;
     onClick?: HostEventHandler;
@@ -748,6 +761,12 @@ export interface Props {
     width?: number;
     height?: number;
     index?: number;
+    /** Native slider scale keys (creation-time, like the select option list). */
+    min?: number;
+    max?: number;
+    step?: number;
+    /** Native progress: `1` shows the indeterminate animation. */
+    loading?: number;
     grow?: boolean;
     options?: string[];
     checked?: () => boolean;
@@ -772,12 +791,28 @@ export interface Props {
  *   - `button` — `text` is the label; emits `click`.
  *   - `select` — `value` is the selected option text; the host opens its own
  *     picker; picking emits `change` with the new option.
+ *   - `date` — `value` is an ISO "YYYY-MM-DD"; picking emits `change`.
+ *   - `progress` — display-only; `value` is 0..=100, `loading: 1` style
+ *     flips the indeterminate animation.
+ *   - `spinner` / `rating` — display widgets; rating emits `change` with the
+ *     star count.
+ *   - `slider` — `value` is the numeric thumb position; dragging emits
+ *     `input` per tick and `change` on release.
  *
  * The frontend keeps ownership of the state (controlled, like `input`): the
  * event handler decides what the new state is, the setter re-runs the
  * `value` getter, and the host reflects it.
  */
-export type NativeTag = "checkbox" | "switch" | "button" | "select";
+export type NativeTag =
+    | "checkbox"
+    | "switch"
+    | "button"
+    | "select"
+    | "date"
+    | "progress"
+    | "slider"
+    | "spinner"
+    | "rating";
 
 /**
  * Hyperscript element factory — also the JSX factory (classic runtime):
@@ -836,9 +871,10 @@ export function h(tag: string | AnyComponent, props: Props | null, ...children: 
 
 /**
  * Bind a field value: a function is treated as a getter and re-pushed
- * whenever a signal it reads changes.
+ * whenever a signal it reads changes. Numeric values (slider thumb, progress
+ * percent) ride the same `setValue` channel spelled as strings.
  */
-function applyValue(e: El, value: string | (() => string)): void {
+function applyValue(e: El, value: string | number | (() => string) | (() => number)): void {
     if (typeof value === "function") {
         createEffect(() => {
             setValue(e, String(value()));

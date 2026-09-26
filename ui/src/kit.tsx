@@ -309,6 +309,115 @@ export function Select(props: {
 }
 
 // ---------------------------------------------------------------------------
+// Progress / Spinner / Rating / Slider (native)
+// ---------------------------------------------------------------------------
+// The remaining native gpui-component widgets (see main.rs `build_native`).
+// Progress and Slider are controlled: the `value` getter drives a `setValue`
+// op and the widget's events echo back. Spinner is a pure animation; Rating
+// keeps its own star state host-side and emits `change`.
+//
+// Scale-ish keys (`min` / `max` / `step` / `loading`) ride the *style* map —
+// that is the one bag the protocol guarantees reaches the node, and the host
+// reads them off `node.style`.
+
+/** Determinate / indeterminate progress bar. `value` is 0..=100. */
+export function Progress(props: {
+    value: () => number;
+    loading?: boolean;
+    height?: number;
+    style?: Style;
+}): El {
+    const style: Style = {};
+    if (props.height !== undefined) style.height = props.height;
+    if (props.loading === true) style.loading = 1;
+    if (props.style !== undefined) mergeStyleInto(style, props.style);
+    return h("progress", { style: style, value: props.value });
+}
+
+/** A cycling loading spinner (`fontSize` scales the icon). */
+export function Spinner(props: { size?: number; style?: Style }): El {
+    const style: Style = {};
+    if (props.size !== undefined) style.fontSize = props.size;
+    if (props.style !== undefined) mergeStyleInto(style, props.style);
+    return h("spinner", { style: style });
+}
+
+/** Star rating; a click emits `change` with the new star count. */
+export function Rating(props: {
+    value: () => number;
+    onChange?: (v: number) => void;
+    max?: number;
+    style?: Style;
+}): El {
+    const chgRef = new StrFnRef();
+    if (props.onChange !== undefined) {
+        chgRef.fn = (v: string) => {
+            if (props.onChange !== undefined) props.onChange(parseFloat(v));
+        };
+    }
+    const style: Style = {};
+    if (props.max !== undefined) style.max = props.max;
+    if (props.style !== undefined) mergeStyleInto(style, props.style);
+    return h("rating", {
+        style: style,
+        value: props.value,
+        onChange: (ev: HostEvent) => {
+            const f = chgRef.fn;
+            if (f !== null) f(String(ev.value));
+        },
+    });
+}
+
+/**
+ * A drag slider bound to a scale. min/max/step are creation-time (a
+ * different scale is a new slider, like the select option list). Dragging
+ * emits `input` per tick and `change` on release; the controlled `value`
+ * getter pushes the position back down.
+ */
+export function Slider(props: {
+    value: () => number;
+    onInput?: (v: number) => void;
+    onChange?: (v: number) => void;
+    min?: number;
+    max?: number;
+    step?: number;
+    width?: number;
+    style?: Style;
+}): El {
+    const inRef = new StrFnRef();
+    if (props.onInput !== undefined) {
+        inRef.fn = (v: string) => {
+            if (props.onInput !== undefined) props.onInput(parseFloat(v));
+        };
+    }
+    const chgRef = new StrFnRef();
+    if (props.onChange !== undefined) {
+        chgRef.fn = (v: string) => {
+            if (props.onChange !== undefined) props.onChange(parseFloat(v));
+        };
+    }
+    const style: Style = {};
+    if (props.width !== undefined) style.width = props.width;
+    if (props.min !== undefined) style.min = props.min;
+    if (props.max !== undefined) style.max = props.max;
+    if (props.step !== undefined) style.step = props.step;
+    if (props.style !== undefined) mergeStyleInto(style, props.style);
+    const onNum = (ev: HostEvent) => String(ev.value);
+    return h("slider", {
+        style: style,
+        value: props.value,
+        onInput: (ev: HostEvent) => {
+            const f = inRef.fn;
+            if (f !== null) f(onNum(ev));
+        },
+        onChange: (ev: HostEvent) => {
+            const f = chgRef.fn;
+            if (f !== null) f(onNum(ev));
+        },
+    });
+}
+
+// ---------------------------------------------------------------------------
 // ScrollArea
 // ---------------------------------------------------------------------------
 

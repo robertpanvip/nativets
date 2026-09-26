@@ -262,7 +262,12 @@ declare namespace JSX {
         onBlur?: (ev: HostEvent) => void;
         /** Initial text content; same as passing a string child. */
         text?: string;
-        /** Text field value: a literal, or a getter for a controlled field. */
+        /**
+         * Controlled value: a literal, or a getter for a controlled widget.
+         * input: the text; checkbox/switch: "true"/"false"; select: the
+         * option; date: ISO "YYYY-MM-DD"; progress/slider: a number
+         * (percent 0..=100 / thumb position).
+         */
         value?: string | number | (() => string | number);
         /** Text field hint, shown while the value is empty. */
         placeholder?: string;
@@ -272,6 +277,14 @@ declare namespace JSX {
         options?: string[];
         /** Native checkbox/switch: the label rendered next to the control. */
         label?: string;
+        /** Native slider scale (creation-time; a different scale is a new slider). */
+        min?: number;
+        max?: number;
+        step?: number;
+        /** Native progress: truthy shows the indeterminate loading animation. */
+        loading?: number | boolean;
+        /** Native slider dragged; `ev.value` is the live thumb position. */
+        onInput?: (ev: HostEvent) => void;
         children?: any;
     }
 
