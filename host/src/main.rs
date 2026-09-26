@@ -65,6 +65,18 @@ use chrono::NaiveDate;
 use gpui_base::Date as GpuiDate;
 use gpui_component::date_picker::{DatePicker as GpuiDatePicker, DatePickerEvent, DatePickerState};
 use gpui_component::slider::{Slider as GpuiSlider, SliderEvent, SliderState};
+// The real dropdown select. `SelectState<D>` is generic over its delegate, so
+// the host pins one: plain text options, whose item *value* is the display
+// string itself — exactly what the protocol carries.
+use gpui_component::select::{Select as GpuiSelect, SelectEvent, SelectState};
+use gpui_component::IndexPath;
+
+/// Delegate backing a host `select` node: the option list as text. `Vec<T>`
+/// already implements `SearchableListDelegate`, and `SharedString` an item, so
+/// no newtype is needed.
+type SelectDelegate = Vec<SharedString>;
+/// The concrete state entity stored per `select` node.
+type HostSelectState = SelectState<SelectDelegate>;
 use gpui_platform::application;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
@@ -397,6 +409,9 @@ const DEFAULT_INPUT_W: f32 = 220.0;
 const DEFAULT_FONT_SIZE: f32 = 13.0;
 /// Default width of a native `slider` when the protocol gives no `width`.
 const DEFAULT_SLIDER_W: f32 = 220.0;
+/// Default width of a native `select` trigger when the protocol gives no
+/// `width` (the frontend kit also sends 170 — this only covers a bare tag).
+const DEFAULT_SELECT_W: f32 = 170.0;
 /// Line box relative to font size, for the single-line fields and canvas text
 /// we shape by hand. GPUI's text elements use a similar ratio, so a hand-painted
 /// field does not sit visually tighter than the labels around it.
@@ -409,6 +424,71 @@ const SCROLLBAR_MIN_THUMB: f32 = 24.0;
 /// `#8b93a7` at 45% — the host's scrollbar grey, matching the demo palette's
 /// secondary text so a host-drawn bar does not look foreign.
 const SCROLLBAR_THUMB: u32 = 0x8B93_A773;
+
+// ---------------------------------------------------------------------------
+// App palette, mirrored from `ui/src/theme.ts`
+//
+// The gpui-component theme is a shadcn-neutral palette: in dark mode its
+// `primary` is *near white*, so a checked checkbox, a switch track, a progress
+// fill and a slider thumb all come out white-on-black — nothing like this app's
+// blue. Rather than re-skinning each control (which is what produced the
+// string of per-widget "style overrides" this file used to carry), the theme's
+// semantic colours are pointed at the app palette once, at window setup, so
+// every component that asks the theme comes out matching.
+// ---------------------------------------------------------------------------
+const P_BG: u32 = 0x0F11_17FF;
+const P_CARD: u32 = 0x161B_26FF;
+const P_ELEVATED: u32 = 0x1C23_33FF;
+const P_BORDER: u32 = 0x262D_3DFF;
+const P_ACCENT: u32 = 0x4F8C_FFFF;
+const P_TEXT: u32 = 0xE8EA_F2FF;
+const P_TEXT_SECONDARY: u32 = 0x8B93_A7FF;
+const P_WHITE: u32 = 0xFFFF_FFFF;
+
+/// Point gpui-component's semantic colours at the app palette.
+///
+/// Called *after* `Theme::change`, because that re-applies the whole config
+/// from the theme JSON and would wipe direct field writes.
+fn apply_app_palette(cx: &mut App) {
+    use gpui_component::Theme as CTheme;
+    let accent: gpui::Hsla = rgba(P_ACCENT).into();
+    let t = CTheme::global_mut(cx);
+    // Fills that mean "selected / active / progress": checkbox mark, switch
+    // track, slider fill, progress bar, dropdown list selection.
+    t.colors.primary = accent;
+    t.colors.primary_hover = accent;
+    t.colors.primary_active = accent;
+    // Drawn *on* primary — the check glyph, the switch knob's contrast.
+    t.colors.primary_foreground = rgba(P_WHITE).into();
+    t.colors.ring = accent; // focus ring, accent-coloured like the fields
+    // Surfaces + hairlines that used to be neutral greys (#2f2f2f).
+    t.colors.input = rgba(P_BORDER).into();
+    t.colors.border = rgba(P_BORDER).into();
+    t.colors.background = rgba(P_BG).into();
+    t.colors.foreground = rgba(P_TEXT).into();
+    t.colors.muted = rgba(P_ELEVATED).into();
+    t.colors.muted_foreground = rgba(P_TEXT_SECONDARY).into();
+    t.colors.accent = rgba(P_ELEVATED).into(); // row hover
+    t.colors.accent_foreground = rgba(P_TEXT).into();
+    // Dropdown / popover surfaces: the app's raised card, not near-black.
+    t.colors.popover = rgba(P_ELEVATED).into();
+    t.colors.popover_foreground = rgba(P_TEXT).into();
+    t.colors.list = rgba(P_ELEVATED).into();
+    t.colors.list_active = rgba(P_ELEVATED).into();
+    t.colors.list_hover = rgba(P_CARD).into();
+    t.colors.list_head = rgba(P_CARD).into();
+    t.colors.caret = accent; // text caret in fields
+    // Switch: the off-track and its knob are their own theme fields.
+    t.colors.switch = rgba(P_ELEVATED).into();
+    t.colors.switch_thumb = rgba(P_TEXT_SECONDARY).into();
+    // The *legacy* token layer is a cache: components such as Checkbox and
+    // Switch read `theme.tokens.primary` (not `colors.primary`), and it is only
+    // rebuilt from `colors` inside `apply_config` — i.e. before these writes.
+    // Without this line the checkbox keeps the neutral theme's near-white mark.
+    t.tokens = (&t.colors).into();
+    // The base layer is a projection for host-drawn chrome (scrollbars).
+    CTheme::sync_base(cx);
+}
 
 struct HostView {
     tree: Tree,
@@ -455,6 +535,13 @@ struct HostView {
     /// Last slider value echoed up per node, so a controlled `setValue` echo
     /// does not fight a drag that is still in progress.
     slider_reported: HashMap<u64, String>,
+    /// One gpui-component `SelectState` per `select` node (option list,
+    /// selection, dropdown open flag). The option list is creation-time — a
+    /// different option set is a new select, exactly like the slider scale.
+    select_states: HashMap<u64, Entity<HostSelectState>>,
+    /// Last select value echoed up per node, so a controlled `setValue` echo
+    /// does not re-push the value the widget itself just confirmed.
+    select_reported: HashMap<u64, String>,
 }
 
 /// Deterministic application order for style keys (HashMap iteration is
@@ -697,10 +784,15 @@ impl HostView {
     /// `change` events (Enter) — the same contract the hand-painted field had,
     /// so the frontend's controlled loop does not change.
     ///
-    /// Protocol styles land on the *wrapper*: `Input` is `Styled` too, but its
-    /// own chrome (border, background, focus ring) comes from the theme, and
-    /// letting arbitrary protocol colors fight it produced broken visuals. The
-    /// wrapper carries size/padding/flow; the field fills it.
+    /// **Where protocol styles land.** `Input::render` applies its themed
+    /// chrome (`input_px/input_py/input_h`, `bg`, `border`, `rounded`) and only
+    /// *then* calls `refine_style(&self.style)` — so a style pushed onto the
+    /// `Input` element itself wins over the theme, while a style pushed onto a
+    /// wrapper is simply painted *under* the field's own background and looks
+    /// ignored. Every style key therefore goes to the `Input`, and the wrapper
+    /// keeps only the box (size + placement) so the parent flexes one element.
+    /// That is what makes the frontend's `background` / `borderColor` (its
+    /// focus ring) / `fontSize` actually visible.
     fn build_input(
         &mut self,
         node: &Node,
@@ -723,7 +815,7 @@ impl HostView {
             state.update(cx, |st, cx| st.set_value(tree_value.clone(), window, cx));
         }
 
-        let mut wrap = div().flex().flex_row().items_center().overflow_hidden();
+        let mut wrap = div().flex().flex_row().items_center();
         if !node.style.contains_key("width") {
             wrap = wrap.w(px(DEFAULT_INPUT_W));
         }
@@ -731,12 +823,15 @@ impl HostView {
             wrap = wrap.h(px(num_of(node, "fontSize").unwrap_or(DEFAULT_FONT_SIZE) * LINE_RATIO + 12.0));
         }
         for (k, v) in sorted_style(node) {
-            // The field's text/border colors are the component theme's job;
-            // height fights the component's own line layout.
-            if matches!(k.as_str(), "color" | "fontSize" | "height") {
-                continue;
+            // The wrapper owns the box (it is what the parent flexes) *and* the
+            // field repeats the same size, because `Input` computes its own
+            // height from its `Size` (`small()` → 22px) and only the protocol
+            // value can override that — a 34px-tall style would otherwise sit
+            // in a 34px wrapper as a 22px pill. Placement / flex factors stay
+            // on the wrapper: they describe where the *node* goes.
+            if is_box_key(k) || is_placement_key(k) || k == "alignItems" || k == "justifyContent" {
+                wrap = apply_style(wrap, k, v);
             }
-            wrap = apply_style(wrap, k, v);
         }
         if no_shrink && !node.style.contains_key("shrink") {
             wrap = wrap.flex_shrink(0.0);
@@ -744,7 +839,7 @@ impl HostView {
 
         let element_id = ElementId::from(SharedString::from(format!("node-{id}")));
         use gpui_component::Sizable;
-        let input = gpui_component::input::Input::new(&state)
+        let mut input = gpui_component::input::Input::new(&state)
             .id(element_id)
             .small()
             .appearance(true)
@@ -752,6 +847,12 @@ impl HostView {
             .flex_grow(1.0)
             .min_w(px(0.0))
             .h_full();
+        for (k, v) in sorted_style(node) {
+            if is_placement_key(k) {
+                continue; // the wrapper places the node (see above)
+            }
+            input = apply_style(input, k, v);
+        }
         wrap.child(input).into_any_element()
     }
 
@@ -903,6 +1004,64 @@ impl HostView {
         state
     }
 
+    /// One gpui-component `SelectState` per `select` node (mirrors
+    /// `date_state` / `slider_state`). The state owns the option list, the
+    /// committed selection and the dropdown open flag; the `Select` element
+    /// built each frame is a view of it. Confirming an option echoes
+    /// `SelectEvent::Confirm` up as a `change` event carrying the option text.
+    ///
+    /// The delegate is a plain `Vec<SharedString>`: protocol options are
+    /// display strings, and the *value* of each item is that same string, so
+    /// `set_selected_value` / `Confirm` round-trip the option text directly.
+    /// Options are creation-time (see `slider_state` for the same rule).
+    fn select_state(
+        &mut self,
+        id: u64,
+        node: &Node,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<HostSelectState> {
+        if let Some(st) = self.select_states.get(&id) {
+            return st.clone();
+        }
+        let options: SelectDelegate = node
+            .select_options()
+            .into_iter()
+            .map(SharedString::from)
+            .collect();
+        let seed = node.value.clone().unwrap_or_default();
+        let seed_ix = options
+            .iter()
+            .position(|o| **o == *seed)
+            .map(|row| IndexPath::default().row(row));
+        let tx = self.event_tx.clone();
+        let state = cx.new(|cx| SelectState::new(options, seed_ix, window, cx));
+        cx.subscribe(
+            &state,
+            move |_this: &mut HostView, _st, ev: &SelectEvent<SelectDelegate>, _cx| {
+                let SelectEvent::Confirm(value) = ev;
+                let Some(value) = value else { return };
+                let msg = json!({
+                    "t": "event", "target": id, "kind": "change",
+                    "value": value.to_string()
+                })
+                .to_string();
+                log!("[host] ev change(select) id={id} t={} {msg}", now_ms());
+                let _ = tx.send(msg);
+            },
+        )
+        .detach();
+        // Route the component's focus handle through the existing poll so
+        // `focus`/`blur` events keep flowing without a second mechanism.
+        let fh = state.read(cx).focus_handle(cx).clone();
+        self.focus_handles.insert(id, fh);
+        self.focus_reported.insert(id, false);
+        let live = select_value_text(&state, cx);
+        self.select_reported.insert(id, live);
+        self.select_states.insert(id, state.clone());
+        state
+    }
+
     /// A native-widget node (`checkbox` / `switch` / `button` / `select`):
     /// rendered as a real `gpui_component` control instead of a styled div.
     ///
@@ -945,7 +1104,12 @@ impl HostView {
         match node.tag.as_str() {
             "checkbox" | "switch" => {
                 // Switch and Checkbox are distinct types; each branch finishes
-                // its own control and shares only the event handler.
+                // its own control and shares only the event handler. Both are
+                // `Styled` and refine the protocol style onto the outer row
+                // (the one carrying the label) *after* their themed chrome, so
+                // a protocol `color` / `fontSize` / `width` really lands. There
+                // is no wrapper here (each control owns its own box), hence no
+                // key is skipped.
                 let is_switch = node.tag == "switch";
                 let tx = self.event_tx.clone();
                 if is_switch {
@@ -953,12 +1117,18 @@ impl HostView {
                     if !label.is_empty() {
                         ctl = ctl.label(label);
                     }
+                    for (k, v) in sorted_style(node) {
+                        ctl = apply_style(ctl, k, v);
+                    }
                     ctl.on_click(toggle_handler(id, tx)).into_any_element()
                 } else {
                     let mut ctl =
                         gpui_component::checkbox::Checkbox::new(element_id).checked(checked);
                     if !label.is_empty() {
                         ctl = ctl.label(label);
+                    }
+                    for (k, v) in sorted_style(node) {
+                        ctl = apply_style(ctl, k, v);
                     }
                     ctl.on_click(toggle_handler(id, tx)).into_any_element()
                 }
@@ -984,43 +1154,48 @@ impl HostView {
                 .into_any_element()
             }
             "select" => {
-                // A plain styled trigger that opens the host's own popup menu
-                // is a bigger cut; for now render the options as a button
-                // showing the current value and cycle through the list on
-                // click — the controlled contract (value down, change up) is
-                // identical to the final dropdown.
-                let options = node.select_options();
-                let current = node
-                    .value
-                    .as_deref()
-                    .map(str::to_string)
-                    .unwrap_or_else(|| options.first().cloned().unwrap_or_default());
-                let tx = self.event_tx.clone();
-                let mut b = gpui_component::button::Button::new(element_id)
-                    .when(!current.is_empty(), |b| b.label(current.clone()));
-                for (k, v) in sorted_style(node) {
-                    if k == "borderRadius" {
-                        continue;
-                    }
-                    b = apply_style(b, k, v);
+                // Real gpui-component `Select`: trigger with the selected
+                // option, dropdown anchored under it (Root overlay + deferred
+                // Positioner), outside-click and Escape close it — the whole
+                // interaction is the component's, not ours. Controlled like
+                // the other stateful widgets: a `setValue` that differs from
+                // the live selection (and from our last echo) is pushed down
+                // via `set_selected_value`; a user pick comes back as
+                // `SelectEvent::Confirm` (see `select_state`).
+                let state = self.select_state(id, node, window, cx);
+                let tree_value = node.value.clone().unwrap_or_default();
+                let live = select_value_text(&state, cx);
+                let echoed = self.select_reported.get(&id).map(|s| *s == live).unwrap_or(false);
+                if tree_value != live && !(echoed && tree_value == live) && !tree_value.is_empty()
+                {
+                    let wanted = SharedString::from(tree_value.clone());
+                    state.update(cx, |st, cx| {
+                        st.set_selected_value(&wanted, window, cx);
+                    });
+                    self.select_reported.insert(id, tree_value.clone());
                 }
-                b.on_click(move |_ev: &ClickEvent, _window, _cx| {
-                        // Cycle: pick the option after the current one.
-                        let next = options
-                            .iter()
-                            .position(|o| *o == current)
-                            .map(|i| (i + 1) % options.len())
-                            .unwrap_or(0);
-                        let value = options.get(next).cloned().unwrap_or_default();
-                        let msg = json!({
-                            "t": "event", "target": id, "kind": "change",
-                            "value": value
-                        })
-                        .to_string();
-                        log!("[host] ev change id={id} t={} {msg}", now_ms());
-                        let _ = tx.send(msg);
-                    })
-                    .into_any_element()
+                let mut sel = GpuiSelect::new(&state).appearance(true);
+                // Placement keys belong on the wrapper (mirrors `build_canvas`):
+                // the parent flexes the wrapper, the trigger fills it.
+                let mut wrap = div().flex().flex_row().items_center();
+                for (k, v) in sorted_style(node) {
+                    if is_placement_key(k) {
+                        wrap = apply_style(wrap, k, v);
+                    } else if k == "width" {
+                        // Width drives the wrapper; the dropdown matches the
+                        // trigger width on its own (menu_width defaults to the
+                        // trigger's measured bounds).
+                        wrap = apply_style(wrap, k, v);
+                    } else {
+                        // color/fontSize flow through: Select is Styled and
+                        // refines its trigger.
+                        sel = apply_style(sel, k, v);
+                    }
+                }
+                if !node.style.contains_key("width") {
+                    wrap = wrap.w(px(DEFAULT_SELECT_W));
+                }
+                wrap.child(sel).into_any_element()
             }
             "date" => {
                 // Native date picker: a real gpui-component `time::DatePicker`
@@ -1045,7 +1220,27 @@ impl HostView {
                         picker = picker.placeholder(ph.clone());
                     }
                 }
-                picker.appearance(true).cleanable(false).into_any_element()
+                picker = picker.appearance(true).cleanable(false);
+                // Same split as `build_input`: the wrapper owns the box (a
+                // picker with no definite width anchors its calendar to a
+                // zero-width trigger, which reads as "the popup is in the
+                // wrong place"), the picker gets everything visual.
+                let mut wrap = div().flex().flex_row().items_center();
+                for (k, v) in sorted_style(node) {
+                    if is_box_key(k) || is_placement_key(k) || k == "alignItems" {
+                        wrap = apply_style(wrap, k, v);
+                    } else {
+                        picker = apply_style(picker, k, v);
+                    }
+                }
+                if !node.style.contains_key("width") {
+                    // No explicit width → fill the parent column, mirroring the
+                    // `Input` label wrapper's `width: "full"`. Without this the
+                    // picker lands at the default 220 and reads as narrower than
+                    // the field stacked above it.
+                    wrap = wrap.w_full().flex_grow(1.0);
+                }
+                wrap.child(picker).into_any_element()
             }
             "progress" => {
                 // Stateless display widget: `value` (0..=100) drives the bar,
@@ -1303,6 +1498,8 @@ impl HostView {
         self.date_states.retain(|k, _| live.contains(k));
         self.slider_states.retain(|k, _| live.contains(k));
         self.slider_reported.retain(|k, _| live.contains(k));
+        self.select_states.retain(|k, _| live.contains(k));
+        self.select_reported.retain(|k, _| live.contains(k));
     }
 
     /// Push window geometry to the engine when it changed.
@@ -1452,6 +1649,16 @@ fn num_of(node: &Node, key: &str) -> Option<f32> {
 /// re-apply the value mid-drag forever).
 fn slider_value_text(state: &Entity<SliderState>, cx: &App) -> String {
     format_value(state.read(cx).value().end())
+}
+
+/// The live value of a select state (the selected option text, or "").
+/// Same echo-comparison role as `slider_value_text`.
+fn select_value_text(state: &Entity<HostSelectState>, cx: &App) -> String {
+    state
+        .read(cx)
+        .selected_value()
+        .map(|v| v.to_string())
+        .unwrap_or_default()
 }
 
 /// One decimal place max, trailing `.0` trimmed — `37.5` stays `37.5`, `37.0`
@@ -2134,14 +2341,16 @@ fn open_host_window(
     cx: &mut App,
     ev_tx: mpsc::Sender<String>,
     metrics: Option<Arc<bom::WindowMetrics>>,
-) -> gpui::WindowHandle<HostView> {
+) -> gpui::WindowHandle<gpui_component::Root> {
     // gpui-component's global state (theme, root rendering, input machinery).
     // Idempotent per-process; called once before any window opens.
     gpui_component::init(cx);
     // `init` pins Light mode; the dashboard's palette is dark, so flip the
     // component theme to match — otherwise native buttons come out white-on-
-    // white against the dark cards.
+    // white against the dark cards. `change` re-applies the theme JSON, so the
+    // app palette override has to come after it.
     gpui_component::Theme::change(gpui_component::ThemeMode::Dark, None, cx);
+    apply_app_palette(cx);
     let bounds = Bounds {
         origin: point(px(80.0), px(50.0)),
         size: size(px(WINDOW_W), px(WINDOW_H)),
@@ -2157,8 +2366,16 @@ fn open_host_window(
     };
 
     let handle = cx
-        .open_window(options, |_, cx| {
-            cx.new(|_| HostView {
+        .open_window(options, |window, cx| {
+            // HostView is the app; `gpui_component::Root` must be the window's
+            // FIRST view — it owns the tooltip / native-menu overlays that
+            // popover-style surfaces (Select dropdown, DatePicker calendar)
+            // anchor to and dismiss against. Without it the dropdown's
+            // `deferred(...)` popup still paints (its Positioner clamps to the
+            // window viewport itself), but its `on_mouse_down_out` never sees
+            // clicks outside, so the menu could not be closed by clicking
+            // elsewhere. Root is what makes the popup behave like a popup.
+            let host = cx.new(|_| HostView {
                 tree: Tree::new(),
                 event_tx: ev_tx,
                 metrics,
@@ -2172,7 +2389,12 @@ fn open_host_window(
                 date_states: HashMap::new(),
                 slider_states: HashMap::new(),
                 slider_reported: HashMap::new(),
-            })
+                select_states: HashMap::new(),
+                select_reported: HashMap::new(),
+            });
+            // `Root::new` needs `&mut Context<Root>`, so it is built by a second
+            // `cx.new` rather than inline in the window closure.
+            cx.new(|cx| gpui_component::Root::new(host, window, cx))
         })
         .expect("failed to open window");
     cx.activate(true);
@@ -2191,7 +2413,7 @@ fn open_host_window(
 #[cfg_attr(not(quickjs), allow(dead_code))]
 fn spawn_dialog_host(
     cx: &mut App,
-    handle: gpui::WindowHandle<HostView>,
+    handle: gpui::WindowHandle<gpui_component::Root>,
     dialog_rx: async_channel::Receiver<bom::DialogRequest>,
 ) {
     cx.spawn(async move |cx| {
@@ -2202,10 +2424,20 @@ fn spawn_dialog_host(
                 req.message
             );
             let reply = req.reply.clone();
+            // The app view now lives one layer down (Root wraps it): the
+            // handle's view type is Root, and the HostView is Root's inner
+            // `view()` AnyView.
             let shown = cx.update(|cx| {
-                handle.update(cx, |view, _window, cx| {
-                    view.dialog = Some(req);
-                    cx.notify();
+                handle.update(cx, |_root, _window, cx| {
+                    // `AnyView::downcast` consumes the view, so clone the Arc.
+                    if let Ok(host) = _root.view().clone().downcast::<HostView>() {
+                        host.update(cx, |view, cx| {
+                            view.dialog = Some(req);
+                            cx.notify();
+                        });
+                    } else {
+                        log!("[host] host view not found under Root");
+                    }
                 })
             });
             if shown.is_err() {
@@ -2219,25 +2451,34 @@ fn spawn_dialog_host(
 
 fn spawn_ops_apply(
     cx: &mut App,
-    handle: gpui::WindowHandle<HostView>,
+    handle: gpui::WindowHandle<gpui_component::Root>,
     ops_rx: async_channel::Receiver<Vec<Op>>,
 ) {
     cx.spawn(async move |cx| {
         while let Ok(ops) = ops_rx.recv().await {
             let _ = cx.update(|cx| {
-                let _ = handle.update(cx, |view, window, cx| {
-                    if let Some(title) = view.tree.apply(&ops) {
-                        window.set_window_title(&title);
-                    }
-                    if dump_tree_enabled() && ops.len() >= 32 {
-                        log!("[host] tree after {} ops:\n{}", ops.len(), view.tree.dump());
-                    }
-                    // AOT 前端把挂载摊成单 op 行（batch ops=1），≥32 阈值永不触发；
-                    // 早期批次（前 400 个 op）也 dump，便于排障。
-                    if dump_tree_enabled() && OPS_SEEN.load(Ordering::Relaxed) < 400 {
-                        log!("[host] early tree after {} ops:\n{}", ops.len(), view.tree.dump());
-                    }
-                    cx.notify();
+                let _ = handle.update(cx, |_root, window, cx| {
+                    // The app view lives inside Root (see `open_host_window`);
+                    // downcast Root's inner AnyView to reach it. `downcast`
+                    // consumes the view, so the Arc is cloned.
+                    let Ok(host) = _root.view().clone().downcast::<HostView>() else {
+                        log!("[host] ops dropped (host view not under Root)");
+                        return;
+                    };
+                    host.update(cx, |view, cx| {
+                        if let Some(title) = view.tree.apply(&ops) {
+                            window.set_window_title(&title);
+                        }
+                        if dump_tree_enabled() && ops.len() >= 32 {
+                            log!("[host] tree after {} ops:\n{}", ops.len(), view.tree.dump());
+                        }
+                        // AOT 前端把挂载摊成单 op 行（batch ops=1），≥32 阈值永不触发；
+                        // 早期批次（前 400 个 op）也 dump，便于排障。
+                        if dump_tree_enabled() && OPS_SEEN.load(Ordering::Relaxed) < 400 {
+                            log!("[host] early tree after {} ops:\n{}", ops.len(), view.tree.dump());
+                        }
+                        cx.notify();
+                    });
                 });
             });
         }
