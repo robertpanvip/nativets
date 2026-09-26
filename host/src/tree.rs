@@ -402,7 +402,30 @@ impl Tree {
 pub fn is_native_tag(tag: &str) -> bool {
     matches!(
         tag,
-        "checkbox" | "switch" | "button" | "select" | "date" | "progress" | "slider" | "spinner"
+        "checkbox"
+            | "switch"
+            | "button"
+            | "select"
+            | "date"
+            | "progress"
+            | "slider"
+            | "spinner"
             | "rating"
+            | "textarea"
+            | "combobox"
+            | "colorpicker"
+            | "radio"
+            | "tabs"
+            | "pagination"
+            | "breadcrumb"
+            | "alert"
+            | "badge"
+            | "tag"
+            | "avatar"
+            | "separator"
+            | "skeleton"
+            | "label"
+            | "link"
+            | "collapsible"
     )
 }

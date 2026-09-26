@@ -418,6 +418,297 @@ export function Slider(props: {
 }
 
 // ---------------------------------------------------------------------------
+// Extended gpui-component widgets (native bridge)
+// ---------------------------------------------------------------------------
+// One wrapper per new native tag registered in `main.rs::build_native`:
+//   textarea / combobox / colorpicker / radio / tabs / pagination / breadcrumb /
+//   alert / badge / tag / avatar / separator / skeleton / label / link /
+//   collapsible
+//
+// The controlled contract is the same as the other native widgets: the frontend
+// owns the value and pushes it via `setValue`; user interaction echoes back as
+// an event the `onChange` / `onInput` / `onClick` / `onClose` callback receives.
+// Callbacks are copied into class refs before any closure captures them so the
+// same source compiles under scriptc (see the note at the top of this file).
+
+/** Multi-line editor. Controlled like `Input`: `value` is the text; edits echo
+ *  `input` (per keystroke) and `change` (on Enter). */
+export function Textarea(props: {
+    value: () => string;
+    onInput?: (v: string) => void;
+    onChange?: (v: string) => void;
+    height?: number;
+    style?: Style;
+}): El {
+    const inRef = new StrFnRef();
+    if (props.onInput !== undefined) inRef.fn = props.onInput;
+    const chRef = new StrFnRef();
+    if (props.onChange !== undefined) chRef.fn = props.onChange;
+    const style: Style = { width: "full" };
+    if (props.height !== undefined) style.height = props.height;
+    if (props.style !== undefined) mergeStyleInto(style, props.style);
+    return h("textarea", {
+        style: style,
+        value: props.value,
+        onInput: (ev: HostEvent) => {
+            const f = inRef.fn;
+            if (f !== null) f(String(ev.value));
+        },
+        onChange: (ev: HostEvent) => {
+            const f = chRef.fn;
+            if (f !== null) f(String(ev.value));
+        },
+    });
+}
+
+/** Searchable single-select. `value` is the chosen option text; picking echoes
+ *  `change` with the option text. */
+export function Combobox(props: {
+    options: string[];
+    value: () => string;
+    onChange?: (v: string) => void;
+    width?: number;
+    style?: Style;
+}): El {
+    const chgRef = new StrFnRef();
+    if (props.onChange !== undefined) chgRef.fn = props.onChange;
+    const style: Style = {};
+    if (props.width !== undefined) style.width = props.width;
+    if (props.style !== undefined) mergeStyleInto(style, props.style);
+    return h("combobox", {
+        style: style,
+        value: props.value,
+        options: props.options,
+        onChange: (ev: HostEvent) => {
+            const f = chgRef.fn;
+            if (f !== null) f(String(ev.value));
+        },
+    });
+}
+
+/** Colour picker. `value` is `#rrggbb`; changing echoes `change` with the hex. */
+export function ColorPicker(props: {
+    value: () => string;
+    onChange?: (v: string) => void;
+    style?: Style;
+}): El {
+    const chgRef = new StrFnRef();
+    if (props.onChange !== undefined) chgRef.fn = props.onChange;
+    const style: Style = {};
+    if (props.style !== undefined) mergeStyleInto(style, props.style);
+    return h("colorpicker", {
+        style: style,
+        value: props.value,
+        onChange: (ev: HostEvent) => {
+            const f = chgRef.fn;
+            if (f !== null) f(String(ev.value));
+        },
+    });
+}
+
+/** Native radio group. `value` is the selected index; a click echoes `change`
+ *  with the chosen index (0-based). */
+export function RadioNative(props: {
+    options: string[];
+    value: () => number;
+    onChange?: (index: number) => void;
+    direction?: "row" | "column";
+}): El {
+    const selRef = new StrFnRef();
+    if (props.onChange !== undefined) {
+        selRef.fn = (v: string) => props.onChange!(parseInt(v, 10));
+    }
+    const style: Style = {
+        flexDirection: props.direction === "column" ? "column" : "row",
+        gap: 16,
+        alignItems: "center",
+    };
+    return h("radio", {
+        style: style,
+        value: () => String(props.value()),
+        options: props.options,
+        onChange: (ev: HostEvent) => {
+            const f = selRef.fn;
+            if (f !== null) f(String(ev.value));
+        },
+    });
+}
+
+/** Tab bar. `value` is the selected index; a click echoes `change` with the
+ *  chosen index (0-based). */
+export function TabsNative(props: {
+    options: string[];
+    value: () => number;
+    onChange?: (index: number) => void;
+}): El {
+    const selRef = new StrFnRef();
+    if (props.onChange !== undefined) {
+        selRef.fn = (v: string) => props.onChange!(parseInt(v, 10));
+    }
+    return h("tabs", {
+        value: () => String(props.value()),
+        options: props.options,
+        onChange: (ev: HostEvent) => {
+            const f = selRef.fn;
+            if (f !== null) f(String(ev.value));
+        },
+    });
+}
+
+/** Pager. `total` is the page count; `value` is the current 1-based page; a
+ *  click echoes `change` with the target page. */
+export function PaginationNative(props: {
+    total: number;
+    value: () => number;
+    onChange?: (page: number) => void;
+}): El {
+    const selRef = new StrFnRef();
+    if (props.onChange !== undefined) {
+        selRef.fn = (v: string) => props.onChange!(parseInt(v, 10));
+    }
+    const style: Style = {};
+    style.total = props.total;
+    return h("pagination", {
+        style: style,
+        value: () => String(props.value()),
+        onChange: (ev: HostEvent) => {
+            const f = selRef.fn;
+            if (f !== null) f(String(ev.value));
+        },
+    });
+}
+
+/** Breadcrumb trail. `options` are the crumb labels; a click echoes `change`
+ *  with the clicked crumb index (0-based). */
+export function BreadcrumbNative(props: {
+    options: string[];
+    onChange?: (index: number) => void;
+}): El {
+    const selRef = new StrFnRef();
+    if (props.onChange !== undefined) {
+        selRef.fn = (v: string) => props.onChange!(parseInt(v, 10));
+    }
+    return h("breadcrumb", {
+        options: props.options,
+        onChange: (ev: HostEvent) => {
+            const f = selRef.fn;
+            if (f !== null) f(String(ev.value));
+        },
+    });
+}
+
+/** Dismissable banner. `text` is the message; `onClose` fires when the dismiss
+ *  button is clicked (only wired when provided). */
+export function AlertNative(props: {
+    text: string;
+    onClose?: () => void;
+    style?: Style;
+}): El {
+    const closeRef = new CtxFnRef();
+    if (props.onClose !== undefined) closeRef.fn = () => props.onClose!();
+    const style: Style = {};
+    if (props.style !== undefined) mergeStyleInto(style, props.style);
+    return h("alert", {
+        style: style,
+        text: props.text,
+        onClose: () => {
+            const f = closeRef.fn;
+            if (f !== null) f(undefined as unknown as Ctx);
+        },
+    });
+}
+
+/** Inline badge wrapping arbitrary content. */
+export function Badge(props: { children?: Child; style?: Style }): El {
+    const style: Style = {};
+    if (props.style !== undefined) mergeStyleInto(style, props.style);
+    return h("badge", { style: style }, props.children);
+}
+
+/** Small status tag. `variant` is one of default/secondary/danger/success/
+ *  warning/info (drives the host's `TagVariant`). */
+export function Tag(props: { variant?: string; children?: Child; style?: Style }): El {
+    const style: Style = {};
+    if (props.variant !== undefined) style.variant = props.variant;
+    if (props.style !== undefined) mergeStyleInto(style, props.style);
+    return h("tag", { style: style }, props.children);
+}
+
+/** User avatar; `name` is shown as initials. */
+export function Avatar(props: { name: string; style?: Style }): El {
+    const style: Style = {};
+    if (props.style !== undefined) mergeStyleInto(style, props.style);
+    return h("avatar", { style: style, text: props.name });
+}
+
+/** Layout divider. `orientation` is "horizontal" | "vertical". */
+export function Separator(props: { orientation?: "horizontal" | "vertical"; style?: Style }): El {
+    const style: Style = {};
+    if (props.orientation !== undefined) style.orientation = props.orientation;
+    if (props.style !== undefined) mergeStyleInto(style, props.style);
+    return h("separator", { style: style });
+}
+
+/** Loading placeholder bar (host paints a shimmer). */
+export function Skeleton(props: { style?: Style }): El {
+    const style: Style = { width: "full", height: 14 };
+    if (props.style !== undefined) mergeStyleInto(style, props.style);
+    return h("skeleton", { style: style });
+}
+
+/** Static text label (a real gpui-component `Label`). */
+export function Label(props: { text: string; style?: Style }): El {
+    const style: Style = {};
+    if (props.style !== undefined) mergeStyleInto(style, props.style);
+    return h("label", { style: style, text: props.text });
+}
+
+/** Hyperlink. `href` is informational (no navigation happens); `onClick` fires
+ *  when clicked (only wired when provided). */
+export function Link(props: {
+    href?: string;
+    children?: Child;
+    onClick?: () => void;
+    style?: Style;
+}): El {
+    const clickRef = new CtxFnRef();
+    if (props.onClick !== undefined) clickRef.fn = () => props.onClick!();
+    const style: Style = {};
+    if (props.href !== undefined) style.href = props.href;
+    if (props.style !== undefined) mergeStyleInto(style, props.style);
+    return h(
+        "link",
+        {
+            style: style,
+            onClick: () => {
+                const f = clickRef.fn;
+                if (f !== null) f(undefined as unknown as Ctx);
+            },
+        },
+        props.children,
+    );
+}
+
+/** Expandable section. `open` is the controlled state; the children are the
+ *  revealed content. */
+export function Collapsible(props: {
+    open: () => boolean;
+    children?: Child;
+    style?: Style;
+}): El {
+    const style: Style = {};
+    if (props.style !== undefined) mergeStyleInto(style, props.style);
+    return h(
+        "collapsible",
+        {
+            style: style,
+            value: () => (props.open() ? "true" : "false"),
+        },
+        props.children,
+    );
+}
+
+// ---------------------------------------------------------------------------
 // ScrollArea
 // ---------------------------------------------------------------------------
 
