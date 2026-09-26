@@ -266,6 +266,12 @@ function writeLine(line: string): void {
  * A host → frontend event — the `{"t":"event",…}` line. Flat interface
  * rather than a discriminated union: the host is the only producer and every
  * consumer switches on `kind`.
+ *
+ * Click events carry the DOM-ish control surface: `stopPropagation()` halts
+ * the runtime's ancestor walk (see `handleLine`), and `currentTarget` is the
+ * element whose handler is currently running (`target` stays the element the
+ * interaction physically hit). Both exist on every event for shape stability,
+ * but only `click` actually bubbles.
  */
 export interface HostEvent {
     kind: string;
@@ -275,6 +281,14 @@ export interface HostEvent {
     max?: number;
     viewport?: number;
     content?: number;
+    /** Element whose handler is currently running (undefined at the target). */
+    currentTarget?: number;
+    /** Halt the ancestor walk. A no-op outside dispatch. */
+    stopPropagation?: () => void;
+    /** DOM-compat no-op: the host has no default action to cancel. */
+    preventDefault?: () => void;
+    /** Dispatch bookkeeping — set by stopPropagation, cleared after the walk. */
+    stopped?: boolean;
 }
 
 /**
@@ -343,23 +357,79 @@ export function handleLine(line: string): void {
         max: parsed.max,
         viewport: parsed.viewport,
         content: parsed.content,
+        stopPropagation: function (): void { ev.stopped = true; },
+        preventDefault: function (): void { /* no host default action to cancel */ },
     };
-    // Element-scoped handler first ((target,kind) key), then global. The
-    // callable is bound to a local before the call: scriptc refuses to CALL
-    // through a property access (`entry.fn(ev)`), but a local holding the
-    // same value is fine — and it may carry the zero-param handler arm too.
-    if (ev.target !== undefined) {
-        const fn = eventFns.get(numKey(ev.target, ev.kind));
+    dispatchEvent(ev);
+}
+
+/**
+ * Dispatch one event to its target and — for bubbling kinds — up the
+ * ancestor chain. Element handlers are keyed `(target, kind)`; the global
+ * `onHostEvent` listener runs once per event, after the walk, untouched by
+ * `stopPropagation` (it is diagnostics, not delegation).
+ *
+ * Each hop re-points `currentTarget` before calling, so a delegated handler
+ * reads the ancestor it is registered on — the DOM contract. The walk uses
+ * the frontend's own parent registry (`childRegistry`), i.e. the *mount*
+ * tree, which is what a DOM event would bubble through.
+ */
+function dispatchEvent(ev: HostEvent): void {
+    // Field-based stop flag (scriptc: no WeakSet of events, and `stopped`
+    // must be per-event, not per-walk — nested dispatch cannot occur since
+    // the host feeds one line at a time, but the field costs nothing).
+    // The target ALWAYS runs (its own handler is the primary contract);
+    // `bubbles` only decides whether the walk continues past it.
+    let walk: number | undefined = ev.target;
+    while (walk !== undefined) {
+        const fn = eventFns.get(numKey(walk, ev.kind));
         if (fn !== undefined && fn.fn !== null) {
-            const f1 = fn.fn;
-            f1(ev);
+            ev.currentTarget = walk;
+            const f = fn.fn;
+            f(ev);
+            if (ev.stopped === true) return finishEvent(ev);
         }
+        if (!bubbles(ev.kind)) break; // target-only kind: one hop
+        walk = parentOf(walk);
     }
+    // Global listener (once, regardless of bubbling — it is diagnostics,
+    // not delegation).
     const g = lineHandlers.get("event");
     if (g !== undefined && g.fn !== null) {
         const f2 = g.fn;
         f2(ev);
     }
+    finishEvent(ev);
+}
+
+/** Control fields back to their resting state; the event escapes to callers. */
+function finishEvent(ev: HostEvent): void {
+    ev.currentTarget = undefined;
+    ev.stopped = false;
+}
+
+function bubbles(kind: string): boolean {
+    for (let i = 0; i < BUBBLING_KINDS.length; i++) {
+        if (BUBBLING_KINDS[i] === kind) return true;
+    }
+    return false;
+}
+
+/** The mount-tree parent of an element (the registry appendChild keeps). */
+function parentOf(id: number): number | undefined {
+    // Reverse edge in childRegistry: tiny trees make a scan fine; a real
+    // parent map would double the bookkeeping append/remove must maintain.
+    let found: number | undefined = undefined;
+    childRegistry.forEach(function (kids: number[], parent: number): void {
+        if (found !== undefined) return;
+        for (let i = 0; i < kids.length; i++) {
+            if (kids[i] === id) {
+                found = parent;
+                return;
+            }
+        }
+    });
+    return found;
 }
 
 /** Inbound line envelope: t is "event" (handled), "now" (host clock) or other. */
@@ -374,6 +444,15 @@ interface LineMsg {
     content?: number;
     ms?: number;
 }
+
+/**
+ * Kinds that bubble to ancestors. `click` is a *user interaction* and follows
+ * DOM semantics: a handler on any ancestor sees it unless someone calls
+ * `ev.stopPropagation()`. The rest are control *state* (a field was edited,
+ * a scroller moved, focus landed) — they belong to exactly one element and
+ * stay target-only, like DOM `input`/`scroll` don't bubble.
+ */
+const BUBBLING_KINDS: string[] = ["click"];
 
 /** Element-scoped event registry — same class workaround as lineHandlers. */
 class EventEntry {
@@ -903,7 +982,11 @@ export function setRootStyle(style: Style): void {
     setStyle({ id: 0 }, style);
 }
 
-/** Register a callback for host->frontend UI events. */
+/**
+ * Register a callback for host->frontend UI events. Runs once per event,
+ * after the element (and, for `click`, ancestor) handlers — regardless of
+ * `stopPropagation`. Diagnostics hook, not a delegation mechanism.
+ */
 export function onHostEvent(fn: (kind: string) => void): void {
     setLineHandler("event", function (msg: HostEvent): void {
         fn(msg.kind);

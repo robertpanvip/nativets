@@ -646,7 +646,15 @@ impl HostView {
                 });
         }
         if wants(node, "click") {
-            s = s.on_click(cx.listener(move |this, _ev: &ClickEvent, _window, _cx| {
+            s = s.on_click(cx.listener(move |this, _ev: &ClickEvent, _window, cx| {
+                // Exactly one protocol event per physical click: GPUI bubbles
+                // clicks host-side (nested clickable divs each fire, child
+                // first), but the protocol delivers events to a PRECISE
+                // target — bubbling is the frontend runtime's job
+                // (io.ts dispatchEvent walks the mount tree). Without this
+                // stop, an inner hit produces one event per ancestor that
+                // declared onClick.
+                cx.stop_propagation();
                 // C3 latency: epoch ms aligned with the frontend's Date.now()
                 log!("[host] click id={id} t={}", now_ms());
                 this.send_event(id, "click", None);

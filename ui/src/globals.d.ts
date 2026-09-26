@@ -243,9 +243,14 @@ declare namespace JSX {
      * an event to the host (`setEvents`), which then sends it back with a
      * payload (see `HostEvent`). `onFocus`/`onBlur` are field-only; `onScroll`
      * needs an `overflow: "scroll"` node.
+     *
+     * Delegation: `click` bubbles like the DOM — an ancestor's `onClick` fires
+     * after the target's, with `ev.currentTarget` pointed at the ancestor;
+     * `ev.stopPropagation()` halts the walk. The other kinds stay on target.
      */
     interface IntrinsicProps {
         style?: Style;
+        /** Bubbles to ancestors (DOM click semantics; stopPropagation honored). */
         onClick?: (ev: HostEvent) => void;
         /** Text field edited; `ev.value` is the new text. */
         onInput?: (ev: HostEvent) => void;
