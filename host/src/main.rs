@@ -58,8 +58,8 @@ use gpui::{
     canvas, deferred, div, fill, point, prelude::*, px, relative, rgb, rgba, size, AnyElement, App,
     BorderStyle, Bounds, ClickEvent, Context, Corners, Edges, ElementId, Entity, Focusable,
     FocusHandle, Font, FontWeight, InteractiveElement, ParentElement, PathBuilder,
-    Render, ScrollHandle, SharedString, StatefulInteractiveElement, Styled, TextAlign, TextRun,
-    Window, WindowBounds, WindowOptions, TitlebarOptions,
+    Render, ScrollHandle, ScrollWheelEvent, SharedString, StatefulInteractiveElement, Styled,
+    TextAlign, TextRun, Window, WindowBounds, WindowOptions, TitlebarOptions,
 };
 use chrono::NaiveDate;
 use gpui_base::Date as GpuiDate;
@@ -600,7 +600,50 @@ impl HostView {
                 .track_scroll(&handle)
                 .overflow_y_scroll()
                 .h_full()
-                .min_h(px(0.0));
+                .min_h(px(0.0))
+                // Scroll chaining: gpui's built-in wheel handling never stops
+                // propagation, so with nested scrollers BOTH scroll on one
+                // wheel tick. This guard restores the CSS rule: the scroller
+                // under the cursor consumes the event while it can still move
+                // in the wheeled direction, and only lets it chain to the
+                // ancestor once it is AT (or past) its edge.
+                //
+                // Ordering (why the check reads the post-wheel offset): within
+                // one element the guard (`on_scroll_wheel`) registers before
+                // the built-in `paint_scroll_listener`, and the bubble phase
+                // dispatches in REVERSE registration order — so the built-in
+                // handler applies the delta FIRST and this guard runs AFTER
+                // it. `offset` is therefore the post-tick position, which is
+                // exactly what we want: a down-tick from exactly the top must
+                // move the inner scroller (post-offset now inside the range →
+                // stop), while an up-tick already at the top produced no real
+                // movement (post-offset still at/past the edge → chain).
+                .on_scroll_wheel({
+                    let wheel_handle = handle.clone();
+                    move |ev: &ScrollWheelEvent, window, cx| {
+                        let dy = ev.delta.pixel_delta(window.line_height()).y;
+                        if dy == px(0.0) {
+                            return; // horizontal-only tick: nothing to claim
+                        }
+                        let max = wheel_handle.max_offset().y;
+                        if max <= px(0.0) {
+                            return; // nothing to scroll — chain freely
+                        }
+                        let offset = wheel_handle.offset().y; // post-tick, ≤ 0
+                        // offset.y: 0 == top, -max == bottom. dy < 0 scrolls
+                        // toward the bottom, dy > 0 toward the top (gpui adds
+                        // the delta straight onto the offset cell, unclamped
+                        // until the next layout — so past-edge offsets like
+                        // -614 with max=338 are normal between events).
+                        let at_top = offset >= px(0.0);
+                        let at_bottom = offset <= -max;
+                        let can_move = (dy < px(0.0) && !at_bottom)
+                            || (dy > px(0.0) && !at_top);
+                        if can_move {
+                            cx.stop_propagation();
+                        }
+                    }
+                });
         }
         if wants(node, "click") {
             s = s.on_click(cx.listener(move |this, _ev: &ClickEvent, _window, _cx| {

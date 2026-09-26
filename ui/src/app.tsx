@@ -110,6 +110,11 @@ const [scrollPct, setScrollPct] = createSignal(0);
 const [scrollTop, setScrollTop] = createSignal(0);
 const [scrollContent, setScrollContent] = createSignal(0);
 const [scrollEvents, setScrollEvents] = createSignal(0);
+/** Outer scroller movements — set by the host's `scroll` event on the main
+ * ScrollArea. A nested-scroll regression counter: wheeling an INNER scroller
+ * must never bump this (that is scroll-chaining, the bug we fixed in the
+ * host), while wheeling the outer itself must. */
+const [outerScrolls, setOuterScrolls] = createSignal(0);
 
 // --- canvas state ---
 
@@ -778,6 +783,7 @@ function MainPanel(_props: Props): El {
                 to be worth a scrollbar. */}
             <ScrollArea
                 grow
+                onScroll={() => setOuterScrolls(outerScrolls() + 1)}
                 style={{
                     gap: 14,
                     padding: 0,
@@ -816,6 +822,7 @@ function Footer(_props: Props): El {
         >
             {text(() => "frontend: " + mode + " · protocol 1", { fontSize: 12, color: C.textMuted })}
             {text(() => "navigation: " + nav(), { fontSize: 12, color: C.textSecondary })}
+            {text(() => "outer scroll " + outerScrolls() + "×", { fontSize: 12, color: C.textMuted })}
         </div>
     );
 }
