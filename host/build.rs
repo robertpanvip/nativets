@@ -47,15 +47,16 @@ fn main() {
         }
     }
 
-    // QuickJS-embedded mode: link the rquickjs engine instead of Perry's
-    // staticlib. No perry archives needed. Set QUICKJS_EMBED=1 to force it.
+    // QuickJS-embedded mode: link the rquickjs engine. This NO LONGER excludes
+    // the other backends — quickjs / perry (embedded) / scriptc are all linked
+    // into ONE binary and selected at RUNTIME via GPUI_TS_BACKEND
+    // (default: quickjs). No early return: the perry/scriptc wiring below
+    // still runs.
     if std::env::var("QUICKJS_EMBED").is_ok() {
         println!("cargo:rustc-cfg=quickjs");
         println!("cargo:rustc-cfg=has_embedded_frontend");
         println!("cargo:rerun-if-env-changed=QUICKJS_EMBED");
-        // The TS→JS bundle is compiled in via `include_str!` in quickjs.rs, so
-        // no extra env wiring is needed here for a self-contained exe.
-        return;
+        // fall through — perry / scriptc linking continues below
     }
 
     let build_dir = PathBuf::from("../build");
@@ -134,10 +135,18 @@ fn main() {
                 }
             }
         }
-        let runtime_lib =
-            runtime_lib.unwrap_or_else(|| fallback_lib_dir.join("perry_runtime.lib"));
-        let stdlib_lib =
-            stdlib_lib.unwrap_or_else(|| fallback_lib_dir.join("perry_stdlib.lib"));
+        let runtime_lib = std::env::var("PERRY_RUNTIME_LIB")
+            .ok()
+            .map(PathBuf::from)
+            .filter(|p| p.exists())
+            .or_else(|| runtime_lib.clone())
+            .unwrap_or_else(|| fallback_lib_dir.join("perry_runtime.lib"));
+        let stdlib_lib = std::env::var("PERRY_STDLIB_LIB")
+            .ok()
+            .map(PathBuf::from)
+            .filter(|p| p.exists())
+            .or_else(|| stdlib_lib.clone())
+            .unwrap_or_else(|| fallback_lib_dir.join("perry_stdlib.lib"));
         if !runtime_lib.exists() || !stdlib_lib.exists() {
             println!(
                 "cargo:warning=perry runtime/stdlib archives missing ({} / {}) — falling back to child-process mode",
@@ -185,6 +194,8 @@ fn main() {
     println!("cargo:rerun-if-changed={}", manifest.display());
     println!("cargo:rerun-if-env-changed=PERRY_NO_EMBED");
     println!("cargo:rerun-if-env-changed=PERRY_STATIC_LIB_BASE");
+    println!("cargo:rerun-if-env-changed=PERRY_RUNTIME_LIB");
+    println!("cargo:rerun-if-env-changed=PERRY_STDLIB_LIB");
 }
 
 /// 轻量解析 link_archives 数组（避免给 build.rs 引入 serde 依赖）：

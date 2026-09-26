@@ -454,6 +454,12 @@ fn positional_arg() -> Option<String> {
     std::env::args().skip(1).next()
 }
 
+/// `GPUI_TS_BACKEND` — runtime backend selection. All three engines may be
+/// linked into one binary; this picks the one that boots. Default: quickjs.
+fn backend_env() -> Option<String> {
+    std::env::var("GPUI_TS_BACKEND").ok().map(|s| s.to_ascii_lowercase())
+}
+
 fn resolve_frontend() -> Frontend {
     if let Some(arg) = positional_arg() {
         if arg == "scriptc" {
@@ -467,38 +473,49 @@ fn resolve_frontend() -> Frontend {
                 std::process::exit(2);
             }
         }
+        if arg == "perry" {
+            #[cfg(embedded)]
+            {
+                return Frontend::Embedded;
+            }
+            #[cfg(not(embedded))]
+            {
+                log!("[host] perry backend not compiled in (PERRY_NO_EMBED set / archives missing at build time)");
+                std::process::exit(2);
+            }
+        }
         if arg.ends_with(".js") {
             return Frontend::Child { cmd: "node".to_string(), args: vec![arg] };
         }
         return Frontend::Child { cmd: arg, args: vec![] };
     }
-    // Explicit selection only: GPUI_TS_BACKEND=scriptc. QuickJS stays the
-    // default even when a scriptc artifact ships next to the exe — a stale one
-    // must not silently hijack the primary backend.
-    #[cfg(scriptc)]
-    {
-        if std::env::var("GPUI_TS_BACKEND").as_deref() == Ok("scriptc") {
-            // Static build (scriptc_static): the engine is linked into this
-            // binary — nothing to resolve.
-            #[cfg(scriptc_static)]
+    // Explicit selection only: GPUI_TS_BACKEND=perry|scriptc. QuickJS stays
+    // the default even when other engines ship in the same binary — a stale
+    // artifact must not silently hijack the primary backend.
+    match backend_env().as_deref() {
+        Some("scriptc") => {
+            #[cfg(scriptc)]
             {
                 return Frontend::Scriptc;
             }
-            // Legacy DLL build (scriptc_dll): the shared library must exist.
-            #[cfg(scriptc_dll)]
+            #[cfg(not(scriptc))]
             {
-                let exe_dir = std::env::current_exe()
-                    .ok()
-                    .and_then(|p| p.parent().map(|d| d.to_path_buf()));
-                let dll_next_to_exe =
-                    exe_dir.map(|d| d.join("scriptc_fe.dll")).is_some_and(|p| p.exists());
-                if dll_next_to_exe || std::path::Path::new("build/scriptc_fe.dll").exists() {
-                    return Frontend::Scriptc;
-                }
-                log!("[host] GPUI_TS_BACKEND=scriptc but scriptc_fe.dll not found next to exe or in ./build");
+                log!("[host] GPUI_TS_BACKEND=scriptc but scriptc backend not compiled in");
                 std::process::exit(2);
             }
         }
+        Some("perry") => {
+            #[cfg(embedded)]
+            {
+                return Frontend::Embedded;
+            }
+            #[cfg(not(embedded))]
+            {
+                log!("[host] GPUI_TS_BACKEND=perry but perry backend not compiled in");
+                std::process::exit(2);
+            }
+        }
+        Some("quickjs") | None | Some(_) => {}
     }
     #[cfg(quickjs)]
     {

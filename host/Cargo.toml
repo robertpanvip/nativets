@@ -39,3 +39,16 @@ cc = "1"
 
 [profile.dev]
 opt-level = 1
+
+# Smallest-exe release profile ("tree-shaken" Rust): fat LTO with one codegen
+# unit lets LLVM drop every gpui/gpui-component/rquickjs item the bridge never
+# reaches (GPUI is a huge monorepo lib; the retained-tree host uses a small
+# slice of it). panic=abort removes the unwinder; strip removes symbols and
+# debuginfo from the final PE.
+[profile.release]
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+overflow-checks = false
