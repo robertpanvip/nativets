@@ -71,7 +71,7 @@ if (!out) {
 }
 const buildDir = path.join(root, "build");
 const uiDir = path.join(root, "ui");
-const HOST_EXE = path.join(root, "host", "target", "release", "gpui-perryts-host.exe");
+const HOST_EXE = path.join(root, "host", "target", "release", "nativets-host.exe");
 
 /** 路径转成 node_modules/.bin 下可直接 spawn 的形式 */
 function run(cmd, cmdArgs, opts = {}) {

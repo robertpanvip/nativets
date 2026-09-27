@@ -36,7 +36,7 @@ import time
 from collections import Counter
 from ctypes import wintypes
 
-TITLE = "PerryTS × GPUI"
+TITLE = "nativets × GPUI"
 EXE = r"E:\AI-workspace\gpui-perryts\host\target\release\gpui-perryts-host.exe"
 LOG = r"E:\AI-workspace\gpui-perryts\build\ns5.log"
 MOUSEEVENTF_WHEEL = 0x0800

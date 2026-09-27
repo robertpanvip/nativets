@@ -191,7 +191,7 @@ node --test "host/test/*.test.mjs"          # BOM 语义（35 例，需 glob 不
 ```
 
 前端解析顺序：内嵌 QuickJS（默认）→ `build/perry-app.exe`（Perry 原生）→
-`ui/dist/main.js`（node-dev）。也可显式指定：`gpui-perryts-host.exe ui/dist/main.js`。
+`ui/dist/main.js`（node-dev）。也可显式指定：`nativets-host.exe ui/dist/main.js`。
 
 后端由 `host/build.rs` 决定：设 `QUICKJS_EMBED=1` 走内嵌 QuickJS（不链 perry 库）；
 否则按 `PERRY_STATIC_LIB_BASE` 解析 app archive（`scripts/gpui-ts.mjs --backend perry`
@@ -203,27 +203,27 @@ node --test "host/test/*.test.mjs"          # BOM 语义（35 例，需 glob 不
 > 源码（`/FORCE:MULTIPLE` 把错误完全吞掉）。`scripts/gpui-ts.mjs` 现在会在链接后
 > 校验 exe 里含当前前端的字符串，见 `docs/gpui-ts-plan.md` 坑 #7。
 
-## 发布为 npm 库：`gpui-ts`
+## 发布为 npm 库：`nativets`
 
 仓库里的 host/前端能自举之后，它可以被打成一个**给别人用的 npm 包**：
 使用者只要有 Node ≥ 18，**不需要 Rust、不需要 MSVC、不需要本仓库**。
 
 ```bash
-npm i gpui-ts
-npx gpui-ts build src/app.tsx -o myapp.exe     # 11.5 MB，单文件自包含
-npx gpui-ts run   src/app.tsx                  # 打包到临时文件并直接运行
-npx gpui-ts doctor                             # 报告本机这套安装能不能用
+npm i nativets
+npx nativets build src/app.tsx -o myapp.exe   # 单文件自包含
+npx nativets run   src/app.tsx                # 打包到临时文件并直接运行
+npx nativets doctor                           # 报告本机这套安装能不能用
 ```
 
-包内容（`packages/gpui-ts/`，11 个文件 / 压缩后 4.8 MB）：
+包内容（`packages/gpui-ts/`）：
 
 | 目录 | 内容 |
 | --- | --- |
 | `bin/gpui-ts.mjs` | CLI：`build` / `run` / `doctor` |
 | `lib/build.mjs` | 打包核心（esbuild 选项、`TAIL_MARKER`、`packExe`） |
-| `runtime/index.js` | 运行时 + 组件库 + canvas2d + theme 的 ESM 打包（20 KB） |
-| `types/*.d.ts` | 5 个声明文件，编辑器补全/跳转/签名提示 |
-| `vendor/win32-x64/` | 预编译宿主二进制（11.5 MB） |
+| `runtime/index.js` | 运行时 + 组件库 + canvas2d + theme 的 ESM 打包 |
+| `types/*.d.ts` | 声明文件，编辑器补全/跳转/签名提示 |
+| `vendor/win32-x64/` | 预编译宿主二进制 `nativets-host.exe`（20 MB，三后端） |
 
 ### 为什么用户不用装编译环境
 

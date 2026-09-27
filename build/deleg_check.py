@@ -19,7 +19,7 @@ import sys
 import time
 from ctypes import wintypes
 
-TITLE = "PerryTS × GPUI"
+TITLE = "nativets × GPUI"
 EXE = r"E:\AI-workspace\gpui-perryts\host\target\release\gpui-perryts-host.exe"
 LOG = r"E:\AI-workspace\gpui-perryts\build\deleg.log"
 SHOT = r"E:\AI-workspace\gpui-perryts\build\deleg-shot.png"

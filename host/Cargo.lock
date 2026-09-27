@@ -2222,24 +2222,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "gpui-perryts-host"
-version = "0.1.0"
-dependencies = [
- "async-channel",
- "cc",
- "chrono",
- "getrandom 0.2.17",
- "gpui-base",
- "gpui-component",
- "gpui-kit-assets",
- "gpui-pre",
- "gpui-pre-platform",
- "rquickjs",
- "serde",
- "serde_json",
-]
-
-[[package]]
 name = "gpui-pre"
 version = "0.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3873,6 +3855,24 @@ dependencies = [
  "spirv",
  "thiserror 2.0.20",
  "unicode-ident",
+]
+
+[[package]]
+name = "nativets-host"
+version = "0.1.0"
+dependencies = [
+ "async-channel",
+ "cc",
+ "chrono",
+ "getrandom 0.2.17",
+ "gpui-base",
+ "gpui-component",
+ "gpui-kit-assets",
+ "gpui-pre",
+ "gpui-pre-platform",
+ "rquickjs",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

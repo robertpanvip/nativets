@@ -39,8 +39,8 @@ export function Header(_props: Props): El {
                     P
                 </div>
                 <div style={{ flexDirection: "column", gap: 2 }}>
-                    {text("PerryTS × GPUI", { fontSize: 17, fontWeight: "bold", color: C.textPrimary })}
-                    {text("TypeScript 前端 · Perry 原生编译 · GPUI GPU 渲染", {
+                    {text("nativets × GPUI", { fontSize: 17, fontWeight: "bold", color: C.textPrimary })}
+                    {text("TypeScript 前端 · 原生编译 · GPUI GPU 渲染", {
                         fontSize: 12,
                         color: C.textSecondary,
                     })}

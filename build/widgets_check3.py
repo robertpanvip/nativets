@@ -25,7 +25,7 @@ import sys
 import time
 from ctypes import wintypes
 
-TITLE = "PerryTS × GPUI"
+TITLE = "nativets × GPUI"
 EXE = r"E:\AI-workspace\gpui-perryts\host\target\release\gpui-perryts-host.exe"
 LOG = r"E:\AI-workspace\gpui-perryts\build\widgets3.log"
 SHOT1 = r"E:\AI-workspace\gpui-perryts\build\wg3-before.png"

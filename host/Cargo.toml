@@ -1,8 +1,8 @@
 [package]
-name = "gpui-perryts-host"
+name = "nativets-host"
 version = "0.1.0"
 edition = "2024"
-description = "GPUI render host for PerryTS-compiled TypeScript frontends (mutation protocol over stdio)"
+description = "nativets render host — TypeScript frontend, native GPUI rendering (mutation protocol)"
 
 [dependencies]
 gpui-pre = { version = "=0.3.3" }

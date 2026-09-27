@@ -19,7 +19,7 @@ import path from "node:path";
  */
 export const TAIL_MARKER = "\n<<<GPUI_TS_BUNDLE_v1>>>\n";
 
-export const HOST_BASENAME = "gpui-ts-host.exe";
+export const HOST_BASENAME = "nativets-host.exe";
 
 /** esbuild settings shared by `build` and `run`. */
 export const ESBUILD_OPTS = {

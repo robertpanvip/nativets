@@ -778,7 +778,7 @@ fn open_host_window(
     let options = WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(bounds)),
         titlebar: Some(TitlebarOptions {
-            title: Some(SharedString::from("PerryTS × GPUI")),
+            title: Some(SharedString::from("nativets × GPUI")),
             ..Default::default()
         }),
         window_min_size: Some(size(px(MIN_WINDOW_W), px(MIN_WINDOW_H))),
