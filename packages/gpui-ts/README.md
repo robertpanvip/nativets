@@ -1,19 +1,24 @@
-# gpui-ts
+# nativets
 
-用 TypeScript / TSX 写桌面应用，产出一个**原生单文件 exe**。
+**NativeTS 是一门「编译型」的系统级 TypeScript：TypeScript 进去，原生 exe 出来。**
 
-没有 Rust 工具链，没有 MSVC，没有 Electron，没有浏览器内核。装上这个包，
-`npx gpui-ts build src/app.tsx` 就够了。
+用 TypeScript / TSX 写桌面应用，产出一个**原生单文件 exe**。像 Go 一样的开发
+体验：`nativets dev` 写代码、`nativets build` 出成品——不需要单独安装
+Node.js 运行时知识以外的任何工具链：没有 Rust、没有 MSVC、没有 Electron、
+没有浏览器内核。
 
 ```bash
-npm i gpui-ts
-npx gpui-ts build src/app.tsx -o myapp.exe
-./myapp.exe
+npm install -g nativets
+
+nativets dev   src/app.tsx     # 监视文件 → 自动重编译 → 重启应用窗口
+nativets build src/app.tsx     # 产出自包含的单文件 exe
 ```
 
-- **不需要编译环境** — 宿主二进制随包预编译发布（`vendor/win32-x64/`），
-  用户的机器上只要有 Node ≥ 18 即可。
-- **单文件产物** — 大约 11.5 MB，一个 exe，拷到任何目录双击就能跑。
+- **npm 包即工具链** — 编译、打包、宿主运行时全部随包分发，用户不需要
+  安装 TypeScript compiler、C/C++/Rust 工具链或其他任何 Native 编译环境。
+- **两种核心模式** — `dev`（保存即重建重启的开发循环）与 `build`
+  （产物就是一个可分发的 exe）。
+- **单文件产物** — 约 18.5 MB，一个 exe，拷到任何目录双击就能跑。
   不需要 `node_modules`，不需要一起拷别的文件。
 - **原生窗口** — 由 Rust 侧的 [GPUI](https://gpui.rs) 渲染（GPU 加速，
   无 WebView）；窗口是真的系统窗口，任务栏、DPI、缩放都正常。
@@ -30,7 +35,7 @@ CSS 引擎**——所以样式是一个受支持的子集，见下文「样式�
 `src/app.tsx`：
 
 ```tsx
-import { createRoot, h, createSignal, text } from "gpui-ts";
+import { createRoot, h, createSignal, text } from "nativets";
 
 function App() {
     const [n, setN] = createSignal(0);
@@ -50,9 +55,10 @@ createRoot({ title: "My App" }, App);
 ```
 
 ```bash
-npx gpui-ts build src/app.tsx -o myapp.exe
-npx gpui-ts run   src/app.tsx      # 编译到临时文件并直接运行
-npx gpui-ts doctor                 # 检查本机这套安装是否可用
+nativets dev   src/app.tsx        # 开发循环：保存 → 重编译 → 重启窗口
+nativets build src/app.tsx -o myapp.exe   # 生产构建：单文件 exe
+nativets run   src/app.tsx        # 编译到临时文件并直接运行（一次性）
+nativets doctor                   # 检查本机这套安装是否可用
 ```
 
 `App` 可以**返回**要显示的 UI（`El`、字符串、数字，或它们的数组），也可以自己
@@ -81,12 +87,16 @@ npx gpui-ts doctor                 # 检查本机这套安装是否可用
 
 | 命令 | 作用 |
 | --- | --- |
-| `gpui-ts build <entry.tsx> [-o <out.exe>]` | 打包成单个自包含 exe，默认输出到 `<entry>.exe` |
-| `gpui-ts run <entry.tsx>` | 先 build 到临时文件，再运行，退出后清理 |
-| `gpui-ts doctor` | 打印 Node 版本、当前平台、宿主二进制路径与体积 |
-| `gpui-ts --help` / `--version` | 用法与版本 |
+| `nativets dev <entry.tsx> [-o <out.exe>]` | 监视入口及其依赖，保存即重编译、重打包并重启应用窗口 |
+| `nativets build <entry.tsx> [-o <out.exe>]` | 打包成单个自包含 exe，默认输出到 `<entry>.exe` |
+| `nativets run <entry.tsx>` | 先 build 到临时文件，再运行，退出后清理 |
+| `nativets doctor` | 打印 Node 版本、当前平台、宿主二进制路径与体积 |
+| `nativets --help` / `--version` | 用法与版本 |
 
-`build` 失败时退出码为 2 并打印原因（入口不存在、当前平台没有预编译宿主、esbuild 缺失等）。
+`dev` 是 Go 式的内部循环：esbuild 的 watch 上下文负责依赖发现与增量编译
+（只报告真正进了 bundle 的文件），每次重编译后把新 bundle 追加到宿主二进制
+并重启应用窗口，Ctrl+C 退出。编译错误不会中断 watch——修好保存的那一刻
+窗口就会回来。
 
 ---
 
@@ -133,7 +143,8 @@ function Card(props: { title: string; children?: any }) {
 ## API
 
 包导出四个模块的内容（`runtime` / `kit` / `canvas2d` / `theme`），
-`import { … } from "gpui-ts"` 一律可用。
+`import { … } from "nativets"` 一律可用（从任意目录解析到包内自带的运行时，
+不依赖 node_modules 查找）。
 
 ### runtime
 
@@ -258,7 +269,7 @@ exe，只是顺便带着一段脚本。宿主启动时按标记（`<<<GPUI_TS_BU
 
 ## 当前限制
 
-- **平台**：目前只发布 `win32-x64` 的宿主。其他平台 `gpui-ts doctor` 会告诉你
+- **平台**：目前只发布 `win32-x64` 的宿主。其他平台 `nativets doctor` 会告诉你
   缺什么；从源码构建宿主后放进 `vendor/<platform>-<arch>/` 即可。
 - **JS 子集**：应用代码最终由 QuickJS 执行，不要依赖 V8 特有的东西。
   `async` / `await` 可用；Node 内置模块（`fs`、`path` 等）**不可用**——
@@ -266,7 +277,9 @@ exe，只是顺便带着一段脚本。宿主启动时按标记（`<<<GPUI_TS_BU
   `exit`，以及 `setTimeout` 等定时器）。
 - **没有 DOM / CSS 引擎**：见上文样式子集与已知偏离。
 - **没有 devtools**：调试靠 `process.stdout.write` 和宿主日志
-  （设 `PERRY_UI_TRACE=1` 可看到事件与指令的时间线）。
+  （设 `PERRY_UI_TRACE=1` 可看到事件与指令的时间线）。DevTools 协议接入在
+  规划中——届时 `nativets dev` 将支持 Chrome DevTools 调试、断点与源码级
+  堆栈定位。
 
 ## License
 

@@ -51,19 +51,69 @@ export async function bundleApp(esbuild, entry, outfile) {
 }
 
 /**
+ * esbuild plugin mapping `import … from "nativets"` onto the package's own
+ * bundled runtime, so an app entry works the same from any directory — no
+ * node_modules walk, no self-referential package resolution (which only works
+ * when Node finds package.json by walking *up from the importing file*).
+ *
+ * `build`/`run`/`dev` all go through this; deep imports (`nativets/…`) are not
+ * a thing — the public surface is the single root export.
+ */
+export function nativetsRuntimePlugin(packageRoot) {
+    const runtime = path.join(packageRoot, "runtime", "index.js");
+    return {
+        name: "nativets-runtime",
+        setup(build) {
+            build.onResolve({ filter: /^nativets$/ }, () => ({ path: runtime }));
+        },
+    };
+}
+
+/**
  * Copy `host` to `out` and append the bundle.
  *
  * Refuses a bundle that already contains the marker: the host reads from the
  * **last** marker, so a stray one inside the JS would make it split the file at
  * the wrong place and then fail with a confusing parse error.
  */
-export function packExe(host, js, out) {
+export function packExe(host, js, out, { fallbackDir = null, fallbackTag = "run" } = {}) {
     if (js.includes(TAIL_MARKER)) {
         throw new Error(
             "the bundle contains the tail marker; the host would split the file at the wrong offset",
         );
     }
     fs.mkdirSync(path.dirname(out), { recursive: true });
-    fs.copyFileSync(host, out);
-    fs.appendFileSync(out, Buffer.from(TAIL_MARKER + js, "utf8"));
+    // Write to a sibling temp file, then try to rename it over the target.
+    // The rename is atomic, so a partially-written exe is never observed.
+    //
+    // If the target is locked (Windows keeps a running image locked — `dev`
+    // replaces the exe while the previous app window may still be closing),
+    // fall back to `<fallbackDir>/<base>.<tag>.<seq>.exe` where `seq` advances
+    // until the name is free, so two generations never collide. The caller
+    // spawns whatever path this function returned.
+    const tmpOut = out + ".tmp-" + process.pid + "-" + fallbackTag;
+    try {
+        fs.copyFileSync(host, tmpOut);
+        fs.appendFileSync(tmpOut, Buffer.from(TAIL_MARKER + js, "utf8"));
+        try {
+            fs.renameSync(tmpOut, out);
+            return out;
+        } catch (e) {
+            const dir = fallbackDir === null ? path.dirname(out) : fallbackDir;
+            fs.mkdirSync(dir, { recursive: true });
+            const base = path.basename(out, ".exe");
+            for (let seq = 1; ; seq++) {
+                const candidate = path.join(dir, `${base}.${fallbackTag}.${seq}.exe`);
+                try {
+                    fs.renameSync(tmpOut, candidate);
+                    return candidate;
+                } catch (err) {
+                    if (seq > 64) throw err; // something is deeply wrong
+                    // name taken (a previous generation is still running) — try next
+                }
+            }
+        }
+    } finally {
+        fs.rmSync(tmpOut, { force: true });
+    }
 }

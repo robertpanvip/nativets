@@ -1,7 +1,7 @@
 {
   "name": "nativets",
   "version": "0.1.0",
-  "description": "Write a desktop app in TypeScript/TSX and get one self-contained native executable — no Rust toolchain, no Electron, no browser engine.",
+  "description": "NativeTS — a compiled-TypeScript toolchain with a Go-like dev experience: nativets dev for the edit-rebuild-restart loop, nativets build for a self-contained native executable. No Rust/MSVC/Electron.",
   "keywords": [
     "gpui",
     "typescript",

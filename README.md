@@ -1,4 +1,18 @@
-# gpui-perryts
+# nativets（内部名 gpui-perryts）
+
+> **NativeTS is a native TypeScript toolchain that treats TypeScript as a compiled
+> programming language rather than a JavaScript runtime language.**
+>
+> 用户只需要通过 npm 安装 NativeTS 工具链，即可使用类似 Go 的开发体验：
+>
+> ```bash
+> npm install -g nativets
+> nativets dev     # 监视 → 重编译 → 重启应用窗口（Go run 式的内部循环）
+> nativets build   # 产出自包含的原生单文件 exe
+> ```
+>
+> NativeTS 负责编译、打包、宿主运行时与原生可执行文件生成。用户不需要单独
+> 安装 TypeScript compiler、C/C++/Rust 工具链或任何其他 Native 编译环境。
 
 用 **TypeScript（Solid 风格响应式）写界面，GPUI（Zed 同款 GPU 框架）做原生渲染** 的桌面端开发栈。
 
@@ -10,7 +24,9 @@ TypeScript/TSX 风格前端 ──esbuild──▶ 单个 IIFE JS ──内嵌�
 ```
 
 > 运行时层可插拔：**默认内嵌 QuickJS**（`rquickjs`，自拥 10ms 事件循环）；
-> 历史 Perry 后端保留为对照模式（`--backend perry`）。协议与前端源码两者完全一致。
+> 同一个 exe 还链入了 perry（AOT 静态库）与 scriptc（AOT）两个后端，
+> `GPUI_TS_BACKEND=quickjs|perry|scriptc` 运行时选择（默认 quickjs）。
+> 协议与前端源码两者完全一致。npm 包见 `packages/gpui-ts/`（[`nativets`](packages/gpui-ts/README.md)）。
 
 ## 方案评估（为什么是这套架构）
 
