@@ -330,6 +330,17 @@ export function sendHello(title: string): void {
     flush();
 }
 
+/**
+ * Frontend → host diagnostics line. Unlike `console.*` — whose sink differs
+ * per backend (QuickJS tees it to the host log; perry's Node-style console
+ * writes STDOUT, i.e. the ops pipe, where the host silently drops non-JSON
+ * lines) — this rides the protocol itself, so E2E assertions see the same
+ * line on every backend. The host logs it as `[frontend] <msg>`.
+ */
+export function hostLog(msg: string): void {
+    writeLine(JSON.stringify({ t: "log", msg: msg }));
+}
+
 function writeLine(line: string): void {
     if (sink !== null) {
         sink(line);

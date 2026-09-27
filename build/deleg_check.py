@@ -143,13 +143,25 @@ def main():
         # Click in WINDOW-rect coordinates to match the screenshot frame.
         click(hwnd, wx + 600, wy + bubble_y)
         mid = log_text()
-        cb = count(r"冒泡行子块点击", mid) - count(r"冒泡行子块点击", base)
-        pb = count(r"父级收到", mid) - count(r"父级收到", base)
+        # The frontend handler logs via the protocol {"t":"log"} channel →
+        # the host prints "[frontend] [deleg] …". (console.info is NOT a
+        # reliable carrier: perry's Node-style console writes stdout, which
+        # IS the ops pipe in embedded mode, and non-JSON lines are dropped.)
+        cb = count(r"\[frontend\] \[deleg\] .*冒泡行子块点击", mid) - count(
+            r"\[frontend\] \[deleg\] .*冒泡行子块点击", base
+        )
+        pb = count(r"\[frontend\] \[deleg\] .*父级收到", mid) - count(
+            r"\[frontend\] \[deleg\] .*父级收到", base
+        )
 
         click(hwnd, wx + 600, wy + stop_y)
         end = log_text()
-        cs = count(r"拦截行子块点击", end) - count(r"拦截行子块点击", mid)
-        ps = count(r"父级收到", end) - count(r"父级收到", mid)
+        cs = count(r"\[frontend\] \[deleg\] .*拦截行子块点击", end) - count(
+            r"\[frontend\] \[deleg\] .*拦截行子块点击", mid
+        )
+        ps = count(r"\[frontend\] \[deleg\] .*父级收到", end) - count(
+            r"\[frontend\] \[deleg\] .*父级收到", mid
+        )
 
         print(f"bubble row: child={cb} parent={pb} (want 1 / 1)")
         print(f"stop row:   child={cs} parent={ps} (want 1 / 0)")

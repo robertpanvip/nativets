@@ -3,7 +3,7 @@
  * shared signals through the kit wrappers.
  */
 
-import { h, text } from "../io";
+import { h, text, hostLog } from "../io";
 import type { El, Props } from "../io";
 import { C } from "../theme";
 import { Card } from "../primitives";
@@ -62,7 +62,7 @@ export function FormCard(_props: Props): El {
                         placeholder="选择日期…"
                         onChange={(v: string) => {
                             setPickedDate(v);
-                            console.log("[app] date picked:", v);
+                            hostLog("[app] date picked: " + v);
                         }}
                     />
                     <div style={{ flexDirection: "row", alignItems: "center", gap: 14 }}>

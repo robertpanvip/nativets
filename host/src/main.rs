@@ -368,6 +368,14 @@ pub(crate) fn ingest_line(line: &str, ops_tx: &async_channel::Sender<Vec<Op>>) {
         Some("hello") => {
             log!("[host] frontend hello: {line}");
         }
+        Some("log") => {
+            // Frontend diagnostics ({"t":"log","msg":…}). console.* is NOT a
+            // reliable carrier here: perry's Node-style console writes stdout
+            // — which IS the ops pipe in embedded mode — and non-JSON lines
+            // are dropped above. The explicit channel lands on every backend.
+            let msg = v.get("msg").and_then(|m| m.as_str()).unwrap_or("");
+            log!("[frontend] {msg}");
+        }
         Some("batch") => {
             if let Some(ops) = v.get("ops").and_then(|o| o.as_array()) {
                 let total = ops.len();

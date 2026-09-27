@@ -3,15 +3,16 @@
  * parent container receives clicks on children that have no own handler.
  */
 
-import { h, text } from "../io";
+import { h, text, hostLog } from "../io";
 import type { El, Props, HostEvent } from "../io";
 import { C } from "../theme";
 import { Card } from "../primitives";
 import { delegLog, setDelegLog } from "../state";
 
 function delegAppend(line: string): void {
-    // console.info 同步一份：宿主日志是 E2E 的断言源（signal 只喂 UI）
-    console.info("[deleg] " + line);
+    // hostLog 走协议 {"t":"log"}：三后端统一落宿主日志（console.info 在
+    // perry embedded 下进 ops 管道被吞，不能做 E2E 断言源）；signal 只喂 UI
+    hostLog("[deleg] " + line);
     // 最新的在上面；限长防爆
     const next = line + "\n" + delegLog();
     setDelegLog(next.length > 400 ? next.slice(0, 400) : next);

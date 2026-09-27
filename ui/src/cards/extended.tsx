@@ -10,7 +10,7 @@
  * `onInput` / `onClick` / `onClose` callbacks receive.
  */
 
-import { h, text, Show } from "../io";
+import { h, text, Show, hostLog } from "../io";
 import type { El, Props } from "../io";
 import { C } from "../theme";
 import { Card, PillBtn } from "../primitives";
@@ -58,7 +58,7 @@ import {
 } from "../state";
 
 function logExt(line: string): void {
-    console.info("[ext] " + line);
+    hostLog("[ext] " + line);
     const next = line + "\n" + extLog();
     setExtLog(next.length > 300 ? next.slice(0, 300) : next);
 }
