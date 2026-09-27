@@ -51,9 +51,13 @@ pub fn save_original_stderr() -> Handle {
 }
 
 // ---------------------------------------------------------------------------
-// Perry C ABI (#1088 staticlib contract) — only linkable in embedded mode
+// Perry C ABI (#1088 staticlib contract) — only linkable when the perry
+// backend feature is on AND build.rs found the archives (`embedded` cfg).
+// A quickjs-only build references no perry symbol, so the linker drops the
+// runtime entirely even though this module's pipe plumbing still compiles
+// (it doubles as the logging-redirect helper).
 // ---------------------------------------------------------------------------
-#[cfg(embedded)]
+#[cfg(all(embedded, feature = "be-perry"))]
 mod perry {
     unsafe extern "C" {
         pub fn perry_module_init();
@@ -76,12 +80,14 @@ mod perry {
         pub fn js_stdlib_process_pending() -> i32;
     }
 }
-#[cfg(embedded)]
+#[cfg(all(embedded, feature = "be-perry"))]
 // Re-exported for the host loop; which of these are actually called depends on
 // the build mode (the QuickJS path doesn't drive Perry's poll loop at all).
 #[allow(unused_imports)]
 pub use perry::{perry_has_work, perry_module_init, perry_next_wake_ms, perry_poll};
-#[cfg(embedded)]
+// Only the perry backend drives the stdlib pump; a quickjs-only build never
+// links the perry staticlib, so this symbol must not be referenced there.
+#[cfg(all(embedded, feature = "be-perry"))]
 pub use perry::js_stdlib_process_pending;
 
 /// Host → Perry event line writer (in pipe write end).
@@ -130,7 +136,7 @@ impl EmbeddedFrontend {
 /// frontend writes to its stderr (PERRY_UI_TRACE diagnostics etc.). Pass the
 /// ORIGINAL stderr handle saved before redirection — makes embedded mode as
 /// observable as child-process mode.
-#[cfg(embedded)]
+#[cfg(all(embedded, feature = "be-perry"))]
 pub fn launch(
     frontend_stderr_tee: RawHandle,
     ops_tx: async_channel::Sender<Vec<crate::Op>>,
@@ -194,5 +200,5 @@ pub fn launch(
 
     unsafe { perry_module_init() };
 
-    (EmbeddedFrontend { stdin: in_w })
+    EmbeddedFrontend { stdin: in_w }
 }

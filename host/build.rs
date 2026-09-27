@@ -39,7 +39,7 @@ fn main() {
     // cargo would not rebuild when the bootstrap JS changes.
     println!("cargo:rerun-if-changed=src/bootstrap.js");
 
-    // ── scriptc backend ───────────────────────────────────────────────────
+    // ── scriptc backend (feature `be-scriptc`) ────────────────────────────
     // Two shapes, chosen by what ui/build-scriptc.mjs left in build/:
     //   * STATIC (preferred): build/scriptc/sc-main.lib.c — the program TU
     //     scriptc emits with profile `emission:"c"`. It is compiled together
@@ -49,32 +49,36 @@ fn main() {
     //     a single self-contained exe (no DLL).
     //   * DLL (legacy fallback): build/scriptc_fe.dll — a mingw-CRT shared
     //     library resolved at runtime with LoadLibraryExA.
+    // Feature-gated: without `be-scriptc` the whole branch is skipped so a
+    // quickjs/perry-only build never compiles the C runtime.
     println!("cargo:rustc-check-cfg=cfg(scriptc_static)");
     println!("cargo:rustc-check-cfg=cfg(scriptc_dll)");
-    println!("cargo:rerun-if-env-changed=GPUI_TS_NO_SCRIPTC");
-    println!("cargo:rerun-if-changed=../build/scriptc");
-    println!("cargo:rerun-if-changed=../build/scriptc_fe.dll");
-    if std::env::var("GPUI_TS_NO_SCRIPTC").is_err() {
-        if std::path::Path::new("../build/scriptc/sc-main.lib.c").exists() {
-            build_scriptc_static();
-            println!("cargo:rustc-cfg=scriptc");
-            println!("cargo:rustc-cfg=scriptc_static");
-        } else if std::path::Path::new("../build/scriptc_fe.dll").exists() {
-            println!("cargo:rustc-cfg=scriptc");
-            println!("cargo:rustc-cfg=scriptc_dll");
+    if cfg!(feature = "be-scriptc") {
+        println!("cargo:rerun-if-env-changed=GPUI_TS_NO_SCRIPTC");
+        println!("cargo:rerun-if-changed=../build/scriptc");
+        println!("cargo:rerun-if-changed=../build/scriptc_fe.dll");
+        if std::env::var("GPUI_TS_NO_SCRIPTC").is_err() {
+            if std::path::Path::new("../build/scriptc/sc-main.lib.c").exists() {
+                build_scriptc_static();
+                println!("cargo:rustc-cfg=scriptc");
+                println!("cargo:rustc-cfg=scriptc_static");
+            } else if std::path::Path::new("../build/scriptc_fe.dll").exists() {
+                println!("cargo:rustc-cfg=scriptc");
+                println!("cargo:rustc-cfg=scriptc_dll");
+            }
         }
+    } else {
+        // still track the dirs so flipping the feature rebuilds correctly
+        println!("cargo:rerun-if-changed=../build/scriptc");
     }
 
-    // QuickJS-embedded mode: link the rquickjs engine. This NO LONGER excludes
-    // the other backends — quickjs / perry (embedded) / scriptc are all linked
-    // into ONE binary and selected at RUNTIME via GPUI_TS_BACKEND
-    // (default: quickjs). No early return: the perry/scriptc wiring below
-    // still runs.
-    if std::env::var("QUICKJS_EMBED").is_ok() {
+    // QuickJS-embedded mode (feature `be-quickjs`): link the rquickjs engine.
+    // Without the feature the whole QuickJS lane (mod quickjs, BOM dialogs)
+    // is compiled out by main.rs.
+    if cfg!(feature = "be-quickjs") && std::env::var("QUICKJS_EMBED").is_ok() {
         println!("cargo:rustc-cfg=quickjs");
         println!("cargo:rustc-cfg=has_embedded_frontend");
         println!("cargo:rerun-if-env-changed=QUICKJS_EMBED");
-        // fall through — perry / scriptc linking continues below
     }
 
     let build_dir = PathBuf::from("../build");
@@ -111,7 +115,10 @@ fn main() {
     let fallback_lib_dir =
         PathBuf::from("../ui/node_modules/@perryts/perry-win32-x64/lib");
 
-    let ok = app_src.exists()
+    // Feature gate first: without `be-perry` no perry archive is linked, no
+    // matter what lies in build/.
+    let ok = cfg!(feature = "be-perry")
+        && app_src.exists()
         && fallback_lib_dir.join("perry_runtime.lib").exists()
         && std::env::var("PERRY_NO_EMBED").is_err();
 

@@ -1,4 +1,4 @@
-// Build the publishable `gpui-ts` package out of this repo's sources.
+// Build the publishable `nativets` package out of this repo's sources.
 //
 //   node scripts/build-package.mjs [--host <path-to-host.exe>]
 //
@@ -11,6 +11,12 @@
 // The runtime is bundled (not published as loose TS) so a user's app resolves a
 // *single instance* of the signal store — two copies of `runtime.ts` would mean
 // two unrelated signal graphs, and state would silently stop propagating.
+//
+// The vendored host is the QUICKJS-ONLY build (`--no-default-features
+// --features be-quickjs`): perry/scriptc are compile-time backends that need a
+// full toolchain anyway (repo checkout + cargo), so shipping their code in the
+// zero-toolchain package would be dead weight. Feature gating (see
+// host/Cargo.toml) cuts the binary ~20 MB → ~10.5 MB.
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";

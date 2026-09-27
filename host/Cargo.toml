@@ -4,6 +4,21 @@ version = "0.1.0"
 edition = "2024"
 description = "nativets render host — TypeScript frontend, native GPUI rendering (mutation protocol)"
 
+# ── backend gating ──────────────────────────────────────────────────────────
+# Each feature links EXACTLY ONE frontend engine; the CLI builds with
+# `--no-default-features --features be-<name>` so the linker can drop every
+# other engine's code (per-backend "tree shaking"). Bare `cargo build` gets
+# default = all three (the historical fat multi-engine binary).
+#
+#   be-quickjs  embed rquickjs; app ships as appended/bundled JS (npm package)
+#   be-scriptc  AOT: TS → C → machine code compiled in by build.rs
+#   be-perry    perry runtime staticlib linked in; app compiled by `perry compile`
+[features]
+default = ["be-quickjs", "be-scriptc", "be-perry"]
+be-quickjs = ["dep:rquickjs"]
+be-scriptc = []
+be-perry = []
+
 [dependencies]
 gpui-pre = { version = "=0.3.3" }
 gpui-pre-platform = { version = "=0.3.3" }
@@ -24,7 +39,7 @@ gpui-base = { path = "../vendor/gpui-kit/crates/base", version = "0.6.1" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 async-channel = "2"
-rquickjs = { version = "0.14.0", features = ["std"] }
+rquickjs = { version = "0.14.0", features = ["std"], optional = true }
 # Date string parsing for the native DatePicker's controlled `setValue`.
 # Already in the graph transitively (via gpui-component), no new download.
 chrono = "0.4"

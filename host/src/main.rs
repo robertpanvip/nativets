@@ -40,7 +40,7 @@ mod render;
 #[cfg_attr(not(quickjs), allow(dead_code))]
 mod bom;
 
-#[cfg(has_embedded_frontend)]
+#[cfg(all(has_embedded_frontend, any(feature = "be-quickjs", feature = "be-perry")))]
 // Compiled in both embedded and quickjs modes; in quickjs mode the Perry
 // poll-loop helpers are simply unused, which is expected (not a defect).
 #[cfg_attr(quickjs, allow(dead_code, unused_imports))]
@@ -107,7 +107,7 @@ use gpui_platform::application;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Write};
-#[cfg(not(any(embedded, quickjs)))]
+#[cfg(not(any(all(embedded, feature = "be-perry"), quickjs)))]
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -121,12 +121,12 @@ use std::sync::{mpsc, Arc, OnceLock};
 static LOG_HANDLE: AtomicUsize = AtomicUsize::new(0);
 
 fn init_logging() {
-    #[cfg(has_embedded_frontend)]
+    #[cfg(all(has_embedded_frontend, any(feature = "be-quickjs", feature = "be-perry")))]
     {
         let h = embedded::save_original_stderr();
         LOG_HANDLE.store(h as usize, Ordering::Relaxed);
     }
-    #[cfg(not(has_embedded_frontend))]
+    #[cfg(not(all(has_embedded_frontend, any(feature = "be-quickjs", feature = "be-perry"))))]
     {
         LOG_HANDLE.store(usize::MAX, Ordering::Relaxed); // plain eprintln fallback
     }
@@ -141,7 +141,7 @@ pub(crate) fn log_line(s: &str) {
         eprintln!("{s}");
         return;
     }
-    #[cfg(has_embedded_frontend)]
+    #[cfg(all(has_embedded_frontend, any(feature = "be-quickjs", feature = "be-perry")))]
     {
         use std::fs::File;
         use std::os::windows::io::FromRawHandle;
@@ -439,7 +439,7 @@ enum Frontend {
     /// cross-mode comparison and non-linked builds.
     Child { cmd: String, args: Vec<String> },
     /// Perry staticlib linked into this process (build.rs cfg).
-    #[cfg(embedded)]
+    #[cfg(all(embedded, feature = "be-perry"))]
     Embedded,
     /// QuickJS engine linked into this process (build.rs cfg=quickjs).
     #[cfg(quickjs)]
@@ -495,13 +495,13 @@ fn resolve_frontend() -> Frontend {
             }
         }
         if arg == "perry" {
-            #[cfg(embedded)]
+            #[cfg(all(embedded, feature = "be-perry"))]
             {
                 return Frontend::Embedded;
             }
-            #[cfg(not(embedded))]
+            #[cfg(not(all(embedded, feature = "be-perry")))]
             {
-                log!("[host] perry backend not compiled in (PERRY_NO_EMBED set / archives missing at build time)");
+                log!("[host] perry backend not compiled in (PERRY_NO_EMBED set / archives missing / built without feature be-perry)");
                 std::process::exit(2);
             }
         }
@@ -529,11 +529,11 @@ fn resolve_frontend() -> Frontend {
             }
         }
         Some("perry") => {
-            #[cfg(embedded)]
+            #[cfg(all(embedded, feature = "be-perry"))]
             {
                 return Frontend::Embedded;
             }
-            #[cfg(not(embedded))]
+            #[cfg(not(all(embedded, feature = "be-perry")))]
             {
                 log!("[host] GPUI_TS_BACKEND=perry but perry backend not compiled in");
                 std::process::exit(2);
@@ -557,11 +557,11 @@ fn resolve_frontend() -> Frontend {
             }
         }
         "perry" => {
-            #[cfg(embedded)]
+            #[cfg(all(embedded, feature = "be-perry"))]
             {
                 return Frontend::Embedded;
             }
-            #[cfg(not(embedded))]
+            #[cfg(not(all(embedded, feature = "be-perry")))]
             {
                 log!("[host] default backend perry not compiled in — falling back");
             }
@@ -572,12 +572,15 @@ fn resolve_frontend() -> Frontend {
     {
         return Frontend::QuickJs;
     }
-    #[cfg(embedded)]
+    #[cfg(all(embedded, feature = "be-perry"))]
     {
         return Frontend::Embedded;
     }
-    #[cfg(not(any(embedded, quickjs, scriptc)))]
+    #[allow(unreachable_code)]
     {
+        // The `use std::path::Path` at the top is feature-conditional; be
+        // fully explicit here so every remaining combination compiles.
+        use std::path::Path;
         if Path::new("build/perry-app.exe").exists() {
             return Frontend::Child { cmd: "build/perry-app.exe".to_string(), args: vec![] };
         }
@@ -644,7 +647,7 @@ fn main() {
                 .detach();
             });
         }
-        #[cfg(embedded)]
+        #[cfg(all(embedded, feature = "be-perry"))]
         Frontend::Embedded => {
             log!("[host] embedded mode: perry staticlib in-process");
             // launch() starts the ops reader BEFORE perry_module_init: the
@@ -674,7 +677,10 @@ fn main() {
                         .await;
                     unsafe {
                         embedded::perry_poll();
-                        embedded::js_stdlib_process_pending();
+                        #[cfg(feature = "be-perry")]
+                        {
+                            embedded::js_stdlib_process_pending();
+                        }
                     }
                 })
                 .detach();

@@ -95,9 +95,15 @@ function emit() {
     );
 }
 
-/** 所有 cargo 构建共用的默认后端注入：exe 启动即用选中的后端。 */
+/** 所有 cargo 构建共用的默认后端注入 + feature 门控：exe 启动即用选中的后端，
+ *  且只链这一个引擎（--no-default-features 让链接器裁掉另外两个后端）。 */
 function cargoEnv(extra = {}) {
     return { ...process.env, GPUI_TS_DEFAULT_BACKEND: backend, ...extra };
+}
+
+/** The cargo feature list for the selected backend — exactly one engine. */
+function backendFeatures() {
+    return `be-${backend}`;
 }
 
 // ===========================================================================
@@ -118,10 +124,14 @@ if (backend === "quickjs") {
         process.exit(1);
     }
 
-    console.log("[gpui-ts] 2/2 cargo build --release（QUICKJS_EMBED=1：内嵌 QuickJS + bundle）");
+    console.log("[gpui-ts] 2/2 cargo build --release（QUICKJS_EMBED=1 + be-quickjs：内嵌 QuickJS + bundle，其余引擎裁掉）");
     run(
         "cargo",
-        ["build", "--release", "--manifest-path", path.join(root, "host", "Cargo.toml")],
+        [
+            "build", "--release",
+            "--manifest-path", path.join(root, "host", "Cargo.toml"),
+            "--no-default-features", "--features", backendFeatures(),
+        ],
         { env: cargoEnv({ QUICKJS_EMBED: "1" }) }
     );
     if (!existsSync(HOST_EXE)) {
@@ -193,8 +203,12 @@ if (backend === "scriptc") {
         console.error("[gpui-ts]   （scriptc AOT 需要本机 scriptc + zig 工具链；无法安装时用 --backend quickjs）");
         process.exit(1);
     }
-    console.log("[gpui-ts] 1/1 cargo build --release（scriptc C TU 静态链入：TS → C → 本机代码）");
-    run("cargo", ["build", "--release", "--manifest-path", path.join(root, "host", "Cargo.toml")], {
+    console.log("[gpui-ts] 1/1 cargo build --release（be-scriptc：scriptc C TU 静态链入：TS → C → 本机代码）");
+    run("cargo", [
+        "build", "--release",
+        "--manifest-path", path.join(root, "host", "Cargo.toml"),
+        "--no-default-features", "--features", backendFeatures(),
+    ], {
         env: cargoEnv(),
     });
     if (!existsSync(HOST_EXE)) {
@@ -251,8 +265,12 @@ if (!existsSync(path.join(buildDir, `${libBase}.lib`))) {
     process.exit(1);
 }
 
-console.log("[gpui-ts] 3/4 cargo build --release（单 exe 链接：gpui + perry runtime）");
-run("cargo", ["build", "--release", "--manifest-path", path.join(root, "host", "Cargo.toml")], {
+console.log("[gpui-ts] 3/4 cargo build --release（be-perry：单 exe 链接：gpui + perry runtime，其余引擎裁掉）");
+run("cargo", [
+    "build", "--release",
+    "--manifest-path", path.join(root, "host", "Cargo.toml"),
+    "--no-default-features", "--features", backendFeatures(),
+], {
     env: cargoEnv({ PERRY_STATIC_LIB_BASE: libBase }),
 });
 if (!existsSync(HOST_EXE)) {
