@@ -166,7 +166,7 @@ export function CanvasCard(_props: Props): El {
                         ◐ 换色调
                     </PillBtn>
                     <div style={{ fontSize: 12, color: C.textMuted }}>
-                        <text text={drawStats} />
+                        {text(drawStats)}
                     </div>
                 </div>
             </div>
