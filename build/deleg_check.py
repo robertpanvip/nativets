@@ -20,7 +20,7 @@ import time
 from ctypes import wintypes
 
 TITLE = "nativets × GPUI"
-EXE = r"E:\AI-workspace\gpui-perryts\host\target\release\gpui-perryts-host.exe"
+EXE = r"E:\AI-workspace\gpui-perryts\host\target\release\nativets-host.exe"
 LOG = r"E:\AI-workspace\gpui-perryts\build\deleg.log"
 SHOT = r"E:\AI-workspace\gpui-perryts\build\deleg-shot.png"
 MOUSEEVENTF_WHEEL = 0x0800
@@ -121,8 +121,16 @@ def main():
         u.GetWindowRect(hwnd, ctypes.byref(wr))
         wx, wy = wr.left, wr.top
 
-        for _ in range(3):
-            wheel(hwnd, ox + 700, oy + 250, 14)
+        # Scroll in small bursts and re-screenshot until the delegation card's
+        # two rows are on screen. (Fixed 3×14 used to land them top-most, but
+        # the exact stop point is a layout assumption that has drifted; probing
+        # makes the check robust to card-height changes.)
+        rows = None
+        for _ in range(30):
+            wheel(hwnd, ox + 700, oy + 250, 2)
+            rows = find_rows(hwnd)
+            if rows:
+                break
 
         rows = find_rows(hwnd)
         if not rows:

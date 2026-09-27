@@ -22,7 +22,7 @@ import time
 from ctypes import wintypes
 
 TITLE = "nativets × GPUI"
-EXE = r"E:\AI-workspace\gpui-perryts\host\target\release\gpui-perryts-host.exe"
+EXE = r"E:\AI-workspace\gpui-perryts\host\target\release\nativets-host.exe"
 LOG = r"E:\AI-workspace\gpui-perryts\build\widgets.log"
 SHOT = r"E:\AI-workspace\gpui-perryts\build\widgets-shot.png"
 MOUSEEVENTF_WHEEL = 0x0800

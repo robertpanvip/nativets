@@ -16,7 +16,7 @@ import time
 from ctypes import wintypes
 
 TITLE = "nativets × GPUI"
-EXE = r"E:\AI-workspace\gpui-perryts\host\target\release\gpui-perryts-host.exe"
+EXE = r"E:\AI-workspace\gpui-perryts\host\target\release\nativets-host.exe"
 LOG = r"E:\AI-workspace\gpui-perryts\build\deleg.log"
 SHOT = r"E:\AI-workspace\gpui-perryts\build\deleg-full.png"
 

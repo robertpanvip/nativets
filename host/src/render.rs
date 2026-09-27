@@ -22,6 +22,12 @@ use serde_json::json;
 use std::collections::HashSet;
 use crate::tree::{is_native_tag, Node, Tree};
 
+/// `GPUI_TS_WHEEL_PROBE=1` — per-tick wheel-guard trace (id/dy/max/offset/verdict).
+pub(crate) fn scroll_guard_probe() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| matches!(std::env::var("GPUI_TS_WHEEL_PROBE"), Ok(v) if v != "0"))
+}
+
 impl HostView {
     pub(crate) fn build_node(
         &mut self,
@@ -126,6 +132,15 @@ impl HostView {
         let mut s = d.id(element_id);
         if scroll {
             let handle = self.scroll_handle(id);
+            // Last tick's RAW post-tick offset, remembered across wheel events.
+            // Layout clamps the offset cell (div.rs paint), so `offset - dy`
+            // is only a trustworthy "pre" when no frame landed between ticks;
+            // this anchor makes the boundary test robust either way.
+            let last_raw = self
+                .scroll_last_raw
+                .entry(id)
+                .or_insert_with(|| std::rc::Rc::new(std::cell::Cell::new(0.0f32)))
+                .clone();
             // The scroller must be bounded. `overflow_y_scroll` derives the
             // viewport from this element's own height, but a flex child in a
             // column defaults to "content height" — the container would grow to
@@ -162,6 +177,10 @@ impl HostView {
                         }
                         let max = wheel_handle.max_offset().y;
                         if max <= px(0.0) {
+                            if scroll_guard_probe() {
+                                log!("[wheel-guard] id={id} dy={} max=0 -> free-chain", f32::from(dy));
+                            }
+                            last_raw.set(0.0);
                             return; // nothing to scroll — chain freely
                         }
                         let offset = wheel_handle.offset().y; // post-tick, ≤ 0
@@ -170,10 +189,38 @@ impl HostView {
                         // the delta straight onto the offset cell, unclamped
                         // until the next layout — so past-edge offsets like
                         // -614 with max=338 are normal between events).
-                        let at_top = offset >= px(0.0);
-                        let at_bottom = offset <= -max;
-                        let can_move = (dy < px(0.0) && !at_bottom)
-                            || (dy > px(0.0) && !at_top);
+                        // Chain decision (anchored): the tick belongs to this
+                        // scroller iff it had room to move in the wheeled
+                        // direction BEFORE the tick. Two estimates of `pre`:
+                        // `offset - dy` (exact when no layout ran between
+                        // ticks) and the self-remembered raw post of the
+                        // previous tick (immune to layout clamping because it
+                        // was captured pre-clamp). If EITHER says we were
+                        // at/past the edge, the visual travel this tick was
+                        // (near) zero — chain to the ancestor. Otherwise the
+                        // tick landed us on/past the edge, which is consumed
+                        // here; the ancestor takes the NEXT tick.
+                        let post_f = f32::from(offset);
+                        let dy_f = f32::from(dy);
+                        let max_f = f32::from(max);
+                        let pre_est = post_f - dy_f;
+                        let raw_prev = last_raw.get();
+                        let at_end_before =
+                            (dy_f < 0.0 && (pre_est <= -max_f || raw_prev <= -max_f))
+                                || (dy_f > 0.0 && (pre_est >= 0.0 || raw_prev >= 0.0));
+                        last_raw.set(post_f);
+                        let can_move = !at_end_before;
+                        if scroll_guard_probe() {
+                            log!(
+                                "[wheel-guard] id={id} dy={} max={} offset={} pre_est={} raw_prev={} chain={at_end_before} stop={}",
+                                f32::from(dy),
+                                f32::from(max),
+                                f32::from(offset),
+                                pre_est,
+                                raw_prev,
+                                !at_end_before,
+                            );
+                        }
                         if can_move {
                             cx.stop_propagation();
                         }
@@ -390,6 +437,7 @@ impl HostView {
         let live: HashSet<u64> = self.tree.ids().into_iter().collect();
         self.focus_handles.retain(|k, _| live.contains(k));
         self.scroll_handles.retain(|k, _| live.contains(k));
+        self.scroll_last_raw.retain(|k, _| live.contains(k));
         self.scroll_reported.retain(|k, _| live.contains(k));
         self.focus_reported.retain(|k, _| live.contains(k));
         self.input_states.retain(|k, _| live.contains(k));

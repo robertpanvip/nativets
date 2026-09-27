@@ -309,6 +309,12 @@ struct HostView {
     /// layout; the scrollbar canvas reads them back at paint time. The handle is
     /// the only channel between "GPUI scrolled something" and "we can draw it".
     scroll_handles: HashMap<u64, ScrollHandle>,
+    /// Last tick's raw post-tick offset per scrolling node, remembered by the
+    /// wheel-chain guard (see `build_plain`). Layout clamps the offset cell, so
+    /// a "pre" reconstructed as `offset - dy` is only exact when no frame ran
+    /// between ticks; this anchor survives that. `Rc<Cell<_>>` because the
+    /// guard closure is an `Fn` and outlives the borrow of `self`.
+    scroll_last_raw: HashMap<u64, std::rc::Rc<std::cell::Cell<f32>>>,
     /// Last offset pushed to the frontend per node — so the poll in `render`
     /// turns a change into exactly one event, not one per frame.
     scroll_reported: HashMap<u64, f32>,
@@ -808,6 +814,7 @@ fn open_host_window(
                 dialog: None,
                 focus_handles: HashMap::new(),
                 scroll_handles: HashMap::new(),
+                scroll_last_raw: HashMap::new(),
                 scroll_reported: HashMap::new(),
                 focus_reported: HashMap::new(),
                 input_states: HashMap::new(),

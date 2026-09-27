@@ -10,7 +10,7 @@ import time
 from ctypes import wintypes
 
 TITLE = "nativets × GPUI"
-EXE = r"E:\AI-workspace\gpui-perryts\host\target\debug\gpui-perryts-host.exe"
+EXE = r"E:\AI-workspace\gpui-perryts\host\target\debug\nativets-host.exe"
 OUT = r"E:\AI-workspace\gpui-perryts\build\smoke.png"
 
 u = ctypes.windll.user32

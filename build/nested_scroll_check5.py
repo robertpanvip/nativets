@@ -37,7 +37,7 @@ from collections import Counter
 from ctypes import wintypes
 
 TITLE = "nativets × GPUI"
-EXE = r"E:\AI-workspace\gpui-perryts\host\target\release\gpui-perryts-host.exe"
+EXE = r"E:\AI-workspace\gpui-perryts\host\target\release\nativets-host.exe"
 LOG = r"E:\AI-workspace\gpui-perryts\build\ns5.log"
 MOUSEEVENTF_WHEEL = 0x0800
 WHEEL_DELTA = 120
@@ -134,9 +134,20 @@ def main():
         c, base = counts_since(base)
 
         # 5. outer to exactly 828 (12 notches × 69px); inner stays at 0.
-        wheel(hwnd, ox + OUTER_X, oy + 200, 12)
-        c, base = counts_since(base)
-        text = read_log()
+        # The chained reset in step 4 may overshoot: an up-tick past the top
+        # now stays unclamped inside the outer (top<0 reported) instead of
+        # being eaten, so drive down to the FIRST report in [828, 897) —
+        # 69px per notch means stopping anywhere above 828 keeps the inner
+        # card ABOVE y=352 (its probe point), which breaks phase 2's aim.
+        # Overshoot beyond one notch is tolerated by nudging with single
+        # ticks and re-reading after each.
+        for _ in range(40):
+            text = read_log()
+            outer_top = last_top_for(text, outer_id)
+            if outer_top is not None and 828.0 <= outer_top < 897.0:
+                break
+            wheel(hwnd, ox + OUTER_X, oy + 200, 1, delay=0.02)
+            c, base = counts_since(base)
         outer_top = last_top_for(text, outer_id)
         inner_top = last_top_for(text, inner_id)
         print(f"pre-assert: outer top={outer_top}  inner top={inner_top}")
