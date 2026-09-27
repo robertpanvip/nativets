@@ -25,14 +25,23 @@ const USAGE = `nativets ${VERSION} — TypeScript → native desktop app
 
 Usage:
   nativets dev   <entry.tsx> [-o <out.exe>]   Watch, rebuild & restart on save
-  nativets build <entry.tsx> [-o <out.exe>]   Bundle and pack into one exe
+  nativets build <entry.tsx> [-o <out.exe>] [--backend <name>]
+                                              Bundle and pack into one exe
   nativets run   <entry.tsx>                  Pack to a temp file and run it
   nativets doctor                             Report what this install can do
   nativets --help | --version
 
+Backends (--backend):
+  quickjs   (default) zero toolchain — the app is appended to the prebuilt
+            host as script data; runs on an embedded QuickJS engine
+  scriptc   native AOT — TypeScript is compiled to C and linked into the
+            binary at build time. Requires a local scriptc + zig + Rust/MSVC
+            toolchain; produces a true machine-code exe (build from source)
+  perry     full perry runtime linked in at build time (build from source)
+
 Your entry file is an ordinary TSX module. It must bring in the JSX factory:
 
-  import { createRoot, h, appendChild } from "gpui-ts";
+  import { createRoot, h, appendChild } from "nativets";
   import { App } from "./app";
 
   createRoot({ title: "My App" }, App);
@@ -57,12 +66,15 @@ async function loadEsbuild() {
 }
 
 function parseFlags(argv) {
-    const out = { entry: null, out: null };
+    const out = { entry: null, out: null, backend: process.env.GPUI_TS_BACKEND ?? "quickjs" };
     for (let i = 0; i < argv.length; i++) {
         const a = argv[i];
         if (a === "-o" || a === "--out") {
             out.out = argv[++i];
             if (out.out === undefined) fail(`missing path after ${a}`);
+        } else if (a === "--backend" || a === "-b") {
+            out.backend = argv[++i];
+            if (out.backend === undefined) fail(`missing backend name after ${a}`);
         } else if (!a.startsWith("-")) {
             if (out.entry === null) out.entry = a;
             else fail(`unexpected extra argument: ${a}`);
@@ -108,11 +120,66 @@ function defaultOut(entry) {
     return path.join(process.cwd(), base + ".exe");
 }
 
+/** Is a command invocable on PATH? (cheap spawnSync probe) */
+function haveTool(cmd) {
+    const probe = process.platform === "win32" ? "where" : "command";
+    const args = process.platform === "win32" ? [cmd] : ["-v", cmd];
+    const r = spawnSync(probe, args, { stdio: "ignore", shell: process.platform === "win32" });
+    return r.status === 0;
+}
+
+/**
+ * AOT backends (scriptc / perry) bake the app into the host binary at build
+ * time — they need the repo's source tree + a Rust/MSVC toolchain, not just
+ * the npm package. Locate a checkout (env NATIVETS_REPO or walk up from cwd)
+ * and hand off to the repo-side CLI, which drives the whole compile.
+ */
+async function buildAot(entryPath, outPath, backend) {
+    let repo = process.env.NATIVETS_REPO ?? null;
+    if (repo === null) {
+        // Walk up from the entry file looking for the repo marker.
+        let dir = path.dirname(entryPath);
+        for (let i = 0; i < 12; i++) {
+            if (fs.existsSync(path.join(dir, "scripts", "gpui-ts.mjs"))) { repo = dir; break; }
+            const parent = path.dirname(dir);
+            if (parent === dir) break;
+            dir = parent;
+        }
+    }
+    if (repo === null || !fs.existsSync(path.join(repo, "scripts", "gpui-ts.mjs"))) {
+        console.error(`nativets: --backend ${backend} compiles TypeScript to native code at build time.`);
+        console.error("  that needs the nativets source checkout + Rust/MSVC toolchain (not just this npm package).");
+        console.error("  point NATIVETS_REPO at a checkout of github.com/robertpanvip/nativets,");
+        console.error("  or use the default zero-toolchain backend: nativets build <entry.tsx>");
+        process.exit(2);
+    }
+    if (!haveTool("cargo")) {
+        console.error(`nativets: --backend ${backend} requires a Rust toolchain (cargo not on PATH).`);
+        console.error("  install rustup + MSVC, or use the default quickjs backend (no toolchain).");
+        process.exit(2);
+    }
+    const cli = path.join(repo, "scripts", "gpui-ts.mjs");
+    const args = [cli, entryPath, "-o", outPath, "--backend", backend];
+    console.log(`nativets: AOT build via ${backend} → ${path.relative(process.cwd(), outPath)}`);
+    const r = spawnSync(process.execPath, args, {
+        stdio: "inherit",
+        cwd: repo,
+        env: { ...process.env, GPUI_TS_BACKEND: backend },
+    });
+    process.exit(r.status ?? (r.error ? 1 : 0));
+}
+
 async function cmdBuild(argv) {
-    const { entry, out } = parseFlags(argv);
+    const { entry, out, backend } = parseFlags(argv);
     if (entry === null) fail("build needs an entry file");
+    if (backend !== "quickjs" && backend !== "scriptc" && backend !== "perry") {
+        fail(`unknown backend: ${backend} (quickjs | scriptc | perry)`);
+    }
     const entryPath = resolveEntry(entry);
     const outPath = path.resolve(out === null ? defaultOut(entry) : out);
+    if (backend !== "quickjs") {
+        await buildAot(entryPath, outPath, backend);
+    }
     const host = requireHost();
 
     const esbuild = await loadEsbuild();
@@ -136,13 +203,13 @@ async function cmdBuild(argv) {
 }
 
 async function cmdRun(argv) {
-    const { entry } = parseFlags(argv);
+    const { entry, out, backend } = parseFlags(argv);
     if (entry === null) fail("run needs an entry file");
     const tmpExe = path.join(
         os.tmpdir(),
         `gpui-ts-${path.basename(entry).replace(/\.[jt]sx?$/, "")}-${process.pid}.exe`,
     );
-    await cmdBuild([entry, "-o", tmpExe]);
+    await cmdBuild([entry, "-o", tmpExe, ...(backend !== "quickjs" ? ["--backend", backend] : [])]);
     try {
         const r = spawnSync(tmpExe, [], { stdio: "inherit" });
         process.exit(r.status === null ? 1 : r.status);
@@ -299,6 +366,14 @@ function cmdDoctor() {
     }
     const vendor = path.join(pkgRoot, "vendor");
     console.log(`  shipped   ${fs.existsSync(vendor) ? fs.readdirSync(vendor).join(", ") : "(none)"}`);
+    // AOT backends are opt-in toolchain builds; surface what's available.
+    const cargo = haveTool("cargo");
+    const scriptcCli = haveTool("scriptc") || process.env.SCRIPTC_BIN !== undefined;
+    const zig = haveTool("zig") || process.env.SCRIPTC_ZIG !== undefined;
+    const perryPkg = haveTool("perry");
+    console.log("  backends  quickjs (default, zero toolchain)");
+    console.log(`  backends  scriptc AOT — cargo:${cargo ? "ok" : "missing"} scriptc:${scriptcCli ? "ok" : "missing"} zig:${zig ? "ok" : "missing"}`);
+    console.log(`  backends  perry     — cargo:${cargo ? "ok" : "missing"} perry:${perryPkg ? "ok" : "missing"}`);
 }
 
 const argv = process.argv.slice(2);

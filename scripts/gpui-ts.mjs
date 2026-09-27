@@ -33,21 +33,26 @@ const args = process.argv.slice(2);
 
 let entry = "ui/src/main.ts";
 let out = null;
-let backend = process.env.GPUI_TS_BACKEND ?? "quickjs";
+let backend = process.env.GPUI_TS_BACKEND ?? "scriptc";
 for (let i = 0; i < args.length; i++) {
     if (args[i] === "-o") {
         out = args[++i];
     } else if (args[i] === "--backend") {
         backend = args[++i];
     } else if (args[i] === "-h" || args[i] === "--help") {
-        console.log("用法：node scripts/gpui-ts.mjs [entry.ts] [-o out.exe] [--backend quickjs|perry]");
+        console.log(
+            "用法：node scripts/gpui-ts.mjs [entry.ts] [-o out.exe] [--backend scriptc|perry|quickjs]"
+        );
+        console.log("  scriptc  默认 — 原生 AOT（TS → C → 本机代码），需本机 scriptc/zig 工具链");
+        console.log("  perry    完整 perry 运行时（staticlib 链接），需 perry npm 包");
+        console.log("  quickjs  零工具链便携后端（esbuild → 内嵌 QuickJS）");
         process.exit(0);
     } else {
         entry = args[i];
     }
 }
-if (backend !== "quickjs" && backend !== "perry") {
-    console.error(`[gpui-ts] 未知后端: ${backend}（可选 quickjs | perry）`);
+if (backend !== "quickjs" && backend !== "perry" && backend !== "scriptc") {
+    console.error(`[gpui-ts] 未知后端: ${backend}（可选 scriptc | perry | quickjs）`);
     process.exit(1);
 }
 
@@ -85,6 +90,14 @@ function emit() {
     const mb = (statSync(out).size / 1024 / 1024).toFixed(1);
     console.log(`[gpui-ts] ✔ ${out}  ${mb} MB · 单文件 · 零子进程 · 无 Node/V8 依赖`);
     console.log(`[gpui-ts]   运行：直接执行即可；GPUI 窗口即 TS 应用 UI`);
+    console.log(
+        `[gpui-ts]   默认后端 ${backend}（运行时可用 GPUI_TS_BACKEND=quickjs|perry|scriptc 切换）`
+    );
+}
+
+/** 所有 cargo 构建共用的默认后端注入：exe 启动即用选中的后端。 */
+function cargoEnv(extra = {}) {
+    return { ...process.env, GPUI_TS_DEFAULT_BACKEND: backend, ...extra };
 }
 
 // ===========================================================================
@@ -109,7 +122,7 @@ if (backend === "quickjs") {
     run(
         "cargo",
         ["build", "--release", "--manifest-path", path.join(root, "host", "Cargo.toml")],
-        { env: { ...process.env, QUICKJS_EMBED: "1" } }
+        { env: cargoEnv({ QUICKJS_EMBED: "1" }) }
     );
     if (!existsSync(HOST_EXE)) {
         console.error(`[gpui-ts] 未找到产物 ${HOST_EXE}`);
@@ -168,12 +181,36 @@ function verifyEmbeddedApp(exePath, genDir) {
 }
 
 // ===========================================================================
+// backend: scriptc — TS → C AOT → 与宿主一同静态链接（默认后端）
+// ===========================================================================
+// scriptc 的产物是一个 C 翻译单元（build/scriptc/sc-main.lib.c），
+// host/build.rs 用 cc/cl.exe 把它连同 vendored MSVC runtime 编进宿主本体。
+// 需要：scriptc 编译器 + zigcc（仅编译期），产物零外部依赖。
+if (backend === "scriptc") {
+    const programC = path.join(buildDir, "scriptc", "sc-main.lib.c");
+    if (!existsSync(programC)) {
+        console.error("[gpui-ts] 未找到 build/scriptc/sc-main.lib.c，请先运行：node ui/build-scriptc.mjs");
+        console.error("[gpui-ts]   （scriptc AOT 需要本机 scriptc + zig 工具链；无法安装时用 --backend quickjs）");
+        process.exit(1);
+    }
+    console.log("[gpui-ts] 1/1 cargo build --release（scriptc C TU 静态链入：TS → C → 本机代码）");
+    run("cargo", ["build", "--release", "--manifest-path", path.join(root, "host", "Cargo.toml")], {
+        env: cargoEnv(),
+    });
+    if (!existsSync(HOST_EXE)) {
+        console.error(`[gpui-ts] 未找到产物 ${HOST_EXE}`);
+        process.exit(1);
+    }
+    emit();
+    process.exit(0);
+}
+
+// ===========================================================================
 // backend: perry — perry compile staticlib → 链接 → 单 exe
 // ===========================================================================
 // staticlib 基名：仅安全字符（进 MSVC link 命令行）
 const libBase =
     "app-" + path.basename(entry).replace(/\.[jt]sx?$/, "").replace(/[^A-Za-z0-9_]/g, "_");
-
 const libDir = path.join(uiDir, "node_modules", "@perryts", "perry-win32-x64", "lib");
 if (!existsSync(path.join(libDir, "perry_runtime.lib"))) {
     console.error("[gpui-ts] 未找到 perry 运行时库，请先在 ui/ 下 npm install");
@@ -216,7 +253,7 @@ if (!existsSync(path.join(buildDir, `${libBase}.lib`))) {
 
 console.log("[gpui-ts] 3/4 cargo build --release（单 exe 链接：gpui + perry runtime）");
 run("cargo", ["build", "--release", "--manifest-path", path.join(root, "host", "Cargo.toml")], {
-    env: { ...process.env, PERRY_STATIC_LIB_BASE: libBase },
+    env: cargoEnv({ PERRY_STATIC_LIB_BASE: libBase }),
 });
 if (!existsSync(HOST_EXE)) {
     console.error(`[gpui-ts] 未找到产物 ${HOST_EXE}`);

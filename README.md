@@ -23,10 +23,20 @@ TypeScript/TSX 风格前端 ──esbuild──▶ 单个 IIFE JS ──内嵌�
   Solid 风格 signals                          Rust host: retained tree ──▶ GPUI (GPU)
 ```
 
-> 运行时层可插拔：**默认内嵌 QuickJS**（`rquickjs`，自拥 10ms 事件循环）；
-> 同一个 exe 还链入了 perry（AOT 静态库）与 scriptc（AOT）两个后端，
-> `GPUI_TS_BACKEND=quickjs|perry|scriptc` 运行时选择（默认 quickjs）。
-> 协议与前端源码两者完全一致。npm 包见 `packages/gpui-ts/`（[`nativets`](packages/gpui-ts/README.md)）。
+> 运行时层可插拔：**scriptc / perry / quickjs 三个引擎共存于同一个宿主**，
+> 协议与前端源码三者完全一致。
+>
+> | 后端 | 定位 | 说明 |
+> |---|---|---|
+> | **scriptc** | **默认** · 原生 AOT | TS → C → 本机代码，构建期链入宿主，真·编译型 TypeScript |
+> | perry | 完整运行时 AOT | perry staticlib 构建期链入（500ms I/O 量子等已知怪病见 docs） |
+> | quickjs | 零工具链便携 | esbuild bundle + 内嵌 QuickJS；npm 包预构建宿主唯一支持的后端 |
+>
+> CLI：`node scripts/gpui-ts.mjs <entry> --backend scriptc|perry|quickjs`
+>（**默认 scriptc**；构建期注入默认后端，产物双击即所选引擎，运行时
+> `GPUI_TS_BACKEND` 仍可覆盖）。npm 包见 `packages/gpui-ts/`
+>（[`nativets`](packages/gpui-ts/README.md)）：`nativets build --backend …`
+> 默认走零工具链 quickjs，scriptc/perry 需源码 checkout + Rust/MSVC 工具链。
 
 ## 方案评估（为什么是这套架构）
 

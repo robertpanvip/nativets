@@ -17,6 +17,24 @@ fn main() {
     println!("cargo:rerun-if-env-changed=QUICKJS_EMBED");
     println!("cargo:rerun-if-env-changed=QUICKJS_EMBED_BUNDLE");
 
+    // ── build-time default backend ────────────────────────────────────────
+    // The CLI sets GPUI_TS_DEFAULT_BACKEND=scriptc|perry|quickjs when it wants
+    // the produced exe to boot that engine without runtime configuration.
+    // Emitted as cfg(default_scriptc)/cfg(default_perry); main.rs consumes
+    // them after GPUI_TS_BACKEND (which still overrides at runtime).
+    println!("cargo:rerun-if-env-changed=GPUI_TS_DEFAULT_BACKEND");
+    println!("cargo:rustc-check-cfg=cfg(default_scriptc)");
+    println!("cargo:rustc-check-cfg=cfg(default_perry)");
+    match std::env::var("GPUI_TS_DEFAULT_BACKEND")
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "scriptc" => println!("cargo:rustc-cfg=default_scriptc"),
+        "perry" => println!("cargo:rustc-cfg=default_perry"),
+        _ => {}
+    }
+
     // quickjs.rs embeds this file with include_str!; without the declaration
     // cargo would not rebuild when the bootstrap JS changes.
     println!("cargo:rerun-if-changed=src/bootstrap.js");

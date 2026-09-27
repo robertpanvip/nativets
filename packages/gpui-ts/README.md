@@ -88,10 +88,21 @@ nativets doctor                   # 检查本机这套安装是否可用
 | 命令 | 作用 |
 | --- | --- |
 | `nativets dev <entry.tsx> [-o <out.exe>]` | 监视入口及其依赖，保存即重编译、重打包并重启应用窗口 |
-| `nativets build <entry.tsx> [-o <out.exe>]` | 打包成单个自包含 exe，默认输出到 `<entry>.exe` |
+| `nativets build <entry.tsx> [-o <out.exe>] [--backend <name>]` | 打包成单个自包含 exe，默认输出到 `<entry>.exe` |
 | `nativets run <entry.tsx>` | 先 build 到临时文件，再运行，退出后清理 |
-| `nativets doctor` | 打印 Node 版本、当前平台、宿主二进制路径与体积 |
+| `nativets doctor` | 打印 Node 版本、当前平台、宿主二进制路径与体积、各后端工具链可用性 |
 | `nativets --help` / `--version` | 用法与版本 |
+
+**后端选择**（`--backend` / `GPUI_TS_BACKEND`）：
+
+| 后端 | 说明 | 要求 |
+| --- | --- | --- |
+| `quickjs`（默认） | esbuild bundle 追加到预构建宿主，内嵌 QuickJS 引擎执行 | 零工具链 |
+| `scriptc` | 原生 AOT：TS → C → 本机代码，构建期静态链入 | 源码 checkout + cargo/MSVC + scriptc/zig |
+| `perry` | perry staticlib 构建期链入宿主 | 源码 checkout + cargo/MSVC + perry 包 |
+
+选 AOT 后端时 CLI 会自动定位源码仓库（`NATIVETS_REPO` 环境变量或从入口文件
+向上查找）并交接给仓库侧构建脚本；`doctor` 会列出各后端工具链的可用性。
 
 `dev` 是 Go 式的内部循环：esbuild 的 watch 上下文负责依赖发现与增量编译
 （只报告真正进了 bundle 的文件），每次重编译后把新 bundle 追加到宿主二进制

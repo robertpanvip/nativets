@@ -455,9 +455,30 @@ fn positional_arg() -> Option<String> {
 }
 
 /// `GPUI_TS_BACKEND` — runtime backend selection. All three engines may be
-/// linked into one binary; this picks the one that boots. Default: quickjs.
+/// linked into one binary; this picks the one that boots.
 fn backend_env() -> Option<String> {
-    std::env::var("GPUI_TS_BACKEND").ok().map(|s| s.to_ascii_lowercase())
+    std::env::var("GPUI_TS_BACKEND")
+        .ok()
+        .map(|s| s.to_ascii_lowercase())
+}
+
+/// Build-time default backend, injected by the CLI as GPUI_TS_DEFAULT_BACKEND
+/// (build.rs `option_env!` → cargo:rustc-cfg=default_scriptc / default_perry).
+/// Lets `nativets build --backend scriptc` produce an exe that boots scriptc
+/// with zero runtime configuration, while GPUI_TS_BACKEND still overrides.
+fn default_backend() -> &'static str {
+    #[cfg(default_scriptc)]
+    {
+        "scriptc"
+    }
+    #[cfg(default_perry)]
+    {
+        "perry"
+    }
+    #[cfg(not(any(default_scriptc, default_perry)))]
+    {
+        "quickjs"
+    }
 }
 
 fn resolve_frontend() -> Frontend {
@@ -489,9 +510,12 @@ fn resolve_frontend() -> Frontend {
         }
         return Frontend::Child { cmd: arg, args: vec![] };
     }
-    // Explicit selection only: GPUI_TS_BACKEND=perry|scriptc. QuickJS stays
-    // the default even when other engines ship in the same binary — a stale
-    // artifact must not silently hijack the primary backend.
+    // No explicit selection: GPUI_TS_BACKEND wins, then the build-time
+    // default (GPUI_TS_DEFAULT_BACKEND injected by the CLI), then quickjs.
+    // A build-time default only ever points at a backend that was actually
+    // linked in (the CLI drives both flags), and a stale artifact from
+    // another backend cannot silently hijack the boot choice because the
+    // cfg pair is regenerated on every CLI build.
     match backend_env().as_deref() {
         Some("scriptc") => {
             #[cfg(scriptc)]
@@ -515,7 +539,34 @@ fn resolve_frontend() -> Frontend {
                 std::process::exit(2);
             }
         }
-        Some("quickjs") | None | Some(_) => {}
+        Some("quickjs") => {}
+        Some(other) => {
+            log!("[host] unknown GPUI_TS_BACKEND={other} (quickjs|perry|scriptc) — falling back to default");
+        }
+        None => {}
+    }
+    match default_backend() {
+        "scriptc" => {
+            #[cfg(scriptc)]
+            {
+                return Frontend::Scriptc;
+            }
+            #[cfg(not(scriptc))]
+            {
+                log!("[host] default backend scriptc not compiled in — falling back");
+            }
+        }
+        "perry" => {
+            #[cfg(embedded)]
+            {
+                return Frontend::Embedded;
+            }
+            #[cfg(not(embedded))]
+            {
+                log!("[host] default backend perry not compiled in — falling back");
+            }
+        }
+        _ => {}
     }
     #[cfg(quickjs)]
     {
