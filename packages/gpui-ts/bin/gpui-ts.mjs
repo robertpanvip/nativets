@@ -14,6 +14,8 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { ESBUILD_OPTS, hostPathFor, nativetsRuntimePlugin, packExe } from "../lib/build.mjs";
+import { ensureRust, ensurePerry, ensureXwinSdk, nativetsRoot } from "../lib/setup.mjs";
+import { resolveToolchain, toolchainSummary } from "../lib/toolchain.mjs";
 
 const pkgRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -28,6 +30,7 @@ Usage:
   nativets build <entry.tsx> [-o <out.exe>] [--backend <name>]
                                               Bundle and pack into one exe
   nativets run   <entry.tsx>                  Pack to a temp file and run it
+  nativets setup [--accept-license]           Install the AOT toolchain
   nativets doctor                             Report what this install can do
   nativets --help | --version
 
@@ -35,9 +38,10 @@ Backends (--backend):
   quickjs   (default) zero toolchain — the app is appended to the prebuilt
             host as script data; runs on an embedded QuickJS engine
   scriptc   native AOT — TypeScript is compiled to C and linked into the
-            binary at build time. Requires a local scriptc + zig + Rust/MSVC
-            toolchain; produces a true machine-code exe (build from source)
-  perry     full perry runtime linked in at build time (build from source)
+            binary at build time. Requires the Rust/MSVC toolchain; run
+            \`nativets setup\` once to install it (~5 min, ~1.4 GB)
+  perry     full perry runtime linked in at build time. Same toolchain
+            requirements; \`nativets setup\` covers the compiler + linker too
 
 Your entry file is an ordinary TSX module. It must bring in the JSX factory:
 
@@ -133,6 +137,10 @@ function haveTool(cmd) {
  * time — they need the repo's source tree + a Rust/MSVC toolchain, not just
  * the npm package. Locate a checkout (env NATIVETS_REPO or walk up from cwd)
  * and hand off to the repo-side CLI, which drives the whole compile.
+ *
+ * The toolchain itself does NOT need to be on PATH: `nativets setup` installs
+ * a portable tree under %USERPROFILE%\.nativets and this function injects its
+ * cargo/perry/linker env into the child build.
  */
 async function buildAot(entryPath, outPath, backend) {
     let repo = process.env.NATIVETS_REPO ?? null;
@@ -148,23 +156,26 @@ async function buildAot(entryPath, outPath, backend) {
     }
     if (repo === null || !fs.existsSync(path.join(repo, "scripts", "gpui-ts.mjs"))) {
         console.error(`nativets: --backend ${backend} compiles TypeScript to native code at build time.`);
-        console.error("  that needs the nativets source checkout + Rust/MSVC toolchain (not just this npm package).");
+        console.error("  that needs the nativets source checkout + a Rust toolchain (not just this npm package).");
         console.error("  point NATIVETS_REPO at a checkout of github.com/robertpanvip/nativets,");
         console.error("  or use the default zero-toolchain backend: nativets build <entry.tsx>");
         process.exit(2);
     }
-    if (!haveTool("cargo")) {
-        console.error(`nativets: --backend ${backend} requires a Rust toolchain (cargo not on PATH).`);
-        console.error("  install rustup + MSVC, or use the default quickjs backend (no toolchain).");
+    const tc = resolveToolchain();
+    if (!tc.ok) {
+        console.error(`nativets: --backend ${backend} is missing: ${tc.missing.join(", ")}`);
+        console.error(`  run \`nativets setup\` to install everything into ${nativetsRoot()} (no PATH/registry changes),`);
+        console.error("  or use the default quickjs backend (no toolchain).");
         process.exit(2);
     }
     const cli = path.join(repo, "scripts", "gpui-ts.mjs");
     const args = [cli, entryPath, "-o", outPath, "--backend", backend];
     console.log(`nativets: AOT build via ${backend} → ${path.relative(process.cwd(), outPath)}`);
+    console.log(`  toolchain: cargo ${tc.cargo.via}, perry ${tc.perry.via}, linker ${tc.linker.mode}`);
     const r = spawnSync(process.execPath, args, {
         stdio: "inherit",
         cwd: repo,
-        env: { ...process.env, GPUI_TS_BACKEND: backend },
+        env: { ...process.env, ...tc.env, GPUI_TS_BACKEND: backend },
     });
     process.exit(r.status ?? (r.error ? 1 : 0));
 }
@@ -366,14 +377,41 @@ function cmdDoctor() {
     }
     const vendor = path.join(pkgRoot, "vendor");
     console.log(`  shipped   ${fs.existsSync(vendor) ? fs.readdirSync(vendor).join(", ") : "(none)"}`);
-    // AOT backends are opt-in toolchain builds; surface what's available.
-    const cargo = haveTool("cargo");
-    const scriptcCli = haveTool("scriptc") || process.env.SCRIPTC_BIN !== undefined;
-    const zig = haveTool("zig") || process.env.SCRIPTC_ZIG !== undefined;
-    const perryPkg = haveTool("perry");
+    // AOT backends: what did `nativets setup` (or the system) provide?
+    const tc = toolchainSummary();
+    console.log(`  home      ${tc.root}`);
     console.log("  backends  quickjs (default, zero toolchain)");
-    console.log(`  backends  scriptc AOT — cargo:${cargo ? "ok" : "missing"} scriptc:${scriptcCli ? "ok" : "missing"} zig:${zig ? "ok" : "missing"}`);
-    console.log(`  backends  perry     — cargo:${cargo ? "ok" : "missing"} perry:${perryPkg ? "ok" : "missing"}`);
+    console.log(`  backends  scriptc AOT — cargo:${tc.cargo} linker:${tc.linker}`);
+    console.log(`  backends  perry     — cargo:${tc.cargo} perry:${tc.perry} linker:${tc.linker}`);
+    if (tc.linker === "missing" || tc.cargo === "missing") {
+        console.log(`  hint      run \`nativets setup\` to install the missing pieces (no PATH/registry changes)`);
+    }
+}
+
+/**
+ * `nativets setup` — make the AOT backends work with zero manual steps:
+ * portable Rust + perry via npm + (when no Visual Studio exists) LLVM's
+ * lld-link with a downloaded Microsoft CRT/SDK. Idempotent; each already-
+ * present piece is skipped, so re-running after a failure resumes cleanly.
+ */
+async function cmdSetup(argv) {
+    const acceptLicense = argv.includes("--accept-license");
+    try {
+        console.log(`nativets setup — toolchain root: ${nativetsRoot()}`);
+        console.log("");
+        await ensureRust();
+        console.log("");
+        ensurePerry();
+        console.log("");
+        await ensureXwinSdk({ acceptLicense });
+        console.log("");
+        console.log("nativets setup complete — AOT backends are ready:");
+        console.log("  nativets build app.tsx --backend scriptc");
+        console.log("  nativets build app.tsx --backend perry");
+    } catch (e) {
+        console.error(`nativets setup: ${e.message}`);
+        process.exit(1);
+    }
 }
 
 const argv = process.argv.slice(2);
@@ -390,6 +428,9 @@ switch (cmd) {
         break;
     case "doctor":
         cmdDoctor();
+        break;
+    case "setup":
+        await cmdSetup(argv.slice(1));
         break;
     case "--version":
     case "-v":
