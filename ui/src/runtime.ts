@@ -63,9 +63,17 @@ import { setBomEnv } from "./bom";
 // ---------------------------------------------------------------------------
 
 /**
- * Outbound: install the host-injected native emitter as the sink.
+ * Outbound: install the host-injected native emitter as the sink. When the
+ * host injects nothing (Perry embedded: JSONL over the stdio pipes), fall
+ * back to `process.stdout.write` — the embedded host splices the frontend's
+ * stdout into an anonymous pipe and parses the same JSONL protocol off it.
  * `typeof` probing is legal here — this file only ever runs on a dynamic
  * engine (QuickJS/node/perry), never under scriptc's static compiler.
+ *
+ * HISTORY NOTE: the 0ac0388 split dropped this stdout fallback ("no sink =
+ * drop"), which silently killed the Perry backend — its host injects no
+ * `__hostEmit`, so every hello/batch line was discarded and the window came
+ * up blank. The fallback is load-bearing for perry; keep it.
  */
 const hostEmit: ((line: string) => void) | null = (function (): ((line: string) => void) | null {
     if (typeof globalThis === "undefined") return null;
@@ -76,6 +84,15 @@ const hostEmit: ((line: string) => void) | null = (function (): ((line: string) 
 
 if (hostEmit !== null) {
     setSink(hostEmit);
+} else if (
+    typeof process !== "undefined" &&
+    process.stdout !== undefined &&
+    typeof process.stdout.write === "function"
+) {
+    // JSONL over stdout — child-process / Perry embedded / `pipe` transport.
+    setSink(function (line: string): void {
+        process.stdout.write(line + "\n");
+    });
 }
 
 /**

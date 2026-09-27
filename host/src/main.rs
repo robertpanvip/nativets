@@ -387,7 +387,7 @@ pub(crate) fn ingest_line(line: &str, ops_tx: &async_channel::Sender<Vec<Op>>) {
     }
 }
 
-fn run_ops_reader<R: std::io::Read + Send + 'static>(
+pub(crate) fn run_ops_reader<R: std::io::Read + Send + 'static>(
     r: R,
     ops_tx: async_channel::Sender<Vec<Op>>,
 ) {
@@ -647,11 +647,13 @@ fn main() {
         #[cfg(embedded)]
         Frontend::Embedded => {
             log!("[host] embedded mode: perry staticlib in-process");
-            let (ef, out_r) = embedded::launch(embedded::save_original_stderr());
+            // launch() starts the ops reader BEFORE perry_module_init: the
+            // init writes the whole mount batch synchronously and a ~4 KB
+            // anonymous-pipe buffer with no reader deadlocks it (blank window).
+            let ef = embedded::launch(embedded::save_original_stderr(), ops_tx.clone());
             log!("[host] perry_module_init done in {:?}", t_start.elapsed());
 
             run_event_writer(ef, ev_rx);
-            run_ops_reader(out_r, ops_tx);
 
             application()
                 .with_assets(gpui_kit_assets::Assets)

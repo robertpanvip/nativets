@@ -118,16 +118,23 @@ impl EmbeddedFrontend {
     }
 }
 
-/// Redirect stdio into pipes, initialize the Perry module, return:
-///   * the event writer (host → frontend)
-///   * the ops reader (frontend → host, JSONL lines)
+/// Redirect stdio into pipes, initialize the Perry module, return the event
+/// writer (host → frontend). The ops reader (frontend → host, JSONL lines) is
+/// spawned INSIDE this function, before `perry_module_init`, because the
+/// entry's top-level code writes the whole mount batch synchronously during
+/// init (~25 KB for the demo app). The default anonymous-pipe buffer is ~4 KB:
+/// with the reader only started after init returned, that write blocked
+/// forever and `perry_module_init` never came back — the blank window.
 ///
 /// `frontend_stderr_tee`: handle that receives a live copy of everything the
 /// frontend writes to its stderr (PERRY_UI_TRACE diagnostics etc.). Pass the
 /// ORIGINAL stderr handle saved before redirection — makes embedded mode as
 /// observable as child-process mode.
 #[cfg(embedded)]
-pub fn launch(frontend_stderr_tee: RawHandle) -> (EmbeddedFrontend, File) {
+pub fn launch(
+    frontend_stderr_tee: RawHandle,
+    ops_tx: async_channel::Sender<Vec<crate::Op>>,
+) -> EmbeddedFrontend {
     let (out_r, out_w) = make_pipe();
     let (in_r, in_w) = make_pipe();
     let (err_r, err_w) = make_pipe();
@@ -179,7 +186,13 @@ pub fn launch(frontend_stderr_tee: RawHandle) -> (EmbeddedFrontend, File) {
         });
     }
 
+    // Start the ops reader BEFORE init so the synchronous mount write inside
+    // `perry_module_init` always has a consumer (deadlock rationale above).
+    // Ops arriving before the window opens queue in the unbounded channel and
+    // are applied once `spawn_ops_apply` starts consuming.
+    crate::run_ops_reader(unsafe { File::from_raw_handle(out_r) }, ops_tx);
+
     unsafe { perry_module_init() };
 
-    (EmbeddedFrontend { stdin: in_w }, unsafe { File::from_raw_handle(out_r) })
+    (EmbeddedFrontend { stdin: in_w })
 }
