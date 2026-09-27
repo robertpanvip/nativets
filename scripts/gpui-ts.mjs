@@ -155,10 +155,13 @@ if (backend === "quickjs") {
  * UTF-8 存储的，所以 indexOf 就能验证。全部命中才算通过——陈旧 archive
  * 必然缺掉新版才有的字面量。
  */
-function verifyEmbeddedApp(exePath, genDir) {
+function verifyEmbeddedApp(exePath, genDir, onlyFiles = null) {
     if (process.env.PERRY_SKIP_EMBED_VERIFY === "1") return;
     const literals = [];
-    for (const f of readdirSync(genDir).filter((f) => f.endsWith(".ts"))) {
+    // onlyFiles：外部入口构建时 exe 只含入口编译图（perry 按需编译），
+    // 整棵 gen 树里 repo 前端的哨兵必然缺失——只扫入口自身的字面量。
+    const names = onlyFiles ?? readdirSync(genDir).filter((f) => f.endsWith(".ts"));
+    for (const f of names) {
         const src = readFileSync(path.join(genDir, f), "utf8");
         for (const m of src.matchAll(/"([^"\n]{4,})"/g)) {
             // gen 产物是 charset=ascii，CJK 全部写成 \uXXXX / \xNN
@@ -236,7 +239,15 @@ const useSizeOpt =
     existsSync(path.join(perrySrc, "crates", "perry-runtime", "Cargo.toml"));
 
 console.log("[gpui-ts] 1/4 esbuild 预转 TSX → ui/build/gen（perry 解析器无 JSX 分支）");
-const gen = await pretranspileTsx(uiDir, path.basename(entryPath));
+// 外部入口（ui/src 之外）：把入口源码注入 gen/，否则 perry 只编译 gen/ 树、
+// 根本看不到入口文件；同时 pretranspile 会把 `from "nativets"` 重写为
+// gen/ 内 runtime 模块的相对路径（perry 自行解析 import、无 node_modules 走查）。
+const entryInSrc =
+    existsSync(entryPath) &&
+    path.relative(uiDir, entryPath).startsWith("src" + path.sep);
+const gen = await pretranspileTsx(uiDir, path.basename(entryPath), entryInSrc ? {} : {
+    source: readFileSync(entryPath, "utf8"),
+});
 
 console.log(`[gpui-ts] 2/4 perry compile ${gen.entryRel} → build/${libBase}.lib (staticlib)`);
 run(
@@ -280,4 +291,10 @@ if (!existsSync(HOST_EXE)) {
 
 console.log("[gpui-ts] 4/4 拷贝产物");
 emit();
-verifyEmbeddedApp(out, gen.dir);
+// 外部入口：exe 编译图只含入口（perry 从 entryRel 按需编译），哨兵校验
+// 限定入口文件自身；repo 内入口（in-src）才扫整棵 gen 树。
+verifyEmbeddedApp(
+    out,
+    gen.dir,
+    entryInSrc ? null : [path.basename(gen.entry)]
+);

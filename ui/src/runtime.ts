@@ -57,6 +57,7 @@ import {
     pumpPulses,
 } from "./io";
 import { setBomEnv } from "./bom";
+import { hasSink } from "./io-core";
 
 // ---------------------------------------------------------------------------
 // QuickJS / Node transport wiring (dynamic-engine only)
@@ -75,6 +76,12 @@ import { setBomEnv } from "./bom";
  * `__hostEmit`, so every hello/batch line was discarded and the window came
  * up blank. The fallback is load-bearing for perry; keep it.
  */
+// io-core now self-wires a default sink at its own top level (hostEmit
+// probe → stdout fallback), so plain `import "./io"` entries get a working
+// channel without this module. This block stays for compatibility and is
+// a no-op when io-core already wired something (hasSink guard) — no double
+// wrapping of stdout.
+
 const hostEmit: ((line: string) => void) | null = (function (): ((line: string) => void) | null {
     if (typeof globalThis === "undefined") return null;
     const g = globalThis as { __hostEmit?: unknown };
@@ -82,17 +89,19 @@ const hostEmit: ((line: string) => void) | null = (function (): ((line: string) 
     return null;
 })();
 
-if (hostEmit !== null) {
-    setSink(hostEmit);
-} else if (
-    typeof process !== "undefined" &&
-    process.stdout !== undefined &&
-    typeof process.stdout.write === "function"
-) {
-    // JSONL over stdout — child-process / Perry embedded / `pipe` transport.
-    setSink(function (line: string): void {
-        process.stdout.write(line + "\n");
-    });
+if (!hasSink()) {
+    if (hostEmit !== null) {
+        setSink(hostEmit);
+    } else if (
+        typeof process !== "undefined" &&
+        process.stdout !== undefined &&
+        typeof process.stdout.write === "function"
+    ) {
+        // JSONL over stdout — child-process / Perry embedded / `pipe` transport.
+        setSink(function (line: string): void {
+            process.stdout.write(line + "\n");
+        });
+    }
 }
 
 /**

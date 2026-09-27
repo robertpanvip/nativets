@@ -41,6 +41,17 @@ declare const process: HostProcess;
 /** Emitted by the host in `direct` transport mode (QuickJS in-process). */
 declare function __hostEmit(line: string): void;
 
+/**
+ * The published package name for the runtime (`import … from "nativets"`).
+ * The perry pretranspile rewrites it to `./io` before AOT compilation; the
+ * QuickJS esbuild plugin maps it to the package runtime; editor tsc sees
+ * this declaration so demos in `src/` type-check without a node_modules
+ * install of the package itself. The surface mirrors `types/index.d.ts`.
+ */
+declare module "nativets" {
+    export * from "./runtime";
+}
+
 // ---------------------------------------------------------------------------
 // console
 // ---------------------------------------------------------------------------

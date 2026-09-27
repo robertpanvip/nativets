@@ -43,6 +43,52 @@ export function hasSink(): boolean {
     return sink !== null;
 }
 
+// --- default sink self-wiring ----------------------------------------------
+//
+// Historical contract: "platform entries MUST call setSink()". That leaked
+// transport wiring into app entries — an entry importing `./io` directly
+// (instead of `./runtime`, which owned the wiring) came up with no sink, and
+// under the perry embedded host (which reads JSONL off the frontend's
+// stdout and injects no `__hostEmit`) every op was silently dropped: blank
+// window, default title, zero diagnostics. The wiring therefore lives here,
+// at the protocol core, so ANY entry gets a working channel:
+//
+//   1. `__hostEmit` host function (QuickJS bootstrap injects it — direct
+//      mode, no extra thread);
+//   2. `process.stdout.write` (perry embedded splices stdout into the ops
+//      pipe; node/`nativets dev` reads it too);
+//   3. nothing found → stay unwired; explicit setSink() still wins.
+//
+// Platform entries that need a custom channel (sc-main.ts's host-pull
+// outbox) simply call setSink() at their own top level, which runs AFTER
+// this module's top level — the explicit call overwrites this default.
+// The `typeof` probes are dynamic-engine-only: scriptc never compiles this
+// file's top level into a static graph without the sc-main entry wrapping
+// it (and sc-main's own setSink overrides this block wholesale).
+
+if (sink === null) {
+    if (typeof globalThis === "object" && globalThis !== null) {
+        const g = globalThis as { __hostEmit?: unknown };
+        if (typeof g.__hostEmit === "function") {
+            sink = g.__hostEmit as (line: string) => void;
+        }
+    }
+}
+if (sink === null) {
+    if (typeof process === "object" && process !== null) {
+        const p = process as unknown as { stdout?: { write?: unknown } };
+        if (
+            p.stdout !== undefined &&
+            typeof p.stdout.write === "function"
+        ) {
+            const out = p.stdout as { write: (s: string) => void };
+            sink = function (line: string): void {
+                out.write(line + "\n");
+            };
+        }
+    }
+}
+
 export const stats = {
     batchesSent: 0,
     opsSent: 0,

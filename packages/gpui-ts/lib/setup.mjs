@@ -158,6 +158,20 @@ function mergeRustComponents(home) {
     for (const comp of comps) {
         try { fs.rmSync(path.join(home, comp), { recursive: true, force: true }); } catch { /* best effort */ }
     }
+    // The optional bulk components (docs, source analysis, llvm-tools, …) are
+    // not needed for building nativets apps — each is 100 MB – 1.5 GB. Remove
+    // them so the portable tree stays ~2 GB instead of ~4 GB.
+    const drop = [
+        "rust-docs",
+        "rust-docs-json-preview",
+        "rust-analysis-x86_64-pc-windows-msvc",
+        "llvm-tools-preview",
+        "llvm-bitcode-linker-preview",
+        "rust-analyzer-preview",
+    ];
+    for (const name of drop) {
+        try { fs.rmSync(path.join(home, name), { recursive: true, force: true }); } catch { /* best effort */ }
+    }
 }
 
 function copyInto(srcDir, destDir) {
