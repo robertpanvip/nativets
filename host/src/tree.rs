@@ -231,7 +231,28 @@ impl Tree {
     }
 
     /// Applies a batch; returns a window title if a `setTitle` op was present.
+    ///
+    /// Every `SetValue` seen (even for unknown ids) is collected into
+    /// `set_values` — the optimistic-update layer in `HostView` uses it to
+    /// clear its per-node selection overrides once the JS echo lands.
+    pub fn apply_with_set_values(
+        &mut self,
+        ops: &[Op],
+        set_values: &mut Vec<(u64, String)>,
+    ) -> Option<String> {
+        set_values.clear();
+        self.apply_inner(ops, Some(set_values))
+    }
+
     pub fn apply(&mut self, ops: &[Op]) -> Option<String> {
+        self.apply_inner(ops, None)
+    }
+
+    fn apply_inner(
+        &mut self,
+        ops: &[Op],
+        mut set_values: Option<&mut Vec<(u64, String)>>,
+    ) -> Option<String> {
         let mut title = None;
         for op in ops {
             match op {
@@ -261,6 +282,9 @@ impl Tree {
                         if changed {
                             n.caret = value.chars().count();
                         }
+                    }
+                    if let Some(sink) = set_values.as_deref_mut() {
+                        sink.push((*id, value.clone()));
                     }
                 }
                 Op::SetCanvas { id, cmds } => {

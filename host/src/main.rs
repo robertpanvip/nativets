@@ -164,7 +164,7 @@ macro_rules! log {
 /// *missing something*. Comparing this count against the frontend's own
 /// `opsSent` is what separates "the frontend never emitted it" from "the host
 /// dropped it" — the two failures look identical on screen.
-fn log_ops_enabled() -> bool {
+pub(crate) fn log_ops_enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| matches!(std::env::var("GPUI_TS_LOG_OPS"), Ok(v) if v != "0"))
 }
@@ -293,6 +293,14 @@ fn apply_app_palette(cx: &mut App) {
 struct HostView {
     tree: Tree,
     event_tx: mpsc::Sender<String>,
+    /// Ops inbound channel, drained synchronously at the top of every render
+    /// (`drain_ops`). `Some` in every backend today; a backend that wires ops
+    /// elsewhere (e.g. its own GPUI task) can pass `None` to opt out.
+    ops_rx: Option<async_channel::Receiver<Vec<Op>>>,
+    /// `setTitle` op arriving inside a `drain_ops` batch: `Tree::apply` returns
+    /// the title but the platform window handle is only reachable from
+    /// `render(&mut Window)`, so it is parked here and flushed at frame start.
+    pending_title: Option<String>,
     /// `Some` in QuickJS mode: window geometry is pushed to the engine as
     /// `{"t":"bom",…}` lines whenever it changes. `None` elsewhere — the Perry
     /// and node frontends have no BOM to receive it.
@@ -359,6 +367,14 @@ struct HostView {
     /// One gpui-component `ColorPickerState` per `colorpicker` node.
     color_states: HashMap<u64, Entity<ColorPickerState>>,
     color_reported: HashMap<u64, String>,
+    /// Optimistic selection overrides for stateful picker widgets (tabs/radio/
+    /// pagination): written synchronously in the click callback so the next
+    /// frame shows the new selection *before* the JS round-trip (~1 frame
+    /// period + engine latency, measured ≈88 ms) echoes the `setValue` back.
+    /// The echo applies the same value, so clearing the override on apply is
+    /// visually a no-op — unless the app rejects the click, in which case the
+    /// override clearing correctly snaps back to the app-owned state.
+    tab_override: HashMap<u64, usize>,
 }
 pub(crate) fn ingest_line(line: &str, ops_tx: &async_channel::Sender<Vec<Op>>) {
     let Ok(v) = serde_json::from_str::<Value>(line) else {
@@ -393,7 +409,10 @@ pub(crate) fn ingest_line(line: &str, ops_tx: &async_channel::Sender<Vec<Op>>) {
                 let _ = ops_tx.send_blocking(parsed);
                 if log_ops_enabled() {
                     let seen = OPS_SEEN.fetch_add(total, Ordering::Relaxed) + total;
-                    log!("[host] batch ops={total} dropped={dropped} total={seen}");
+                    log!(
+                        "[host] batch ops={total} dropped={dropped} total={seen} t={}",
+                        now_ms()
+                    );
                 }
             }
         }
@@ -642,7 +661,7 @@ fn main() {
             application()
                 .with_assets(gpui_kit_assets::Assets)
                 .run(move |cx: &mut App| {
-                let handle = open_host_window(cx, ev_tx, None);
+                let handle = open_host_window(cx, ev_tx, ops_rx.clone(), None);
                 spawn_ops_apply(cx, handle, ops_rx);
 
                 // watchdog: if the frontend dies, close the app
@@ -675,7 +694,7 @@ fn main() {
             application()
                 .with_assets(gpui_kit_assets::Assets)
                 .run(move |cx: &mut App| {
-                let handle = open_host_window(cx, ev_tx, None);
+                let handle = open_host_window(cx, ev_tx, ops_rx.clone(), None);
                 spawn_ops_apply(cx, handle, ops_rx);
 
                 // Drive Perry's event loop from the GPUI executor: drains
@@ -726,7 +745,7 @@ fn main() {
             application()
                 .with_assets(gpui_kit_assets::Assets)
                 .run(move |cx: &mut App| {
-                let handle = open_host_window(cx, ev_tx, Some(metrics));
+                let handle = open_host_window(cx, ev_tx, ops_rx.clone(), Some(metrics));
                 spawn_ops_apply(cx, handle, ops_rx);
                 spawn_dialog_host(cx, handle, dialog_rx);
                 // The QuickJS engine self-drives on its own thread (tick +
@@ -754,7 +773,7 @@ fn main() {
             application()
                 .with_assets(gpui_kit_assets::Assets)
                 .run(move |cx: &mut App| {
-                let handle = open_host_window(cx, ev_tx, None);
+                let handle = open_host_window(cx, ev_tx, ops_rx.clone(), None);
                 spawn_ops_apply(cx, handle, ops_rx);
                 // The scriptc driver thread self-drives (fixed 10 ms quantum);
                 // no host-loop timer needed here either.
@@ -780,6 +799,7 @@ fn run_event_queuer(sink: scriptc::EventSink, ev_rx: mpsc::Receiver<String>) {
 fn open_host_window(
     cx: &mut App,
     ev_tx: mpsc::Sender<String>,
+    ops_rx: async_channel::Receiver<Vec<Op>>,
     metrics: Option<Arc<bom::WindowMetrics>>,
 ) -> gpui::WindowHandle<gpui_component::Root> {
     // gpui-component's global state (theme, root rendering, input machinery).
@@ -818,6 +838,8 @@ fn open_host_window(
             let host = cx.new(|_| HostView {
                 tree: Tree::new(),
                 event_tx: ev_tx,
+                ops_rx: Some(ops_rx),
+                pending_title: None,
                 metrics,
                 dialog: None,
                 focus_handles: HashMap::new(),
@@ -838,6 +860,7 @@ fn open_host_window(
                 combobox_reported: HashMap::new(),
                 color_states: HashMap::new(),
                 color_reported: HashMap::new(),
+                tab_override: HashMap::new(),
             });
             // `Root::new` needs `&mut Context<Root>`, so it is built by a second
             // `cx.new` rather than inline in the window closure.
@@ -903,6 +926,19 @@ fn spawn_ops_apply(
 ) {
     cx.spawn(async move |cx| {
         while let Ok(ops) = ops_rx.recv().await {
+            // Split the latency: channel wait (ops sat in the queue before the
+            // GPUI executor polled us) vs apply itself. Log EVERY batch when
+            // ops-logging is on — the heartbeat (clock) batches give a send→recv
+            // baseline that click batches must be compared against.
+            let has_set_value = ops.iter().any(|o| matches!(o, tree::Op::SetValue { .. }));
+            if log_ops_enabled() {
+                log!(
+                    "[host] recv batch ops={}{} t={}",
+                    ops.len(),
+                    if has_set_value { " incl SetValue" } else { "" },
+                    now_ms()
+                );
+            }
             let _ = cx.update(|cx| {
                 let _ = handle.update(cx, |_root, window, cx| {
                     // The app view lives inside Root (see `open_host_window`);
@@ -913,8 +949,25 @@ fn spawn_ops_apply(
                         return;
                     };
                     host.update(cx, |view, cx| {
-                        if let Some(title) = view.tree.apply(&ops) {
+                        let mut set_values: Vec<(u64, String)> = Vec::new();
+                        if let Some(title) =
+                            view.tree.apply_with_set_values(&ops, &mut set_values)
+                        {
                             window.set_window_title(&title);
+                        }
+                        // The app's JS has caught up with any optimistic click:
+                        // drop the overrides it echoed (same value) or rejected
+                        // (snaps back).
+                        for (id, _) in &set_values {
+                            view.tab_override.remove(id);
+                        }
+                        if log_ops_enabled() {
+                            log!(
+                                "[host] applied {} ops{} t={}",
+                                ops.len(),
+                                if has_set_value { " incl SetValue" } else { "" },
+                                now_ms()
+                            );
                         }
                         if dump_tree_enabled() && ops.len() >= 32 {
                             log!("[host] tree after {} ops:\n{}", ops.len(), view.tree.dump());

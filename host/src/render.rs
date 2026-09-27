@@ -453,6 +453,7 @@ impl HostView {
         self.combobox_reported.retain(|k, _| live.contains(k));
         self.color_states.retain(|k, _| live.contains(k));
         self.color_reported.retain(|k, _| live.contains(k));
+        self.tab_override.retain(|k, _| live.contains(k));
     }
 
     pub(crate) fn sync_metrics(&self, window: &mut Window, cx: &mut Context<Self>) {
@@ -549,10 +550,61 @@ impl HostView {
         }
         cx.notify();
     }
+
+    /// Drain every pending ops batch at the top of a frame, synchronously.
+    ///
+    /// Why: ops cross from the engine thread via async_channel into a spawned
+    /// GPUI task. On Windows that wake-up path has a flag race —
+    /// `run_foreground_task` clears `wake_posted` and then `try_pop`s as two
+    /// separate steps, so a cross-thread `dispatch_on_main_thread` landing
+    /// between those steps sees a stale `true` and skips its `PostMessageW`.
+    /// The queued runnable then waits for the next unrelated main-thread
+    /// posting (spinner/clock notifications arrive at frame rate), which
+    /// measured a stable ~88ms click→apply lag on the QuickJS backend (perry
+    /// hides the bug because its engine emits from a main-thread GPUI task and
+    /// lands in the same drain quantum).
+    ///
+    /// Draining here applies ops *before* the element tree is built in the
+    /// same frame — click-to-highlight in ≤1 vsync, no async hop, no race.
+    /// `spawn_ops_apply` stays attached as the fallback consumer for frames
+    /// that never come (fully static UI): the channel is FIFO and both
+    /// consumers pop-and-apply atomically, so batch order is preserved no
+    /// matter which one wins.
+    pub(crate) fn drain_ops(&mut self, window: &mut Window) {
+        let Some(ops_rx) = self.ops_rx.as_ref() else { return };
+        let mut set_values: Vec<(u64, String)> = Vec::new();
+        while let Ok(ops) = ops_rx.try_recv() {
+            let has_set_value =
+                ops.iter().any(|o| matches!(o, crate::tree::Op::SetValue { .. }));
+            if crate::log_ops_enabled() && has_set_value {
+                log!("[host] frame-drain recv incl SetValue t={}", now_ms());
+            }
+            if let Some(title) = self.tree.apply_with_set_values(&ops, &mut set_values) {
+                self.pending_title = Some(title);
+            }
+            // The app's JS has caught up with any optimistic click: drop the
+            // overrides it echoed (same value) or rejected (snaps back).
+            for (id, _) in &set_values {
+                self.tab_override.remove(id);
+            }
+            if crate::log_ops_enabled() && has_set_value {
+                log!("[host] frame-drain applied {} ops t={}", ops.len(), now_ms());
+            }
+        }
+        if let Some(title) = self.pending_title.take() {
+            window.set_window_title(&title);
+        }
+    }
 }
 
 impl Render for HostView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Ops first: batches queued by the engine thread land in this frame's
+        // element tree (see `drain_ops` for why the spawned-task path races).
+        if crate::log_ops_enabled() {
+            log!("[host] render enter t={}", now_ms());
+        }
+        self.drain_ops(window);
         self.sync_metrics(window, cx);
         let root = self
             .build_node(0, false, window, cx)

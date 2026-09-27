@@ -405,16 +405,25 @@ impl HostView {
                 // selected index (or label). A click echoes the chosen index as a
                 // `change` event; the app owns the selection.
                 let options = node.select_options();
-                let idx = option_index(&options, &node.value.clone().unwrap_or_default());
+                let idx = self.tab_override.get(&id).copied().or_else(|| {
+                    option_index(&options, &node.value.clone().unwrap_or_default())
+                });
                 let mut group = RadioGroup::new(element_id).selected_index(idx);
                 let tx = self.event_tx.clone();
-                group = group.on_click(move |i: &usize, _window, _cx| {
+                // Optimistic update — same rationale as the tabs arm.
+                let weak = cx.entity().downgrade();
+                group = group.on_click(move |i: &usize, window, cx| {
                     let msg = json!({
                         "t": "event", "target": id, "kind": "change", "value": i.to_string()
                     })
                     .to_string();
                     log!("[host] ev change(radio) id={id} t={} {msg}", now_ms());
                     let _ = tx.send(msg);
+                    let clicked = *i;
+                    let _ = weak.update(cx, |view, _| {
+                        view.tab_override.insert(id, clicked);
+                    });
+                    window.refresh();
                 });
                 for (i, opt) in options.iter().enumerate() {
                     group = group.child(
@@ -428,17 +437,34 @@ impl HostView {
                 // Tab bar: `options` become the tab labels, `value` is the
                 // selected index. A click echoes the chosen index as `change`.
                 let options = node.select_options();
-                let idx = option_index(&options, &node.value.clone().unwrap_or_default())
-                    .unwrap_or(0);
+                let idx = self
+                    .tab_override
+                    .get(&id)
+                    .copied()
+                    .unwrap_or_else(|| {
+                        option_index(&options, &node.value.clone().unwrap_or_default())
+                            .unwrap_or(0)
+                    });
                 let mut bar = TabBar::new(element_id).selected_index(idx);
                 let tx = self.event_tx.clone();
-                bar = bar.on_click(move |i: &usize, _window, _cx| {
+                // Optimistic update: the host already knows the clicked index,
+                // so record it and force a frame — the highlight moves within
+                // one vsync instead of after the full JS round-trip (~88 ms,
+                // one frame period + engine-side latency). The echo `setValue`
+                // clears the override; same value, so nothing re-flashes.
+                let weak = cx.entity().downgrade();
+                bar = bar.on_click(move |i: &usize, window, cx| {
                     let msg = json!({
                         "t": "event", "target": id, "kind": "change", "value": i.to_string()
                     })
                     .to_string();
                     log!("[host] ev change(tabs) id={id} t={} {msg}", now_ms());
                     let _ = tx.send(msg);
+                    let clicked = *i;
+                    let _ = weak.update(cx, |view, _| {
+                        view.tab_override.insert(id, clicked);
+                    });
+                    window.refresh();
                 });
                 for opt in options.iter() {
                     bar = bar.child(Tab::new().label(opt.clone()));
@@ -453,23 +479,32 @@ impl HostView {
                     .or_else(|| Some(node.select_options().len() as f32))
                     .unwrap_or(1.0)
                     .max(1.0) as usize;
-                let page = node
-                    .value
-                    .as_deref()
-                    .and_then(|v| v.parse::<usize>().ok())
-                    .filter(|p| *p >= 1 && *p <= total)
-                    .unwrap_or(1);
+                let page = self.tab_override.get(&id).copied().map(|p| p + 1).or_else(|| {
+                    node.value
+                        .as_deref()
+                        .and_then(|v| v.parse::<usize>().ok())
+                })
+                .filter(|p| *p >= 1 && *p <= total)
+                .unwrap_or(1);
                 let mut pg = Pagination::new(element_id)
                     .total_pages(total)
                     .current_page(page);
                 let tx = self.event_tx.clone();
-                pg = pg.on_click(move |p: &usize, _window, _cx| {
+                // Optimistic update — same rationale as the tabs arm.
+                let weak = cx.entity().downgrade();
+                pg = pg.on_click(move |p: &usize, window, cx| {
                     let msg = json!({
                         "t": "event", "target": id, "kind": "change", "value": p.to_string()
                     })
                     .to_string();
                     log!("[host] ev change(pagination) id={id} t={} {msg}", now_ms());
                     let _ = tx.send(msg);
+                    let clicked = *p;
+                    let _ = weak.update(cx, |view, _| {
+                        // pagination is 1-based; the override stores 0-based.
+                        view.tab_override.insert(id, clicked.saturating_sub(1));
+                    });
+                    window.refresh();
                 });
                 pg.into_any_element()
             }
