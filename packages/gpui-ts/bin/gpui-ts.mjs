@@ -14,6 +14,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { ESBUILD_OPTS, hostPathFor, nativetsRuntimePlugin, packExe } from "../lib/build.mjs";
+import { bundleTyped, collectGraph } from "../lib/dev-typed.mjs";
 import { ensureRust, ensurePerry, ensureXwinSdk, nativetsRoot } from "../lib/setup.mjs";
 import { resolveToolchain, toolchainSummary } from "../lib/toolchain.mjs";
 
@@ -70,7 +71,12 @@ async function loadEsbuild() {
 }
 
 function parseFlags(argv) {
-    const out = { entry: null, out: null, backend: process.env.GPUI_TS_BACKEND ?? "quickjs" };
+    const out = {
+        entry: null, out: null,
+        backend: process.env.GPUI_TS_BACKEND ?? "quickjs",
+        // `nativets dev --esbuild` opts out of the typed pipeline.
+        esbuildDev: false,
+    };
     for (let i = 0; i < argv.length; i++) {
         const a = argv[i];
         if (a === "-o" || a === "--out") {
@@ -79,6 +85,8 @@ function parseFlags(argv) {
         } else if (a === "--backend" || a === "-b") {
             out.backend = argv[++i];
             if (out.backend === undefined) fail(`missing backend name after ${a}`);
+        } else if (a === "--esbuild") {
+            out.esbuildDev = true;
         } else if (!a.startsWith("-")) {
             if (out.entry === null) out.entry = a;
             else fail(`unexpected extra argument: ${a}`);
@@ -232,16 +240,145 @@ async function cmdRun(argv) {
 /**
  * `nativets dev` — the Go-like inner loop.
  *
- * esbuild's context API gives us watch mode + dependency discovery (it only
- * reports the files that actually made it into the bundle). On every rebuild
- * we repack host+bundle and restart the app window, so the user always looks
- * at a live process. Ctrl+C quits.
+ * Two pipelines:
+ *   • typed (default, no esbuild): TypeScript compiler API lowers JSX and
+ *     erases types (`lib/dev-typed.mjs`), files are recompiled individually
+ *     on change (per-module mtime cache), and the new bundle is hot-reloaded
+ *     into the RUNNING app — no window restart. The host (quickjs backend)
+ *     watches the bundle file (`QUICKJS_BUNDLE`) and re-evals it.
+ *   • esbuild (`--esbuild`): the legacy watch + repack + restart loop.
+ *
+ * Hot reload contract: the host clears the retained tree (`clear root`) and
+ * re-evals the IIFE bundle; module state (ids, signals, timers) resets inside
+ * the fresh evaluation. Chrome DevTools (GPUI_TS_CDP=port) keeps working
+ * across reloads because only the tree content changes, not the window.
  */
 async function cmdDev(argv) {
-    const { entry, out } = parseFlags(argv);
+    const { entry, out, esbuildDev } = parseFlags(argv);
     if (entry === null) fail("dev needs an entry file");
     const entryPath = resolveEntry(entry);
     const outPath = path.resolve(out === null ? defaultOut(entry) : out);
+
+    if (esbuildDev) return cmdDevEsbuild(entryPath, outPath);
+
+    // ---- typed pipeline (default) ------------------------------------------
+    const host = requireHost();
+    const runtimeEntry = path.join(pkgRoot, "runtime", "index.js");
+
+    // Dev bundle lives next to the exe; the host polls it via QUICKJS_BUNDLE.
+    const bundlePath = path.join(
+        os.tmpdir(),
+        `nativets-dev-${path.basename(entryPath).replace(/\.[jt]sx?$/, "")}-${process.pid}.js`,
+    );
+    // Per-file mtime cache: only changed modules recompile (the tsc lower+
+    // transpile of the full graph is ~100ms; the cache keeps saves snappy on
+    // big graphs).
+    let srcMtimes = new Map();
+
+    async function compile() {
+        const js = await bundleTyped(entryPath, { nativetsRuntime: runtimeEntry });
+        // Atomic write (write+rename) so the host never evals a half file.
+        const tmp = bundlePath + ".tmp";
+        fs.writeFileSync(tmp, js, "utf8");
+        fs.renameSync(tmp, bundlePath);
+        return js.length;
+    }
+
+    function graphMtimes() {
+        // Cheap freshness probe: entry graph + runtime graph mtimes.
+        const files = [];
+        try {
+            files.push(...collectGraph(entryPath));
+            files.push(...collectGraph(runtimeEntry));
+        } catch { /* compile errors surface in compile() properly */ }
+        const mt = new Map();
+        for (const f of files) {
+            try { mt.set(f, fs.statSync(f).mtimeMs); } catch { /* gone */ }
+        }
+        return mt;
+    }
+
+    // Spawn the host pointed at the dev bundle. Env carries CDP + reload.
+    let child = null;
+    function spawnHost() {
+        child = spawn(host, [], {
+            stdio: "inherit",
+            env: {
+                ...process.env,
+                QUICKJS_BUNDLE: bundlePath,
+                // DevTools UI/style debugging on by default in dev; opt out
+                // with GPUI_TS_CDP=0.
+                GPUI_TS_CDP: process.env.GPUI_TS_CDP ?? "9222",
+            },
+        });
+        child.on("exit", (code) => {
+            if (!child.killed) {
+                child = null;
+                console.log(`nativets dev: app exited (${code ?? "signal"}) — save to relaunch`);
+            }
+        });
+    }
+
+    console.log(`nativets dev ${VERSION} (typed pipeline) — watching ${path.basename(entryPath)}`);
+    console.log(`  bundle: ${bundlePath}`);
+    console.log(`  devtools: http://127.0.0.1:9222/json  (Ctrl+C to quit)`);
+
+    let building = false;
+    let pending = false;
+    async function rebuild() {
+        if (building) { pending = true; return; }
+        building = true;
+        try {
+            const t0 = Date.now();
+            const bytes = await compile();
+            console.log(`nativets dev: compiled ${(bytes / 1024).toFixed(1)} KB in ${Date.now() - t0}ms — hot reloading`);
+            if (child === null) spawnHost();
+            // The host polls the bundle file (250ms tick); nothing to push.
+        } catch (e) {
+            console.error(`nativets dev: ${String(e.message ?? e).split("\n")[0]}`);
+        } finally {
+            building = false;
+            if (pending && !quitting) { pending = false; rebuild(); }
+        }
+    }
+
+    await rebuild();
+    srcMtimes = graphMtimes();
+
+    let quitting = false;
+    const poller = setInterval(() => {
+        if (quitting) return;
+        const now = graphMtimes();
+        let changed = now.size !== srcMtimes.size;
+        if (!changed) {
+            for (const [f, m] of now) {
+                const old = srcMtimes.get(f);
+                if (old === undefined || old !== m) { changed = true; break; }
+            }
+        }
+        if (changed) { srcMtimes = now; rebuild(); }
+        // Dead app (user closed the window) + a save relaunches via rebuild's
+        // spawnHost; nothing else needed here.
+    }, 300);
+
+    const shutdown = () => {
+        quitting = true;
+        clearInterval(poller);
+        if (child !== null) child.kill();
+        fs.rmSync(bundlePath, { force: true });
+        process.exit(0);
+    };
+    process.on("SIGINT", shutdown);
+    process.on("SIGTERM", shutdown);
+    setInterval(() => {}, 1 << 30);
+}
+
+/**
+ * Legacy esbuild watch loop (`nativets dev --esbuild`): rebuild the whole
+ * bundle on change, repack host+bundle, restart the window.
+ */
+async function cmdDevEsbuild(entryPath, outPath) {
+    const { entry } = { entry: entryPath };
     const host = requireHost();
     const esbuild = await loadEsbuild();
 

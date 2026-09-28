@@ -605,6 +605,12 @@ impl Render for HostView {
             log!("[host] render enter t={}", now_ms());
         }
         self.drain_ops(window);
+        // CDP (DevTools) tree reads: serve any queued request snapshots here,
+        // after ops have applied, so the DOM pane reflects this frame's tree.
+        #[cfg(quickjs)]
+        if let Some(sh) = self.cdp_shared.as_ref() {
+            sh.drain_requests(&self.tree);
+        }
         self.sync_metrics(window, cx);
         let root = self
             .build_node(0, false, window, cx)

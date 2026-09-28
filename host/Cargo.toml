@@ -46,6 +46,12 @@ chrono = "0.4"
 # OS CSPRNG behind crypto.getRandomValues / crypto.randomUUID (bom.rs).
 # Already in the graph transitively, so this pulls in no new download.
 getrandom = "0.2"
+# Minimal Chrome DevTools Protocol server (GPUI_TS_CDP=port): a std-thread
+# WebSocket + a tiny HTTP /json endpoint. Only `native-tls`-less core — the
+# handshake lives in the protocol module, the engine in cdp.rs.
+tungstenite = { version = "0.21", default-features = false, features = ["handshake"] }
+# SHA-1 for the CDP WebSocket handshake (Sec-WebSocket-Accept).
+sha1_smol = "1"
 
 [build-dependencies]
 # Compiles the vendored scriptc runtime + the generated program TU with the

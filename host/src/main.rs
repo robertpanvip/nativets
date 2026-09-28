@@ -49,6 +49,13 @@ mod embedded;
 #[cfg(quickjs)]
 mod quickjs;
 
+/// Chrome DevTools Protocol server (UI/style debugging). `GPUI_TS_CDP=9222`
+/// turns it on; threads and the GPUI-side bridge live in `cdp`/`cdp_state`.
+#[cfg_attr(not(quickjs), allow(dead_code))]
+mod cdp;
+#[cfg_attr(not(quickjs), allow(dead_code))]
+mod cdp_state;
+
 /// scriptc AOT backend (cfg `scriptc`): either a statically linked MSVC
 /// runtime + program TU (cfg `scriptc_static`, built by `ui/build-scriptc.mjs`
 /// — no DLL, shares the rustc UCRT), or the legacy mingw DLL loaded with
@@ -375,6 +382,10 @@ struct HostView {
     /// visually a no-op — unless the app rejects the click, in which case the
     /// override clearing correctly snaps back to the app-owned state.
     tab_override: HashMap<u64, usize>,
+    /// CDP bridge (quickjs builds): served tree reads at frame start, so the
+    /// DevTools DOM/CSS panes see the same retained tree the renderer walks.
+    #[allow(dead_code)]
+    cdp_shared: Option<Arc<cdp_state::CdpShared>>,
 }
 pub(crate) fn ingest_line(line: &str, ops_tx: &async_channel::Sender<Vec<Op>>) {
     let Ok(v) = serde_json::from_str::<Value>(line) else {
@@ -661,7 +672,7 @@ fn main() {
             application()
                 .with_assets(gpui_kit_assets::Assets)
                 .run(move |cx: &mut App| {
-                let handle = open_host_window(cx, ev_tx, ops_rx.clone(), None);
+                let handle = open_host_window(cx, ev_tx, ops_rx.clone(), None, None);
                 spawn_ops_apply(cx, handle, ops_rx);
 
                 // watchdog: if the frontend dies, close the app
@@ -694,7 +705,7 @@ fn main() {
             application()
                 .with_assets(gpui_kit_assets::Assets)
                 .run(move |cx: &mut App| {
-                let handle = open_host_window(cx, ev_tx, ops_rx.clone(), None);
+                let handle = open_host_window(cx, ev_tx, ops_rx.clone(), None, None);
                 spawn_ops_apply(cx, handle, ops_rx);
 
                 // Drive Perry's event loop from the GPUI executor: drains
@@ -729,11 +740,20 @@ fn main() {
             let metrics = bom::WindowMetrics::new(WINDOW_W, WINDOW_H, 1.0, 0.0, 0.0);
             let (dialog_tx, dialog_rx) = async_channel::unbounded::<bom::DialogRequest>();
 
+            // CDP (UI/style debugging) — off unless GPUI_TS_CDP=<port>. The
+            // shared bridge is always constructed in quickjs mode (cheap);
+            // only the server threads are conditional.
+            let cdp_shared = cdp_state::CdpShared::new(ops_tx.clone());
+            if let Some(port) = cdp::enabled_port() {
+                cdp::launch(port, cdp_shared.clone());
+            }
+
             let host = quickjs::launch(
                 quickjs::save_original_stderr(),
                 ops_tx.clone(),
                 metrics.clone(),
                 dialog_tx,
+                Some(cdp_shared.clone()),
             );
             log!("[host] quickjs engine booted in {:?}", t_start.elapsed());
 
@@ -742,12 +762,15 @@ fn main() {
             run_event_injector(host.sink.clone(), ev_rx);
 
             let sink = host.sink.clone();
+            let cdp_for_view = cdp_shared.clone();
+            let cdp_for_pump = cdp_shared.clone();
             application()
                 .with_assets(gpui_kit_assets::Assets)
                 .run(move |cx: &mut App| {
-                let handle = open_host_window(cx, ev_tx, ops_rx.clone(), Some(metrics));
+                let handle = open_host_window(cx, ev_tx, ops_rx.clone(), Some(metrics), Some(cdp_for_view));
                 spawn_ops_apply(cx, handle, ops_rx);
                 spawn_dialog_host(cx, handle, dialog_rx);
+                spawn_cdp_pump(cx, handle, cdp_for_pump);
                 // The QuickJS engine self-drives on its own thread (tick +
                 // park/unpark); no perry_poll loop needed here.
             });
@@ -773,7 +796,7 @@ fn main() {
             application()
                 .with_assets(gpui_kit_assets::Assets)
                 .run(move |cx: &mut App| {
-                let handle = open_host_window(cx, ev_tx, ops_rx.clone(), None);
+                let handle = open_host_window(cx, ev_tx, ops_rx.clone(), None, None);
                 spawn_ops_apply(cx, handle, ops_rx);
                 // The scriptc driver thread self-drives (fixed 10 ms quantum);
                 // no host-loop timer needed here either.
@@ -801,6 +824,7 @@ fn open_host_window(
     ev_tx: mpsc::Sender<String>,
     ops_rx: async_channel::Receiver<Vec<Op>>,
     metrics: Option<Arc<bom::WindowMetrics>>,
+    #[allow(unused_variables)] cdp_shared: Option<Arc<cdp_state::CdpShared>>,
 ) -> gpui::WindowHandle<gpui_component::Root> {
     // gpui-component's global state (theme, root rendering, input machinery).
     // Idempotent per-process; called once before any window opens.
@@ -861,6 +885,7 @@ fn open_host_window(
                 color_states: HashMap::new(),
                 color_reported: HashMap::new(),
                 tab_override: HashMap::new(),
+                cdp_shared,
             });
             // `Root::new` needs `&mut Context<Root>`, so it is built by a second
             // `cx.new` rather than inline in the window closure.
@@ -919,12 +944,51 @@ fn spawn_dialog_host(
     .detach();
 }
 
+/// CDP tree-read pump (quickjs + DevTools). `drain_requests` already runs
+/// once per frame in `render`, but that only helps when the app renders —
+/// a static UI idles at the ~500 ms heartbeat, so DevTools' DOM/CSS reads
+/// would each wait up to half a second (the earlier per-node hop version
+/// multiplied that by the node count and blew client timeouts outright).
+///
+/// Instead of a poll loop, this waits on the request queue itself: the CDP
+/// thread signals an "incoming" channel when it enqueues, we wake (~≤50 ms
+/// wake latency, no busy polling), drain directly on the main thread through
+/// the window handle, and go back to sleep. `drain_requests` uses `mem::take`
+/// so this and the per-frame render drain can never double-serve a request.
+#[cfg_attr(not(quickjs), allow(dead_code))]
+fn spawn_cdp_pump(
+    cx: &mut App,
+    handle: gpui::WindowHandle<gpui_component::Root>,
+    cdp_shared: Arc<cdp_state::CdpShared>,
+) {
+    let (notify_tx, notify_rx) = async_channel::unbounded::<()>();
+    cdp_shared.attach_notify(notify_tx);
+    cx.spawn(async move |cx| {
+        while notify_rx.recv().await.is_ok() {
+            // Coalesce a burst: one wake serves everything queued so far.
+            while notify_rx.try_recv().is_ok() {}
+            let _ = cx.update(|cx| {
+                let _ = handle.update(cx, |_root, _window, cx| {
+                    let Ok(host) = _root.view().clone().downcast::<HostView>() else {
+                        return;
+                    };
+                    host.update(cx, |view, _cx| {
+                        if let Some(sh) = view.cdp_shared.as_ref() {
+                            sh.drain_requests(&view.tree);
+                        }
+                    });
+                });
+            });
+        }
+    })
+    .detach();
+}
+
 fn spawn_ops_apply(
     cx: &mut App,
     handle: gpui::WindowHandle<gpui_component::Root>,
     ops_rx: async_channel::Receiver<Vec<Op>>,
-) {
-    cx.spawn(async move |cx| {
+) {    cx.spawn(async move |cx| {
         while let Ok(ops) = ops_rx.recv().await {
             // Split the latency: channel wait (ops sat in the queue before the
             // GPUI executor polled us) vs apply itself. Log EVERY batch when

@@ -79,6 +79,27 @@ globalThis.queueMicrotask = function (cb) {
 };
 
 // ---------------------------------------------------------------------------
+// dev-mode reset — called by the host before a hot reload re-evals the app
+// bundle. Module-level state inside the bundle (ids, signals, handler maps)
+// is recreated fresh by the new IIFE evaluation; the *bootstrap-owned*
+// globals below would otherwise leak stale timers/listeners from the old
+// bundle into the new run (e.g. a clock card's setInterval ticking twice).
+// The stdin `end` handler must survive: the host's shutdown path uses it.
+// ---------------------------------------------------------------------------
+
+globalThis.__hostDevReset = function () {
+    globalThis.__timers.length = 0;
+    if (globalThis.__raf) {
+        globalThis.__raf.cbs = {};
+        globalThis.__raf.pending = 0;
+    }
+    globalThis.__listeners = {};
+    if (globalThis.__stdinCbs && typeof globalThis.__stdinCbs.data === "function") {
+        delete globalThis.__stdinCbs.data;
+    }
+};
+
+// ---------------------------------------------------------------------------
 // process shim (QuickJS has no `process`)
 // ---------------------------------------------------------------------------
 

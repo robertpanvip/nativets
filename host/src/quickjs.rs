@@ -113,6 +113,53 @@ impl EventSink {
 pub struct QuickJsHost {
     /// The injected event channel — the only carrier there is.
     pub sink: EventSink,
+    /// Hot-reload mailbox handle (dev mode). `None` unless a CDP/dev reload
+    /// channel was requested via `GPUI_TS_CDP` / QUICKJS_BUNDLE watching.
+    pub reload: Option<ReloadHandle>,
+}
+
+/// Hot-reload channel (dev mode): the CLI writes a new bundle to
+/// `QUICKJS_BUNDLE` (atomic rename), the engine polls the file's mtime and
+/// re-evals it in place. No window restart, no process exit — the retained
+/// tree is cleared with an `Op::Reset`-equivalent first so the new bundle's
+/// mount starts from a clean root.
+#[derive(Clone)]
+pub struct ReloadHandle {
+    path: Arc<std::path::PathBuf>,
+    /// Set (from any thread) to force an immediate reload check.
+    kick: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl ReloadHandle {
+    /// Nudge the engine to re-check the bundle file now (skips the mtime
+    /// poll latency, ~250ms by default).
+    pub fn kick(&self) {
+        self.kick
+            .store(true, std::sync::atomic::Ordering::Release);
+        // Unpark so the engine notices within one tick instead of the poll
+        // quantum.
+        // (The engine thread handle lives in EventSink; the queue push that
+        // normally wakes it is not needed for a pure poll wakeup.)
+    }
+}
+
+/// Build a reload handle when dev mode is active (QUICKJS_BUNDLE set).
+fn reload_handle_from_env() -> Option<ReloadHandle> {
+    std::env::var("QUICKJS_BUNDLE").ok().map(|p| ReloadHandle {
+        path: Arc::new(std::path::PathBuf::from(p)),
+        kick: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    })
+}
+
+/// Last-modified mtime of the bundle file, or `None` when unreadable (mid
+/// write+rename, deleted, …) — a `None` never triggers a reload.
+fn bundle_mtime(p: &std::path::Path) -> Option<std::time::SystemTime> {
+    std::fs::metadata(p).and_then(|m| m.modified()).ok()
+}
+
+/// Read the bundle file, tolerating a transient absence (write+rename window).
+fn read_bundle_file(p: &std::path::Path) -> Option<String> {
+    std::fs::read_to_string(p).ok().filter(|s| !s.is_empty())
 }
 
 /// Save the original stderr BEFORE any redirection so host diagnostics survive.
@@ -140,6 +187,14 @@ struct Engine {
     metrics: Arc<bom::WindowMetrics>,
     /// BOM: `alert`/`confirm` requests → UI thread.
     dialogs: async_channel::Sender<bom::DialogRequest>,
+    /// CDP `Runtime.evaluate` mailbox (dev mode): (expression, reply). The
+    /// reply carries the *stringified* result — the engine serializes to JSON
+    /// text inside the context, so no rquickjs value crosses a thread.
+    evals: Arc<Mutex<Vec<(String, std::sync::mpsc::Sender<String>)>>>,
+    /// Hot-reload handle (dev mode): poll the bundle file, re-eval on change.
+    reload: Option<ReloadHandle>,
+    /// mtime of the bundle at last (re)load — the change detector.
+    loaded_mtime: Option<std::time::SystemTime>,
 }
 
 impl Engine {
@@ -149,9 +204,12 @@ impl Engine {
         ops_tx: async_channel::Sender<Vec<Op>>,
         metrics: Arc<bom::WindowMetrics>,
         dialogs: async_channel::Sender<bom::DialogRequest>,
+        evals: Arc<Mutex<Vec<(String, std::sync::mpsc::Sender<String>)>>>,
+        reload: Option<ReloadHandle>,
     ) -> Self {
         let rt = Runtime::new().expect("[qjs] Runtime::new failed");
         let ctx = Context::full(&rt).expect("[qjs] Context::full failed");
+        let loaded_mtime = reload.as_ref().and_then(|r| bundle_mtime(&r.path));
         Engine {
             rt,
             ctx,
@@ -160,12 +218,15 @@ impl Engine {
             stderr_tee,
             metrics,
             dialogs,
+            evals,
+            reload,
+            loaded_mtime,
         }
     }
 
     /// Boot the engine: register host globals, eval bootstrap + app bundle,
     /// then drive the event loop forever on this thread.
-    fn start(&self, bundle: String) {
+    fn start(mut self, bundle: String) {
         self.ctx.with(|ctx| {
             self.register_globals(ctx.clone());
             if let Err(e) = ctx.eval::<(), _>(BOOTSTRAP_JS) {
@@ -177,34 +238,78 @@ impl Engine {
                 );
                 return;
             }
-            // Hand the bundle to the engine as a global string, then run it via
-            // an indirect eval wrapped in try/catch so a load-time throw surfaces
-            // its real JS message + stack (rquickjs's `Error` Debug is just
-            // "Exception", so we report from JS instead).
-            let _ = ctx.globals().set("__BUNDLE", bundle);
-            let runner = r#"
-                (function () {
-                    try {
-                        (0, eval)(globalThis.__BUNDLE);
-                        globalThis.__hostTrace("info", "[qjs] app bundle evaluated");
-                    } catch (e) {
-                        var info = "type=" + typeof e;
-                        try { info += " ctor=" + (e && e.constructor && e.constructor.name); } catch (_) {}
-                        try { info += " msg=" + (e && e.message); } catch (_) {}
-                        globalThis.__hostTrace("error", "[qjs] BUNDLE_THROW: " + info + " | stack=" + ((e && e.stack) || "none"));
-                    }
-                })();
-            "#;
-            if let Err(e) = ctx.eval::<(), _>(runner.to_string()) {
-                trace(self.stderr_tee, &format!("[qjs] runner eval error: {}", e));
-            }
+            self.eval_bundle_inner(ctx, &bundle);
         });
 
         // Event loop. We *park* rather than sleep, so an inbound event wakes us
         // the moment it arrives (worst case still one tick).
         loop {
             thread::park_timeout(TICK);
+            self.dev_pump();
             self.pump();
+        }
+    }
+
+    /// Evaluate one app bundle inside try/catch so a throw surfaces its real
+    /// JS message + stack (rquickjs's `Error` Debug is just "Exception").
+    /// Public entry for the hot-reload path (not already inside `ctx.with`).
+    fn eval_bundle(&self, bundle: &str) {
+        self.ctx.with(|ctx| self.eval_bundle_inner(ctx, bundle));
+    }
+
+    /// The body of `eval_bundle` — must be called inside `ctx.with`.
+    /// (`Context::with` is NOT reentrant: the runtime's RefCell is already
+    /// borrowed while inside, and nesting panics.)
+    fn eval_bundle_inner(&self, ctx: Ctx<'_>, bundle: &str) {
+        // Hot reloads re-enter here with the previous bundle's bootstrap-
+        // owned state (timers, rAF callbacks, window listeners) still
+        // installed. Drop it so the new run starts clean — bundle-owned
+        // module state resets itself by construction (fresh IIFE scope).
+        if let Ok(f) = ctx.globals().get::<_, Function>("__hostDevReset") {
+            let _ = f.call::<(), ()>(());
+        }
+        let _ = ctx.globals().set("__BUNDLE", bundle.to_string());
+        let runner = r#"
+            (function () {
+                try {
+                    (0, eval)(globalThis.__BUNDLE);
+                    globalThis.__hostTrace("info", "[qjs] app bundle evaluated");
+                } catch (e) {
+                    var info = "type=" + typeof e;
+                    try { info += " ctor=" + (e && e.constructor && e.constructor.name); } catch (_) {}
+                    try { info += " msg=" + (e && e.message); } catch (_) {}
+                    globalThis.__hostTrace("error", "[qjs] BUNDLE_THROW: " + info + " | stack=" + ((e && e.stack) || "none"));
+                }
+            })();
+        "#;
+        if let Err(e) = ctx.eval::<(), _>(runner.to_string()) {
+            trace(self.stderr_tee, &format!("[qjs] runner eval error: {}", e));
+        }
+    }
+
+    /// Hot reload (dev mode): if the bundle file changed on disk, clear the
+    /// retained tree (host-side) and re-eval the new bundle in this same
+    /// context. The IIFE bundle re-runs its top level — module state (ids,
+    /// signals, handlers) is recreated fresh because the whole bundle is a
+    /// new closure scope.
+    fn maybe_reload(&mut self) {
+        let Some(handle) = self.reload.as_ref() else { return };
+        let mtime = bundle_mtime(&handle.path);
+        if mtime.is_some() && mtime != self.loaded_mtime {
+            // Load *first*: if the read fails mid-write we keep the old mtime
+            // and let the next change retry.
+            if let Some(src) = read_bundle_file(&handle.path) {
+                self.loaded_mtime = mtime;
+                crate::log_line("[qjs] hot reload: bundle changed — resetting tree & re-eval");
+                // 1) Clear the retained tree on the host (root keeps, children
+                //    go). Sent through the same ops channel as everything else,
+                //    so ordering vs. the new bundle's mount batch is FIFO.
+                let _ = self.ops_tx.send_blocking(vec![Op::Clear { id: 0 }]);
+                // 2) Re-run the bundle. Module-level state (io-core's id
+                //    counter, signal graphs, handler maps) lives inside the
+                //    IIFE closure, so a fresh eval resets all of it.
+                self.eval_bundle(&src);
+            }
         }
     }
 
@@ -380,7 +485,41 @@ impl Engine {
             }
             // 4) flush the batches those handlers just queued
             while ctx.execute_pending_job() {}
+
+            // 5) CDP Runtime.evaluate requests (dev mode). Each entry carries
+            //    its own reply channel; the eval serializes to a JSON *text*
+            //    inside the context (`JSON.stringify` wrapper), and the CDP
+            //    thread parses it back into a serde_json::Value. A throwing
+            //    eval replies with `{"__evalError": …}`.
+            let evals: Vec<(String, std::sync::mpsc::Sender<String>)> = {
+                let mut q = self.evals.lock().unwrap();
+                std::mem::take(&mut *q)
+            };
+            for (expr, reply) in evals {
+                let src = format!(
+                    "JSON.stringify((function(){{ var __r; try {{ __r = (function(){{ return ({expr}) }}()); }} catch (e) {{ return JSON.stringify({{__evalError: String(e && e.message || e)}}); }} return __r === undefined ? null : __r; }})())"
+                );
+                let out: Result<String, _> = ctx.eval(src);
+                let _ = reply.send(out.unwrap_or_else(|e| {
+                    "{\"__evalError\":\"eval failed on the host side\"}".to_string()
+                }));
+            }
         });
+    }
+
+    /// Dev-mode extras checked every tick: hot-reload poll + kick flag.
+    fn dev_pump(&mut self) {
+        if let Some(handle) = self.reload.as_ref() {
+            if handle
+                .kick
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                handle
+                    .kick
+                    .store(false, std::sync::atomic::Ordering::Release);
+            }
+        }
+        self.maybe_reload();
     }
 }
 
@@ -395,17 +534,50 @@ pub fn launch(
     ops_tx: async_channel::Sender<Vec<Op>>,
     metrics: Arc<bom::WindowMetrics>,
     dialogs: async_channel::Sender<bom::DialogRequest>,
+    shared: Option<Arc<crate::cdp_state::CdpShared>>,
 ) -> QuickJsHost {
     let queue: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let bundle = load_bundle();
     let stderr_tee = frontend_stderr_tee as usize;
+    let reload = reload_handle_from_env();
+    let evals: Arc<Mutex<Vec<(String, std::sync::mpsc::Sender<String>)>>> =
+        Arc::new(Mutex::new(Vec::new()));
+
+    // CDP Runtime.evaluate: hand the engine's eval mailbox sender to the
+    // shared CDP state so `Runtime.evaluate` requests queue for this thread.
+    // (cdp.rs pushes into the Arc<Mutex<Vec>> via this sender's clone.)
+    if let Some(sh) = shared.as_ref() {
+        let (eval_tx, eval_rx) = std::sync::mpsc::channel::<(
+            String,
+            std::sync::mpsc::Sender<String>,
+        )>();
+        // A forwarder thread moves requests into the engine's mailbox — the
+        // engine thread drains `evals` on its tick; this keeps CdpShared's
+        // surface a plain channel.
+        let evals_fwd = evals.clone();
+        thread::spawn(move || {
+            for req in eval_rx {
+                evals_fwd.lock().unwrap().push(req);
+            }
+        });
+        sh.attach_eval(eval_tx);
+    }
 
     let engine_thread = thread::Builder::new()
         .name("quickjs".to_string())
         .spawn({
             let queue = queue.clone();
+            let evals = evals.clone();
             move || {
-                let engine = Engine::new(stderr_tee, queue, ops_tx, metrics, dialogs);
+                let engine = Engine::new(
+                    stderr_tee,
+                    queue,
+                    ops_tx,
+                    metrics,
+                    dialogs,
+                    evals,
+                    reload,
+                );
                 engine.start(bundle);
             }
         })
@@ -416,6 +588,7 @@ pub fn launch(
             queue,
             engine: engine_thread.thread().clone(),
         },
+        reload: reload_handle_from_env(),
     }
 }
 
