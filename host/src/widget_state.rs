@@ -10,7 +10,6 @@ use crate::now_ms;
 use crate::style::{hsla_to_hex, num_of, option_index, parse_hex_color};
 use crate::{HostSelectState, HostComboboxState, SelectDelegate, HostView};
 use gpui::{prelude::*, App, Context, Entity, Focusable, Window, SharedString};
-use serde_json::json;
 use chrono::NaiveDate;
 use gpui_base::Date as GpuiDate;
 use gpui_component::date_picker::{DatePickerEvent, DatePickerState};
@@ -57,8 +56,8 @@ impl HostView {
                 }
                 _ => return,
             };
-            let msg = json!({ "t": "event", "target": id, "kind": kind, "value": value }).to_string();
-            log!("[host] ev {kind} id={id} t={} {msg}", now_ms());
+            let msg = crate::protocol::OutEvent::value(id, kind, value);
+            log!("[host] {} t={}", msg.log_tag(), now_ms());
             let _ = echo_tx.send(msg);
         })
         .detach();
@@ -94,9 +93,8 @@ impl HostView {
         cx.subscribe(&state, move |_this: &mut HostView, _st, ev: &DatePickerEvent, _cx| {
             let DatePickerEvent::Change(d) = ev;
             let value = d.to_string();
-            let msg = json!({ "t": "event", "target": id, "kind": "change", "value": value })
-                .to_string();
-            log!("[host] ev change(id=date) id={id} t={} {msg}", now_ms());
+            let msg = crate::protocol::OutEvent::value(id, "change", value);
+            log!("[host] ev change(id=date) id={id} t={}", now_ms());
             let _ = tx.send(msg);
         })
         .detach();
@@ -140,9 +138,8 @@ impl HostView {
                 SliderEvent::Release(v) => ("change", v.end()),
             };
             let text = format_value(value.1);
-            let msg = json!({ "t": "event", "target": id, "kind": value.0, "value": text })
-                .to_string();
-            log!("[host] ev {}(slider) id={id} t={} {msg}", value.0, now_ms());
+            let msg = crate::protocol::OutEvent::value(id, value.0, text);
+            log!("[host] ev {}(slider) id={id} t={}", value.0, now_ms());
             let _ = tx.send(msg);
         })
         .detach();
@@ -179,12 +176,8 @@ impl HostView {
             move |_this: &mut HostView, _st, ev: &SelectEvent<SelectDelegate>, _cx| {
                 let SelectEvent::Confirm(value) = ev;
                 let Some(value) = value else { return };
-                let msg = json!({
-                    "t": "event", "target": id, "kind": "change",
-                    "value": value.to_string()
-                })
-                .to_string();
-                log!("[host] ev change(select) id={id} t={} {msg}", now_ms());
+                let msg = crate::protocol::OutEvent::value(id, "change", value.to_string());
+                log!("[host] ev change(select) id={id} t={}", now_ms());
                 let _ = tx.send(msg);
             },
         )
@@ -231,8 +224,8 @@ impl HostView {
                     _ => return,
                 };
                 let msg =
-                    json!({ "t": "event", "target": id, "kind": kind, "value": value }).to_string();
-                log!("[host] ev {kind} id={id} t={} {msg}", now_ms());
+                    crate::protocol::OutEvent::value(id, kind, value);
+                log!("[host] ev {kind} id={id} t={}", now_ms());
                 let _ = tx.send(msg);
             },
         )
@@ -272,11 +265,8 @@ impl HostView {
             move |_this: &mut HostView, _st, ev: &ComboboxEvent<Vec<SharedString>>, _cx| {
                 let ComboboxEvent::Confirm(vals) = ev else { return };
                 let value = vals.first().map(|v| v.to_string()).unwrap_or_default();
-                let msg = json!({
-                    "t": "event", "target": id, "kind": "change", "value": value
-                })
-                .to_string();
-                log!("[host] ev change(combobox) id={id} t={} {msg}", now_ms());
+                let msg = crate::protocol::OutEvent::value(id, "change", value);
+                log!("[host] ev change(combobox) id={id} t={}", now_ms());
                 let _ = tx.send(msg);
             },
         )
@@ -311,12 +301,8 @@ impl HostView {
             &state,
             move |_this: &mut HostView, _st, ev: &ColorPickerEvent, _cx| {
                 let ColorPickerEvent::Change(Some(h)) = ev else { return };
-                let msg = json!({
-                    "t": "event", "target": id, "kind": "change",
-                    "value": hsla_to_hex(*h)
-                })
-                .to_string();
-                log!("[host] ev change(color) id={id} t={} {msg}", now_ms());
+                let msg = crate::protocol::OutEvent::value(id, "change", hsla_to_hex(*h));
+                log!("[host] ev change(color) id={id} t={}", now_ms());
                 let _ = tx.send(msg);
             },
         )

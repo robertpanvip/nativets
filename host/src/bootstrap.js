@@ -10,12 +10,23 @@
  * Contract with the host (`quickjs.rs::register_globals`):
  *   __hostWrite(s)          stdout sink            (Pipe mode: the ops pipe)
  *   __hostTrace(level,msg)  diagnostics → stderr   (never the protocol channel)
- *   __hostEmit(line)        one protocol line      (Direct mode only)
+ *   __hostOps(opsArray)     one batch of op objects, typed (ABI tier — the
+ *                           frontend's io-core probes this first and falls
+ *                           back to `__hostEmit` JSONL when absent)
+ *   __hostHello(title)      hello handshake (ABI tier)
+ *   __hostLog(msg)          frontend diagnostics (ABI tier)
+ *   __hostEmit(line)        one JSONL protocol line (fallback tier)
  *   __hostExit(code)        real process exit
  *   __hostWindow() -> JSON  {"innerWidth":…,"innerHeight":…,"dpr":…,"screenWidth":…,"screenHeight":…}
  *   __hostPerfNow() -> f64  monotonic ms since host start
  *   __hostEntropy(n) -> hex n random bytes (2n hex chars)
  *   __hostDialog(kind,message,title) -> i32   1 = ok, 0 = cancel
+ *
+ * Inbound events (host → engine): structured `OutEvent`s arrive as typed
+ * arguments of the global `__hostEventSink(kind,target,value,top,max,
+ * viewport,content)` (installed by the app bundle's runtime module) and of
+ * `__bomEvent(w,h,dpr,sw,sh)` below; legacy JSONL lines still ride the
+ * stdin facade for out-of-process hosts.
  *
  * Every one of them is optional: the BOM degrades to sane defaults when a
  * primitive is absent, which is what makes the node tests possible.
@@ -209,6 +220,21 @@ globalThis.__bomLine = function (line) {
             screenHeight: o.sh,
         });
     } catch (e) {}
+};
+
+/**
+ * Structured BOM push (ABI tier): the host hands the five numbers directly —
+ * no JSON line to parse. Same semantics as `__bomLine` above; the two entry
+ * points exist because the JSONL fallback tier still needs the line form.
+ */
+globalThis.__bomEvent = function (w, h, dpr, sw, sh) {
+    globalThis.__bomApply({
+        innerWidth: w,
+        innerHeight: h,
+        dpr: dpr,
+        screenWidth: sw,
+        screenHeight: sh,
+    });
 };
 
 // `window` and `self` are the global object (single global, like a browser

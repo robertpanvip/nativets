@@ -19,14 +19,18 @@
 //!
 //! QuickJS mode (cfg `quickjs`, the default) links `rquickjs` instead and runs
 //! the bundle on a dedicated engine thread. Because the engine is in-process,
-//! the protocol does not go through stdio at all: the host injects
-//! `__hostEmit` into the JS context for outbound ops and pushes events
-//! straight into the engine queue. Both directions funnel through
-//! `ingest_line` below, so they cannot drift apart from the child/embedded
-//! paths.
+//! the protocol does not go through stdio at all: the host injects ABI host
+//! functions into the JS context (`__hostOps` — a typed argument array, no
+//! JSON round-trip on the engine side) for outbound ops, and pushes
+//! [`protocol::OutEvent`] structs straight into the engine queue where they
+//! become typed arguments of a JS callback. The child/embedded/scriptc paths
+//! keep the JSONL wire format: GPUI-side emit sites hand over structured
+//! events, and `protocol::OutEvent::to_line` is the single serialization
+//! point — neither side of those paths can drift.
 
 mod draw;
 mod tree;
+mod protocol;
 mod style;
 mod canvas_draw;
 mod widget_state;
@@ -299,7 +303,10 @@ fn apply_app_palette(cx: &mut App) {
 }
 struct HostView {
     tree: Tree,
-    event_tx: mpsc::Sender<String>,
+    /// Structured outbound events (the ABI channel). quickjs injects them as
+    /// typed JS callback arguments; the JSONL backends serialize at the last
+    /// moment via `OutEvent::to_line` (see `run_event_writer`).
+    event_tx: mpsc::Sender<protocol::OutEvent>,
     /// Ops inbound channel, drained synchronously at the top of every render
     /// (`drain_ops`). `Some` in every backend today; a backend that wires ops
     /// elsewhere (e.g. its own GPUI task) can pass `None` to opt out.
@@ -445,10 +452,11 @@ pub(crate) fn run_ops_reader<R: std::io::Read + Send + 'static>(
     });
 }
 
-fn run_event_writer<W: std::io::Write + Send + 'static>(mut w: W, ev_rx: mpsc::Receiver<String>) {
+fn run_event_writer<W: std::io::Write + Send + 'static>(mut w: W, ev_rx: mpsc::Receiver<protocol::OutEvent>) {
     std::thread::spawn(move || {
-        for msg in ev_rx {
-            log!("[host] ev write t={}: {msg}", now_ms());
+        for ev in ev_rx {
+            let msg = ev.to_line();
+            log!("[host] {} t={}: {msg}", ev.log_tag(), now_ms());
             if writeln!(w, "{msg}").and_then(|_| w.flush()).is_err() {
                 log!("[host] ev write FAILED (frontend stdin closed?)");
                 break;
@@ -457,19 +465,20 @@ fn run_event_writer<W: std::io::Write + Send + 'static>(mut w: W, ev_rx: mpsc::R
     });
 }
 
-/// Injected transport (QuickJS `Direct` mode): hand each event straight to the
-/// engine's inbound queue and unpark its tick.
+/// Injected transport (QuickJS `Direct` mode): hand each structured event
+/// straight to the engine's inbound queue and unpark its tick. No
+/// serialization at all — `quickjs.rs::pump` turns the enum into typed
+/// arguments of the `__hostEventSink` JS callback.
 ///
 /// Compared with `run_event_writer` this drops a pipe write, a blocking read,
-/// a line split and a UTF-8 decode — and because `push` unparks the engine,
-/// dispatch happens immediately instead of on the next 10ms tick.
+/// a line split, a UTF-8 decode AND the JSON round-trip.
 #[cfg(quickjs)]
-fn run_event_injector(sink: quickjs::EventSink, ev_rx: mpsc::Receiver<String>) {
+fn run_event_injector(sink: quickjs::EventSink, ev_rx: mpsc::Receiver<protocol::OutEvent>) {
     std::thread::spawn(move || {
         log!("[host] event injector up");
-        for msg in ev_rx {
-            log!("[host] ev inject t={}: {msg}", now_ms());
-            sink.push(msg);
+        for ev in ev_rx {
+            log!("[host] {} t={}", ev.log_tag(), now_ms());
+            sink.push_event(ev);
         }
     });
 }
@@ -646,7 +655,7 @@ fn main() {
     let frontend = resolve_frontend();
 
     // --- per-mode transport wiring ---
-    let (ev_tx, ev_rx) = mpsc::channel::<String>();
+    let (ev_tx, ev_rx) = mpsc::channel::<protocol::OutEvent>();
     let (ops_tx, ops_rx) = async_channel::unbounded::<Vec<Op>>();
 
     match frontend {
@@ -809,19 +818,19 @@ fn main() {
 /// thread (scriptc): no pipe, no unpark — the driver picks them up on its
 /// next quantum.
 #[cfg(scriptc)]
-fn run_event_queuer(sink: scriptc::EventSink, ev_rx: mpsc::Receiver<String>) {
+fn run_event_queuer(sink: scriptc::EventSink, ev_rx: mpsc::Receiver<protocol::OutEvent>) {
     std::thread::spawn(move || {
         log!("[host] event queuer up");
-        for msg in ev_rx {
-            log!("[host] ev queue t={}: {msg}", now_ms());
-            sink.push(msg);
+        for ev in ev_rx {
+            log!("[host] {} t={}", ev.log_tag(), now_ms());
+            sink.push(ev.to_line());
         }
     });
 }
 
 fn open_host_window(
     cx: &mut App,
-    ev_tx: mpsc::Sender<String>,
+    ev_tx: mpsc::Sender<protocol::OutEvent>,
     ops_rx: async_channel::Receiver<Vec<Op>>,
     metrics: Option<Arc<bom::WindowMetrics>>,
     #[allow(unused_variables)] cdp_shared: Option<Arc<cdp_state::CdpShared>>,

@@ -373,13 +373,14 @@ impl HostView {
     }
 
     pub(crate) fn send_event(&self, target: u64, kind: &str, field: Option<(&str, String)>) {
-        let msg = match field {
-            Some((k, v)) => json!({ "t": "event", "target": target, "kind": kind, k: v }),
-            None => json!({ "t": "event", "target": target, "kind": kind }),
-        }
-        .to_string();
-        log!("[host] ev {kind} id={target} t={} {msg}", now_ms());
-        let _ = self.event_tx.send(msg);
+        // Structured ABI event — `field` today is always a `value` (the only
+        // payload kind any emit site uses); scroll rides its own constructor.
+        let ev = match field {
+            Some(("value", v)) | Some((_, v)) => crate::protocol::OutEvent::value(target, kind, v),
+            None => crate::protocol::OutEvent::plain(target, kind),
+        };
+        log!("[host] {} t={}", ev.log_tag(), now_ms());
+        let _ = self.event_tx.send(ev);
     }
 
     pub(crate) fn sync_focus(&mut self, window: &Window) {
@@ -418,18 +419,15 @@ impl HostView {
             }
             let max = f32::from(h.max_offset().y);
             let viewport = f32::from(h.bounds().size.height);
-            let msg = json!({
-                "t": "event",
-                "target": id,
-                "kind": "scroll",
-                "top": round1(top),
-                "max": round1(max),
-                "viewport": round1(viewport),
-                "content": round1(viewport + max),
-            })
-            .to_string();
-            log!("[host] ev scroll id={id} t={} {msg}", now_ms());
-            let _ = self.event_tx.send(msg);
+            let ev = crate::protocol::OutEvent::scroll(
+                round1(top),
+                round1(max),
+                round1(viewport),
+                round1(viewport + max),
+                id,
+            );
+            log!("[host] ev scroll id={id} t={}", now_ms());
+            let _ = self.event_tx.send(ev);
         }
     }
 
@@ -466,7 +464,11 @@ impl HostView {
             changed |= metrics.set_screen(b.size.width.into(), b.size.height.into());
         }
         if changed {
-            let _ = self.event_tx.send(metrics.line());
+            let (iw, ih) = metrics.inner();
+            let (sw, sh) = metrics.screen();
+            let _ = self
+                .event_tx
+                .send(crate::protocol::OutEvent::bom(iw, ih, metrics.dpr(), sw, sh));
         }
     }
 

@@ -51,6 +51,7 @@ export type {
 import {
     setSink,
     handleLine,
+    handleHostEvent,
     stats,
     flush,
     setEngineLabel,
@@ -146,6 +147,47 @@ if (stdinFacade !== null) {
     stdinFacade.setEncoding("utf8");
     stdinFacade.on("data", pumpStdin);
 }
+
+// ---------------------------------------------------------------------------
+// ABI tier (quickjs in-process host): register the typed event callback and
+// expose it to the host. The engine's pump resolves the *global*
+// `__hostEventSink` and calls it with `(kind, target, value, top, max,
+// viewport, content)` — one call per event, no JSON stage on either side.
+// The global here bridges into io-core's registered slot via
+// `handleHostEvent` (which assembles the same HostEvent view `handleLine`
+// would and runs the shared dispatch). Only installed when a quickjs host
+// is actually present (`__hostOps` probe) so node-dev/perry environments
+// keep their pristine global object.
+// ---------------------------------------------------------------------------
+
+(function installAbiEventBridge(): void {
+    if (typeof globalThis === "undefined") return;
+    const g = globalThis as { __hostOps?: unknown; __hostEventSink?: unknown };
+    // Capability probe: a host that injects `__hostOps` (ABI tier) also
+    // pushes structured events; JSONL-only hosts (perry embedded, node-dev)
+    // must not see this global or their `t:"event"` lines would be double-
+    // handled (they already reach io-core via pumpStdin → handleLine).
+    if (typeof g.__hostOps !== "function") return;
+    if (g.__hostEventSink !== undefined) return; // already installed
+    g.__hostEventSink = function (
+        kind: string,
+        target: number,
+        value: string,
+        top: number,
+        max: number,
+        viewport: number,
+        content: number,
+    ): void {
+        handleHostEvent(kind, target, value, top, max, viewport, content);
+    };
+})();
+
+/**
+ * Node-dev still has a real `process` but no host callbacks: nothing to do
+ * for the ABI tier there — io-core's boot probe found no `__hostOps`, so
+ * flush() uses the JSONL sink and events arrive via `pumpStdin`.
+ */
+void handleLine;
 
 // ---------------------------------------------------------------------------
 // BOM injection — live closures over the browser-ish globals

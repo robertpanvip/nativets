@@ -45,7 +45,6 @@ use gpui_component::progress::Progress;
 use gpui_component::spinner::Spinner;
 use gpui_component::slider::Slider as GpuiSlider;
 use gpui_base::Date as GpuiDate;
-use serde_json::json;
 use crate::tree::Node;
 use crate::HostView;
 use crate::widget_state::parse_date_value;
@@ -127,10 +126,9 @@ impl HostView {
                     b = apply_style(b, k, v);
                 }
                 b.on_click(move |_ev: &ClickEvent, _window, _cx| {
-                    let msg = json!({ "t": "event", "target": id, "kind": "click" })
-                        .to_string();
-                    log!("[host] ev click id={id} t={} {msg}", now_ms());
-                    let _ = tx.send(msg);
+                    let ev = crate::protocol::OutEvent::plain(id, "click");
+                    log!("[host] ev click id={id} t={}", now_ms());
+                    let _ = tx.send(ev);
                 })
                 .into_any_element()
             }
@@ -286,13 +284,9 @@ impl HostView {
                     .max(max);
                 if wants(node, "change") || wants(node, "input") {
                     r = r.on_click(move |new: &usize, _window, _cx| {
-                        let msg = json!({
-                            "t": "event", "target": id, "kind": "change",
-                            "value": new.to_string()
-                        })
-                        .to_string();
-                        log!("[host] ev change(rating) id={id} t={} {msg}", now_ms());
-                        let _ = tx.send(msg);
+                        let ev = crate::protocol::OutEvent::value(id, "change", new.to_string());
+                        log!("[host] ev change(rating) id={id} t={}", now_ms());
+                        let _ = tx.send(ev);
                     });
                 }
                 r.into_any_element()
@@ -413,12 +407,9 @@ impl HostView {
                 // Optimistic update — same rationale as the tabs arm.
                 let weak = cx.entity().downgrade();
                 group = group.on_click(move |i: &usize, window, cx| {
-                    let msg = json!({
-                        "t": "event", "target": id, "kind": "change", "value": i.to_string()
-                    })
-                    .to_string();
-                    log!("[host] ev change(radio) id={id} t={} {msg}", now_ms());
-                    let _ = tx.send(msg);
+                    let ev = crate::protocol::OutEvent::value(id, "change", i.to_string());
+                    log!("[host] ev change(radio) id={id} t={}", now_ms());
+                    let _ = tx.send(ev);
                     let clicked = *i;
                     let _ = weak.update(cx, |view, _| {
                         view.tab_override.insert(id, clicked);
@@ -454,12 +445,9 @@ impl HostView {
                 // clears the override; same value, so nothing re-flashes.
                 let weak = cx.entity().downgrade();
                 bar = bar.on_click(move |i: &usize, window, cx| {
-                    let msg = json!({
-                        "t": "event", "target": id, "kind": "change", "value": i.to_string()
-                    })
-                    .to_string();
-                    log!("[host] ev change(tabs) id={id} t={} {msg}", now_ms());
-                    let _ = tx.send(msg);
+                    let ev = crate::protocol::OutEvent::value(id, "change", i.to_string());
+                    log!("[host] ev change(tabs) id={id} t={}", now_ms());
+                    let _ = tx.send(ev);
                     let clicked = *i;
                     let _ = weak.update(cx, |view, _| {
                         view.tab_override.insert(id, clicked);
@@ -493,12 +481,9 @@ impl HostView {
                 // Optimistic update — same rationale as the tabs arm.
                 let weak = cx.entity().downgrade();
                 pg = pg.on_click(move |p: &usize, window, cx| {
-                    let msg = json!({
-                        "t": "event", "target": id, "kind": "change", "value": p.to_string()
-                    })
-                    .to_string();
-                    log!("[host] ev change(pagination) id={id} t={} {msg}", now_ms());
-                    let _ = tx.send(msg);
+                    let ev = crate::protocol::OutEvent::value(id, "change", p.to_string());
+                    log!("[host] ev change(pagination) id={id} t={}", now_ms());
+                    let _ = tx.send(ev);
                     let clicked = *p;
                     let _ = weak.update(cx, |view, _| {
                         // pagination is 1-based; the override stores 0-based.
@@ -519,13 +504,10 @@ impl HostView {
                     bc = bc.child(
                         BreadcrumbItem::new(opt.clone()).on_click(
                             move |_ev: &ClickEvent, _window, _cx| {
-                                let msg = json!({
-                                    "t": "event", "target": id, "kind": "change",
-                                    "value": i.to_string()
-                                })
-                                .to_string();
-                                log!("[host] ev change(breadcrumb) id={id} t={} {msg}", now_ms());
-                                let _ = tx.send(msg);
+                                let ev =
+                                    crate::protocol::OutEvent::value(id, "change", i.to_string());
+                                log!("[host] ev change(breadcrumb) id={id} t={}", now_ms());
+                                let _ = tx.send(ev);
                             },
                         ),
                     );
@@ -540,10 +522,9 @@ impl HostView {
                 if wants(node, "close") {
                     let tx = self.event_tx.clone();
                     al = al.on_close(move |_ev: &ClickEvent, _window, _cx| {
-                        let msg =
-                            json!({ "t": "event", "target": id, "kind": "close" }).to_string();
-                        log!("[host] ev close(alert) id={id} t={} {msg}", now_ms());
-                        let _ = tx.send(msg);
+                        let ev = crate::protocol::OutEvent::plain(id, "close");
+                        log!("[host] ev close(alert) id={id} t={}", now_ms());
+                        let _ = tx.send(ev);
                     });
                 }
                 al.into_any_element()
@@ -615,10 +596,9 @@ impl HostView {
                 if wants(node, "click") {
                     let tx = self.event_tx.clone();
                     l = l.on_click(move |_ev: &ClickEvent, _window, _cx| {
-                        let msg =
-                            json!({ "t": "event", "target": id, "kind": "click" }).to_string();
-                        log!("[host] ev click(link) id={id} t={} {msg}", now_ms());
-                        let _ = tx.send(msg);
+                        let ev = crate::protocol::OutEvent::plain(id, "click");
+                        log!("[host] ev click(link) id={id} t={}", now_ms());
+                        let _ = tx.send(ev);
                     });
                 }
                 for child in self.build_children(id, no_shrink, window, cx) {
@@ -708,15 +688,15 @@ impl HostView {
 
 fn toggle_handler(
     id: u64,
-    tx: mpsc::Sender<String>,
+    tx: mpsc::Sender<crate::protocol::OutEvent>,
 ) -> impl Fn(&bool, &mut Window, &mut App) + 'static {
     move |checked: &bool, _window, _cx| {
-        let msg = json!({
-            "t": "event", "target": id, "kind": "change",
-            "value": if *checked { "true" } else { "false" }
-        })
-        .to_string();
-        log!("[host] ev change id={id} t={} {msg}", now_ms());
-        let _ = tx.send(msg);
+        let ev = crate::protocol::OutEvent::value(
+            id,
+            "change",
+            if *checked { "true" } else { "false" },
+        );
+        log!("[host] ev change id={id} t={}", now_ms());
+        let _ = tx.send(ev);
     }
 }

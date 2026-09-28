@@ -21,8 +21,19 @@
  *     gone: transport is always an injected sink (QuickJS injects
  *     `__hostEmit`; the scriptc host polls `gpts_poll`).
  *
- * The QuickJS path keeps identical semantics — bootstrap assigns the real
- * `__hostEmit` as the sink at startup. io-core is transport-agnostic.
+ * Transport tiers, chosen by capability probe at boot (top of this file):
+ *
+ *   1. **ABI** (quickjs in-process engine): the host injects `__hostOps` /
+ *      `__hostHello` / `__hostLog` — typed host functions taking the ops
+ *      array directly. No `JSON.stringify` on the JS side and no text parse
+ *      on the host side; the op objects cross as engine values. Inbound
+ *      events arrive as typed arguments of the `__hostEventSink` callback
+ *      (registered via `setHostEventSink` by the platform entry).
+ *   2. **JSONL** (child / perry embedded / scriptc host-pull): the wire
+ *      format is unchanged — `JSON.stringify` here, `handleLine` below.
+ *
+ * io-core is transport-agnostic: every mutator pushes into `pendingOps` and
+ * `flush()` picks the channel.
  */
 
 // ---------------------------------------------------------------------------
@@ -30,8 +41,9 @@
 // ---------------------------------------------------------------------------
 
 /**
- * The outbound line channel. Platform entries MUST call setSink() before
- * createRoot() — until then lines go nowhere (counted + dropped).
+ * The outbound line channel (JSONL tier). Platform entries MUST call
+ * setSink() before createRoot() — until then lines go nowhere (counted +
+ * dropped).
  */
 let sink: ((line: string) => void) | null = null;
 
@@ -40,7 +52,52 @@ export function setSink(fn: (line: string) => void): void {
 }
 
 export function hasSink(): boolean {
-    return sink !== null;
+    return sink !== null || abiOps !== null;
+}
+
+/**
+ * The ABI tier: the host's typed ops receiver. Probed once at module load —
+ * quickjs hosts inject `__hostOps` before the bundle evaluates. When set,
+ * `flush()` hands `pendingOps` straight to it and the JSONL sink is never
+ * consulted for batches.
+ */
+let abiOps: ((ops: Op[]) => void) | null = null;
+
+/**
+ * The ABI hello/log carriers (same boot probe as `abiOps`).
+ */
+let abiHello: ((title: string) => void) | null = null;
+let abiLog: ((msg: string) => void) | null = null;
+
+/**
+ * Inbound ABI callback slot: the platform entry registers the function the
+ * host calls with typed event arguments. Registered by runtime.ts for the
+ * quickjs path; scriptc/child hosts never call this (their events ride
+ * `handleLine`). A class field, not a bare function variable — keeps the
+ * static-subset shape of every other handler registry here.
+ */
+class HostEventSinkEntry {
+    fn: ((kind: string, target: number, value: string, top: number, max: number, viewport: number, content: number) => void) | null = null;
+}
+
+const hostEventSink = new HostEventSinkEntry();
+
+/**
+ * Register the host→frontend event callback (ABI tier). The host calls it
+ * with `(kind, target, value, top, max, viewport, content)`; `value` is ""
+ * when the event carries none, and the scroll quadruple is 0,0,0,0 for
+ * non-scroll kinds. Returns the previous registration (unused; symmetrical
+ * with setSink for testability).
+ */
+export function setHostEventSink(
+    fn: (kind: string, target: number, value: string, top: number, max: number, viewport: number, content: number) => void,
+): void {
+    hostEventSink.fn = fn;
+}
+
+/** True when the ABI tier is available (quickjs in-process host). */
+export function hasAbi(): boolean {
+    return abiOps !== null;
 }
 
 // --- default sink self-wiring ----------------------------------------------
@@ -53,8 +110,9 @@ export function hasSink(): boolean {
 // window, default title, zero diagnostics. The wiring therefore lives here,
 // at the protocol core, so ANY entry gets a working channel:
 //
-//   1. `__hostEmit` host function (QuickJS bootstrap injects it — direct
-//      mode, no extra thread);
+//   0. `__hostOps` host function (QuickJS injects it — the ABI tier; ops
+//      cross as engine values, no JSON);
+//   1. `__hostEmit` host function (older hosts / JSONL direct mode);
 //   2. `process.stdout.write` (perry embedded splices stdout into the ops
 //      pipe; node/`nativets dev` reads it too);
 //   3. nothing found → stay unwired; explicit setSink() still wins.
@@ -66,6 +124,22 @@ export function hasSink(): boolean {
 // file's top level into a static graph without the sc-main entry wrapping
 // it (and sc-main's own setSink overrides this block wholesale).
 
+if (typeof globalThis === "object" && globalThis !== null) {
+    const g = globalThis as {
+        __hostOps?: unknown;
+        __hostHello?: unknown;
+        __hostLog?: unknown;
+    };
+    if (typeof g.__hostOps === "function") {
+        abiOps = g.__hostOps as (ops: Op[]) => void;
+    }
+    if (typeof g.__hostHello === "function") {
+        abiHello = g.__hostHello as (title: string) => void;
+    }
+    if (typeof g.__hostLog === "function") {
+        abiLog = g.__hostLog as (msg: string) => void;
+    }
+}
 if (sink === null) {
     if (typeof globalThis === "object" && globalThis !== null) {
         const g = globalThis as { __hostEmit?: unknown };
@@ -299,9 +373,14 @@ let pendingOps: Op[] = [];
 
 /**
  * Synchronous flush. Same grouping semantics as the old microtask version —
- * a whole mount sequence becomes one `batch` line — just driven at call
- * time instead of task-queue time. Under QuickJS the host-side engine drains
- * the ops channel per line, so behavior is unchanged for every caller.
+ * a whole mount sequence becomes one batch — just driven at call time
+ * instead of task-queue time.
+ *
+ * Two carriers, probed at boot:
+ *   * ABI tier (`__hostOps`): the ops array crosses as engine values — the
+ *     objects leave this scope and land in the host's Rust closure with no
+ *     serialization anywhere.
+ *   * JSONL tier (`sink`): one `{"t":"batch",…}` line as before.
  */
 export function flush(): void {
     if (pendingOps.length === 0) return;
@@ -309,6 +388,10 @@ export function flush(): void {
     pendingOps = [];
     stats.batchesSent++;
     stats.opsSent += ops.length;
+    if (abiOps !== null) {
+        abiOps(ops);
+        return;
+    }
     writeLine(JSON.stringify({ t: "batch", ops: ops }));
 }
 
@@ -323,9 +406,13 @@ export function scheduleFlush(): void {
  * transport (`writeLine`) or the batch buffer directly.
  */
 export function sendHello(title: string): void {
-    writeLine(JSON.stringify({ t: "hello", proto: 1, title: title }));
-    // `hello` is diagnostics — the window belongs to the host, so the title
-    // only really changes via this op (tree.apply renames the window).
+    // Hello is diagnostics-only (the window belongs to the host); the real
+    // title change rides the setTitle op below, on either tier.
+    if (abiHello !== null) {
+        abiHello(title);
+    } else {
+        writeLine(JSON.stringify({ t: "hello", proto: abiOps !== null ? 2 : 1, title: title }));
+    }
     pendingOps.push({ op: "setTitle", title: title });
     flush();
 }
@@ -338,6 +425,10 @@ export function sendHello(title: string): void {
  * line on every backend. The host logs it as `[frontend] <msg>`.
  */
 export function hostLog(msg: string): void {
+    if (abiLog !== null) {
+        abiLog(msg);
+        return;
+    }
     writeLine(JSON.stringify({ t: "log", msg: msg }));
 }
 
@@ -452,6 +543,47 @@ export function handleLine(line: string): void {
         stopPropagation: function (): void { ev.stopped = true; },
         preventDefault: function (): void { /* no host default action to cancel */ },
     };
+    dispatchEvent(ev);
+}
+
+/**
+ * The ABI tier's inbound entry — the host calls the function registered via
+ * `setHostEventSink` with typed arguments, skipping the JSONL stage
+ * entirely (`handleLine`'s parse + `LineMsg` copy). The HostEvent view is
+ * assembled here with exactly the same field semantics, so downstream
+ * dispatch (`dispatchEvent`) is shared bit-for-bit between the tiers.
+ *
+ * Field mapping from the host's `OutEvent`:
+ *   kind, target                       — always present
+ *   value                              — undefined when the event carries none
+ *                                        (host pushes `None` as JS undefined)
+ *   top/max/viewport/content           — scroll geometry; 0 for other kinds
+ */
+export function handleHostEvent(
+    kind: string,
+    target: number,
+    value: string | undefined,
+    top: number,
+    max: number,
+    viewport: number,
+    content: number,
+): void {
+    const fn = hostEventSink.fn;
+    if (fn === null) return; // no ABI sink registered: drop (as handleLine would)
+    stats.eventsReceived++;
+    const isScroll = top !== 0 || max !== 0 || viewport !== 0 || content !== 0;
+    const ev: HostEvent = {
+        kind: kind,
+        target: target,
+        value: value,
+        top: isScroll ? top : undefined,
+        max: isScroll ? max : undefined,
+        viewport: isScroll ? viewport : undefined,
+        content: isScroll ? content : undefined,
+        stopPropagation: function (): void { ev.stopped = true; },
+        preventDefault: function (): void { /* no host default action to cancel */ },
+    };
+    fn(kind, target, value === undefined ? "" : value, top, max, viewport, content);
     dispatchEvent(ev);
 }
 

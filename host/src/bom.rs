@@ -73,6 +73,14 @@ impl WindowMetrics {
         )
     }
 
+    /// Screen geometry for the structured BOM push (`OutEvent::bom`).
+    pub fn screen(&self) -> (u32, u32) {
+        (
+            self.screen_w.load(Ordering::Relaxed),
+            self.screen_h.load(Ordering::Relaxed),
+        )
+    }
+
     pub fn dpr(&self) -> f32 {
         f32::from_bits(self.dpr.load(Ordering::Relaxed))
     }

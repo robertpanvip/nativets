@@ -27,9 +27,10 @@ use std::thread;
 use std::time::Duration;
 
 use rquickjs::function::Args;
-use rquickjs::{Array, Context, Ctx, Function, Object, Runtime};
+use rquickjs::{Array, Context, Ctx, Function, Object, Runtime, Value};
 
 use crate::bom;
+use crate::protocol::OutEvent;
 use crate::tree::Op;
 
 // --- minimal Win32 surface (no external deps) ---
@@ -89,15 +90,33 @@ const BOOTSTRAP_JS: &str = include_str!("bootstrap.js");
 /// Inbound event injection (host → engine). `push` is callable from any thread
 /// and wakes the parked engine thread immediately, so an event is dispatched
 /// without waiting for the next tick.
+///
+/// Two carriers:
+///   * `push(&str)`  — legacy JSONL lines (BOM pushes until the queue drains,
+///     the EOF marker, anything `run_event_injector` has not migrated).
+///   * `push_event`  — structured [`OutEvent`]s (the ABI path): no
+///     serialization at all, `pump` turns them into typed JS callback args.
 #[derive(Clone)]
 pub struct EventSink {
-    queue: Arc<Mutex<Vec<String>>>,
+    queue: Arc<Mutex<Vec<Inbound>>>,
     engine: thread::Thread,
+}
+
+/// One queued host → engine message.
+enum Inbound {
+    Line(String),
+    Event(OutEvent),
 }
 
 impl EventSink {
     pub fn push(&self, line: String) {
-        self.queue.lock().unwrap().push(line);
+        self.queue.lock().unwrap().push(Inbound::Line(line));
+        self.engine.unpark();
+    }
+
+    /// Structured ABI path: hand the enum itself to the engine thread.
+    pub fn push_event(&self, ev: OutEvent) {
+        self.queue.lock().unwrap().push(Inbound::Event(ev));
         self.engine.unpark();
     }
 
@@ -179,7 +198,7 @@ struct Engine {
     rt: Runtime,
     ctx: Context,
     /// host → engine, drained every tick.
-    queue: Arc<Mutex<Vec<String>>>,
+    queue: Arc<Mutex<Vec<Inbound>>>,
     /// engine → host, handed to the injected `__hostEmit`.
     ops_tx: async_channel::Sender<Vec<Op>>,
     stderr_tee: usize,
@@ -200,7 +219,7 @@ struct Engine {
 impl Engine {
     fn new(
         stderr_tee: usize,
-        queue: Arc<Mutex<Vec<String>>>,
+        queue: Arc<Mutex<Vec<Inbound>>>,
         ops_tx: async_channel::Sender<Vec<Op>>,
         metrics: Arc<bom::WindowMetrics>,
         dialogs: async_channel::Sender<bom::DialogRequest>,
@@ -332,17 +351,55 @@ impl Engine {
         let _ = ctx.globals().set("__hostTrace", host_trace);
 
         // --- the transport ---
-        // `__hostEmit(line)` hands one protocol line to the host's ops channel
-        // on the calling (engine) thread: no pipe write, no reader thread, no
-        // line re-splitting. Ops are parsed here rather than downstream because
-        // this thread is idle ~99% of the time anyway.
         //
-        // This global is *the* carrier — the frontend requires it (it used to
-        // feature-detect `typeof __hostEmit` and fall back to writing JSONL on
-        // stdout, which is gone; see the Transport note at the top).
+        // ABI path (preferred): the frontend hands the host *structured* JS
+        // values — one call per batch, arguments stay typed all the way from
+        // the engine into `tree::parse_op`. No `JSON.stringify` on the JS
+        // side, no `serde_json` text parse on the host side; the only
+        // conversion is rquickjs's `Value` walk (below), which is a pointer
+        // chase instead of a serializer.
+        //
+        //   __hostOps(opsArray)    — `{"t":"batch"}` payload directly
+        //   __hostHello(title)     — the hello handshake + log line
+        //   __hostLog(msg)         — frontend diagnostics
+        //
+        // JSONL path (fallback, kept): `__hostEmit(line)` parses one protocol
+        // line, exactly as before. An old bundle (built before the ABI
+        // existed) keeps working against a new host, and the ABIs degrade to
+        // JSONL transparently — one code path per direction, chosen by the
+        // frontend's feature probe at boot.
+
         let tx = self.ops_tx.clone();
+        let host_ops = Function::new(ctx.clone(), move |ops: Array| {
+            // Each element is the op object itself (`{"op":"create",…}`) —
+            // the batch envelope never carries extra fields, so walking the
+            // array straight into `parse_op` is the whole ingest.
+            let mut parsed: Vec<Op> = Vec::with_capacity(ops.len());
+            for item in ops.iter::<Value>() {
+                let Ok(v) = item else { continue };
+                if let Some(op) = crate::tree::parse_op(&js_to_json(&v)) {
+                    parsed.push(op);
+                }
+            }
+            let _ = tx.send_blocking(parsed);
+        });
+        let _ = ctx.globals().set("__hostOps", host_ops);
+
+        let host_hello = Function::new(ctx.clone(), move |title: String| {
+            crate::log_line(&format!(
+                "[host] frontend hello: {{\"t\":\"hello\",\"proto\":2,\"title\":\"{title}\"}}"
+            ));
+        });
+        let _ = ctx.globals().set("__hostHello", host_hello);
+
+        let host_log = Function::new(ctx.clone(), move |msg: String| {
+            crate::log_line(&format!("[frontend] {msg}"));
+        });
+        let _ = ctx.globals().set("__hostLog", host_log);
+
+        let tx_emit = self.ops_tx.clone();
         let host_emit = Function::new(ctx.clone(), move |line: String| {
-            crate::ingest_line(&line, &tx);
+            crate::ingest_line(&line, &tx_emit);
         });
         let _ = ctx.globals().set("__hostEmit", host_emit);
 
@@ -450,36 +507,87 @@ impl Engine {
             }
             while ctx.execute_pending_job() {}
 
-            // 3) dispatch queued event lines to the 'data' handler; an EOF
-            //    marker instead triggers the app's 'end' handler.
+            // 3) dispatch queued host → engine messages.
+            //    * `Event(OutEvent)` (the ABI path) → one call of the JS
+            //      `__hostEventSink(kind, target, value, top, max, viewport,
+            //      content)` callback with *typed arguments* — io-core
+            //      registers it via `setHostEventSink` at boot. No JSON on
+            //      this path at all. BOM events go to `__bomEvent` instead
+            //      (bootstrap applies them to the window metrics cache).
+            //    * `Line` → the legacy contract: EOF marker runs the app's
+            //      stdin `end` handler; a BOM line is intercepted; anything
+            //      else is delivered to the stdin `data` handler as before
+            //      (older bundles / `__hostEmit` fallback mode).
             if let Ok(cbs) = ctx.globals().get::<_, Object>("__stdinCbs") {
-                let lines: Vec<String> = {
+                let msgs: Vec<Inbound> = {
                     let mut q = self.queue.lock().unwrap();
                     std::mem::take(&mut *q)
                 };
-                for line in lines {
-                    if line == QJS_EOF_MARKER {
-                        if let Ok(end) = cbs.get::<_, Function>("end") {
-                            let _ = end.call::<(), ()>(());
+                for msg in msgs {
+                    match msg {
+                        Inbound::Event(OutEvent::Ev {
+                            target,
+                            kind,
+                            value,
+                            scroll,
+                        }) => {
+                            if let Ok(f) =
+                                ctx.globals().get::<_, Function>("__hostEventSink")
+                            {
+                                let mut a = Args::new(ctx.clone(), 7);
+                                let _ = a.push_arg(kind);
+                                let _ = a.push_arg(target as f64);
+                                // None → JS undefined (not ""): an emptied
+                                // text field must stay distinguishable from
+                                // "this event has no value payload".
+                                let _ = a.push_arg(value);
+                                let (t, m, vp, c) = match scroll {
+                                    Some(s) => (s.top, s.max, s.viewport, s.content),
+                                    None => (0.0, 0.0, 0.0, 0.0),
+                                };
+                                let _ = a.push_arg(t);
+                                let _ = a.push_arg(m);
+                                let _ = a.push_arg(vp);
+                                let _ = a.push_arg(c);
+                                let _ = f.call_arg::<()>(a);
+                            }
                         }
-                        continue;
-                    }
-                    // BOM geometry pushes are host-internal. Apply them and keep
-                    // them off the app's stdin stream — the app would only see
-                    // an unknown `t` it has no handler for, and a future app
-                    // that switches on `t` would be surprised by a private one.
-                    if line.starts_with(BOM_LINE_PREFIX) {
-                        if let Ok(f) = ctx.globals().get::<_, Function>("__bomLine") {
-                            let mut a = Args::new(ctx.clone(), 1);
-                            let _ = a.push_arg(line);
-                            let _ = f.call_arg::<()>(a);
+                        Inbound::Event(OutEvent::Bom { w, h, dpr, sw, sh }) => {
+                            if let Ok(f) = ctx.globals().get::<_, Function>("__bomEvent") {
+                                let mut a = Args::new(ctx.clone(), 5);
+                                let _ = a.push_arg(w);
+                                let _ = a.push_arg(h);
+                                let _ = a.push_arg(dpr);
+                                let _ = a.push_arg(sw);
+                                let _ = a.push_arg(sh);
+                                let _ = f.call_arg::<()>(a);
+                            }
                         }
-                        continue;
-                    }
-                    if let Ok(cb) = cbs.get::<_, Function>("data") {
-                        let mut a = Args::new(ctx.clone(), 1);
-                        let _ = a.push_arg(line + "\n");
-                        let _ = cb.call_arg::<()>(a);
+                        Inbound::Line(line) => {
+                            if line == QJS_EOF_MARKER {
+                                if let Ok(end) = cbs.get::<_, Function>("end") {
+                                    let _ = end.call::<(), ()>(());
+                                }
+                                continue;
+                            }
+                            // BOM geometry pushes are host-internal. Apply them and keep
+                            // them off the app's stdin stream — the app would only see
+                            // an unknown `t` it has no handler for, and a future app
+                            // that switches on `t` would be surprised by a private one.
+                            if line.starts_with(BOM_LINE_PREFIX) {
+                                if let Ok(f) = ctx.globals().get::<_, Function>("__bomLine") {
+                                    let mut a = Args::new(ctx.clone(), 1);
+                                    let _ = a.push_arg(line);
+                                    let _ = f.call_arg::<()>(a);
+                                }
+                                continue;
+                            }
+                            if let Ok(cb) = cbs.get::<_, Function>("data") {
+                                let mut a = Args::new(ctx.clone(), 1);
+                                let _ = a.push_arg(line + "\n");
+                                let _ = cb.call_arg::<()>(a);
+                            }
+                        }
                     }
                 }
             }
@@ -536,7 +644,7 @@ pub fn launch(
     dialogs: async_channel::Sender<bom::DialogRequest>,
     shared: Option<Arc<crate::cdp_state::CdpShared>>,
 ) -> QuickJsHost {
-    let queue: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let queue: Arc<Mutex<Vec<Inbound>>> = Arc::new(Mutex::new(Vec::new()));
     let bundle = load_bundle();
     let stderr_tee = frontend_stderr_tee as usize;
     let reload = reload_handle_from_env();
@@ -595,6 +703,57 @@ pub fn launch(
 // ---------------------------------------------------------------------------
 // plumbing helpers
 // ---------------------------------------------------------------------------
+
+/// Convert an rquickjs [`Value`] into a [`serde_json::Value`] — the ABI
+/// bridge. This is a plain recursive walk (no serializer, no string stage):
+/// the engine's values arrive as borrowed C structures and leave as owned
+/// JSON. Primitives map 1:1; objects/arrays recurse. Anything JSON cannot
+/// represent (functions, symbols, undefined object fields) becomes `Null`,
+/// mirroring `JSON.stringify` semantics so `parse_op` sees identical input
+/// on either path.
+fn js_to_json(v: &Value) -> serde_json::Value {
+    use rquickjs::Type;
+    match v.type_of() {
+        Type::Bool => serde_json::Value::Bool(v.get::<bool>().unwrap_or_default()),
+        // Integers stay integers (`parse_op` reads `as_u64` for ids) — an
+        // f64 that is integral converts losslessly.
+        Type::Int => serde_json::Value::from(v.get::<i64>().unwrap_or_default()),
+        Type::Float => serde_json::json!(v.get::<f64>().unwrap_or_default()),
+        Type::String => {
+            serde_json::Value::String(v.get::<String>().unwrap_or_default())
+        }
+        Type::Array | Type::Object | Type::Exception => {
+            // Arrays and objects both expose property iteration; arrays keep
+            // their dense index keys, which serde_json renders back into an
+            // array-shaped contract via `as_array` in `parse_op`.
+            if let Some(arr) = v.clone().into_array() {
+                let mut out = Vec::with_capacity(arr.len());
+                for item in arr.iter::<Value>() {
+                    match item {
+                        Ok(x) => out.push(js_to_json(&x)),
+                        // A sparse array hole: `undefined` in JS terms.
+                        Err(_) => out.push(serde_json::Value::Null),
+                    }
+                }
+                return serde_json::Value::Array(out);
+            }
+            let mut map = serde_json::Map::new();
+            if let Some(obj) = v.clone().into_object() {
+                for prop in obj.props::<String, Value>() {
+                    match prop {
+                        Ok((k, val)) => map.insert(k, js_to_json(&val)),
+                        Err(_) => continue,
+                    };
+                }
+            }
+            serde_json::Value::Object(map)
+        }
+        // Null, Undefined, functions, symbols, … → null (JSON.stringify
+        // drops undefined object fields entirely, but op payloads never
+        // carry them — `null` keeps the value count stable for debugging).
+        _ => serde_json::Value::Null,
+    }
+}
 
 /// Marker appended by `gpui-ts build` to a copy of the host, immediately before
 /// the application's JS bundle. Picked so a JS source file cannot contain it by
