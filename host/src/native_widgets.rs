@@ -632,7 +632,12 @@ impl HostView {
                 let tree_value = node.value.clone().unwrap_or_default();
                 let live = slider_value_text(&state, cx);
                 let echoed = self.slider_reported.get(&id).map(|s| *s == live).unwrap_or(false);
-                if tree_value != live && !(echoed && tree_value == live) {
+                // While the user is dragging, the native SliderState is the
+                // source of truth for the thumb — never override it with a
+                // (lagging) echoed value, or the thumb snaps back from the
+                // pointer (the "doesn't follow the hand" lag).
+                let dragging = self.slider_dragging.get(&id).copied().unwrap_or(false);
+                if !dragging && tree_value != live && !(echoed && tree_value == live) {
                     if let Some(v) = tree_value.parse::<f32>().ok() {
                         state.update(cx, |st, cx| {
                             let clamped = st.min_value().max(v.min(st.max_value()));

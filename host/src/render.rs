@@ -443,6 +443,7 @@ impl HostView {
         self.date_states.retain(|k, _| live.contains(k));
         self.slider_states.retain(|k, _| live.contains(k));
         self.slider_reported.retain(|k, _| live.contains(k));
+        self.slider_dragging.retain(|k, _| live.contains(k));
         self.select_states.retain(|k, _| live.contains(k));
         self.select_reported.retain(|k, _| live.contains(k));
         self.textarea_states.retain(|k, _| live.contains(k));

@@ -363,6 +363,13 @@ struct HostView {
     /// Last slider value echoed up per node, so a controlled `setValue` echo
     /// does not fight a drag that is still in progress.
     slider_reported: HashMap<u64, String>,
+    /// Whether a drag is currently in progress for this slider node. Set by the
+    /// `SliderEvent` subscription (true on `Change`, false on `Release`). While
+    /// true, `build_native` skips the controlled push-down, so the native
+    /// `SliderState` (which owns the thumb during a drag) is never yanked back
+    /// to a stale echoed value — that pull-back was the "thumb doesn't follow
+    /// the pointer" lag.
+    slider_dragging: HashMap<u64, bool>,
     /// One gpui-component `SelectState` per `select` node (option list,
     /// selection, dropdown open flag). The option list is creation-time — a
     /// different option set is a new select, exactly like the slider scale.
@@ -885,6 +892,7 @@ fn open_host_window(
                 date_states: HashMap::new(),
                 slider_states: HashMap::new(),
                 slider_reported: HashMap::new(),
+                slider_dragging: HashMap::new(),
                 select_states: HashMap::new(),
                 select_reported: HashMap::new(),
                 textarea_states: HashMap::new(),

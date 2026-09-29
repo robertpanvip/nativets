@@ -132,10 +132,25 @@ impl HostView {
                 .step(step)
                 .default_value(seed)
         });
+        // Clone so the (move) subscription closure can read the live value on
+        // Release without consuming the `state` entity we still need below.
+        let state_ev = state.clone();
         cx.subscribe(&state, move |_this: &mut HostView, _st, ev: &SliderEvent, _cx| {
             let value = match ev {
-                SliderEvent::Change(v) => ("input", v.end()),
-                SliderEvent::Release(v) => ("change", v.end()),
+                SliderEvent::Change(v) => {
+                    // Drag in progress: the native SliderState owns the thumb.
+                    // Suppress the controlled push-down until Release so the host
+                    // never yanks the thumb back to a stale echoed value.
+                    _this.slider_dragging.insert(id, true);
+                    ("input", v.end())
+                }
+                SliderEvent::Release(v) => {
+                    _this.slider_dragging.insert(id, false);
+                    // Lock the reported value to the final drag position so the
+                    // post-release echo comparison stays consistent.
+                    _this.slider_reported.insert(id, slider_value_text(&state_ev, _cx));
+                    ("change", v.end())
+                }
             };
             let text = format_value(value.1);
             let msg = crate::protocol::OutEvent::value(id, value.0, text);
