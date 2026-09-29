@@ -257,11 +257,12 @@ declare namespace JSX {
      *
      * Delegation: `click` bubbles like the DOM — an ancestor's `onClick` fires
      * after the target's, with `ev.currentTarget` pointed at the ancestor;
-     * `ev.stopPropagation()` halts the walk. The other kinds stay on target.
+     * `ev.stopped = true` inside a handler halts the walk. The other kinds
+     * stay on target.
      */
     interface IntrinsicProps {
         style?: Style;
-        /** Bubbles to ancestors (DOM click semantics; stopPropagation honored). */
+        /** Bubbles to ancestors (DOM click semantics; ev.stopped honored). */
         onClick?: (ev: HostEvent) => void;
         /** Text field edited; `ev.value` is the new text. */
         onInput?: (ev: HostEvent) => void;
@@ -277,9 +278,11 @@ declare namespace JSX {
          * Controlled value: a literal, or a getter for a controlled widget.
          * input: the text; checkbox/switch: "true"/"false"; select: the
          * option; date: ISO "YYYY-MM-DD"; progress/slider: a number
-         * (percent 0..=100 / thumb position).
+         * (percent 0..=100 / thumb position) — numeric getters must be
+         * wrapped as `() => String(n())` (the runtime has one getter slot
+         * type; a ()=>number value in a ()=>string slot traps).
          */
-        value?: string | number | (() => string | number);
+        value?: string | number | (() => string);
         /** Text field hint, shown while the value is empty. */
         placeholder?: string;
         /** Native checkbox/switch: reactive checked state ("true"/"false" on the wire). */

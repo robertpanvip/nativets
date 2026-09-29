@@ -75,7 +75,8 @@ bool scr_exc_pending(void) { return scr_exc_kind != SCR_EXC_NONE; }
 static void scr_exc_reset(void) {
   if (scr_exc_kind == SCR_EXC_STR) {
     scr_str_release((ScrStr *)scr_exc_payload);
-  } else if (scr_exc_kind == SCR_EXC_REF || scr_exc_kind == SCR_EXC_OBJ) {
+  } else if (scr_exc_kind == SCR_EXC_REF || scr_exc_kind == SCR_EXC_OBJ ||
+             scr_exc_kind == SCR_EXC_PRIMITIVE_REF) {
     scr_exc_release_fn(scr_exc_payload);
   }
   scr_exc_kind = SCR_EXC_NONE;
@@ -121,7 +122,8 @@ void scr_caught_release(ScrCaught *c) {
   if (--c->rc == 0) {
     if (c->kind == SCR_EXC_STR) {
       scr_str_release((ScrStr *)c->payload);
-    } else if (c->kind == SCR_EXC_REF || c->kind == SCR_EXC_OBJ) {
+    } else if (c->kind == SCR_EXC_REF || c->kind == SCR_EXC_OBJ ||
+               c->kind == SCR_EXC_PRIMITIVE_REF) {
       c->release_fn(c->payload);
     }
     scr_obj_free_note();
@@ -136,6 +138,9 @@ void scr_rethrow(const ScrCaught *c) {
   case SCR_EXC_STR: scr_throw_str(scr_str_retain((ScrStr *)c->payload)); break;
   case SCR_EXC_REF:
     scr_throw_ref(c->retain_fn(c->payload), c->retain_fn, c->release_fn, c->trace_fn);
+    break;
+  case SCR_EXC_PRIMITIVE_REF:
+    scr_throw_primitive_ref(c->retain_fn(c->payload), c->retain_fn, c->release_fn, c->trace_fn);
     break;
   case SCR_EXC_OBJ:
     scr_throw_obj(c->retain_fn(c->payload), c->retain_fn, c->release_fn, c->trace_fn);
@@ -183,6 +188,10 @@ bool scr_caught_instanceof(const ScrCaught *c, size_t pre, size_t post) {
   return pre <= vt->pre && vt->pre <= post;
 }
 
+bool scr_caught_is_object(const ScrCaught *c) {
+  return c->kind == SCR_EXC_OBJ || c->kind == SCR_EXC_REF;
+}
+
 ScrStr *scr_caught_to_string(const ScrCaught *c) {
   switch (c->kind) {
   case SCR_EXC_F64: return scr_f64_to_scrstr(c->f64);
@@ -198,6 +207,7 @@ ScrStr *scr_caught_to_string(const ScrCaught *c) {
     }
     /* fall through */
   case SCR_EXC_REF:
+  case SCR_EXC_PRIMITIVE_REF:
     /* Object.prototype.toString — exact for thrown records and class
      * instances without a toString override; thrown arrays/closures/union
      * boxes print this too where Node would vary (SEMANTICS.md). */
@@ -275,7 +285,8 @@ void scr_library_check_exc(void) {
       break;
     }
     /* fall through: non-Error hierarchy objects render like other refs */
-  case SCR_EXC_REF: {
+  case SCR_EXC_REF:
+  case SCR_EXC_PRIMITIVE_REF: {
     const char obj[] = "[object]";
     memcpy(buf + n, obj, sizeof obj - 1);
     n += sizeof obj - 1;
@@ -322,6 +333,18 @@ void scr_throw_ref(void *v, void *(*retain)(void *), void (*release)(void *),
   scr_exc_retain_fn = retain;
   scr_exc_release_fn = release;
   scr_exc_trace_fn = trace;
+}
+
+void scr_throw_primitive_ref(void *v, void *(*retain)(void *), void (*release)(void *),
+                             ScrTraceFn trace) {
+  scr_throw_ref(v, retain, release, trace);
+  scr_exc_kind = SCR_EXC_PRIMITIVE_REF;
+}
+
+void scr_throw_ref_classified(void *v, void *(*retain)(void *), void (*release)(void *),
+                              ScrTraceFn trace, bool object) {
+  scr_throw_ref(v, retain, release, trace);
+  if (!object) scr_exc_kind = SCR_EXC_PRIMITIVE_REF;
 }
 
 void scr_throw_obj(void *v, void *(*retain)(void *), void (*release)(void *),
@@ -372,6 +395,7 @@ void scr_exc_print_uncaught(void) {
     }
     /* fall through: non-Error hierarchy objects render like other refs */
   case SCR_EXC_REF:
+  case SCR_EXC_PRIMITIVE_REF:
     fputs("[object]", stderr);
     break;
   case SCR_EXC_NONE: /* main only calls this when pending */

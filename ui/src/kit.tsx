@@ -36,6 +36,16 @@ import type { Child, El, HostEvent, Style } from "./io";
 class StrFnRef { fn: ((v: string) => void) | null = null; }
 class CtxFnRef { fn: ((ctx: Ctx) => void) | null = null; }
 class PresentFnRef { fn: ((cmds: number, redraws: number) => void) | null = null; }
+/** scriptc 0.1.7 SC2011: calling a `(v: number) => void` props field from
+ * inside a closure leaves the function value without a static representation.
+ * Route it through a class FIELD instead (same workaround as StrFnRef). */
+class NumFnRef { fn: ((v: number) => void) | null = null; }
+/** Zero-arg callbacks (onClick/onClose). NEVER invoke these through a
+ * `CtxFnRef` with `f(undefined as unknown as Ctx)` — the cast compiles to an
+ * eager `union_narrow` of `undefined` into the Ctx object union, which THROWS
+ * at runtime ("undefined is not representable in ..."). A `() => void` field
+ * accepts a zero-param arrow as-is: no re-tag, no cast, no trap. */
+class VoidFnRef { fn: (() => void) | null = null; }
 import { createCanvas } from "./canvas2d";
 import type { Ctx } from "./canvas2d";
 import { C } from "./theme";
@@ -142,15 +152,17 @@ export function Button(props: {
         color: "#ffffff",
     };
     if (props.style !== undefined) mergeStyleInto(style, props.style);
-    const clickRef = new CtxFnRef();
-    clickRef.fn = () => props.onClick();
+    const clickRef = new VoidFnRef();
+    // Zero-param arrow drops straight into a `() => void` field — no SC2003
+    // re-tag needed (that only applies to non-void function unions).
+    clickRef.fn = (): void => { props.onClick(); };
     const inner = props.label !== undefined ? text(props.label, { fontSize: 13 }) : props.children;
     return (
         <button
             style={style}
-            onClick={(ev: HostEvent) => {
+            onClick={(_ev: HostEvent): void => {
                 const f = clickRef.fn;
-                if (f !== null) f(undefined as unknown as Ctx);
+                if (f !== null) f();
             }}
         >
             {inner}
@@ -331,7 +343,9 @@ export function Progress(props: {
     if (props.height !== undefined) style.height = props.height;
     if (props.loading === true) style.loading = 1;
     if (props.style !== undefined) mergeStyleInto(style, props.style);
-    return h("progress", { style: style, value: props.value });
+    // ()=>number getter → ()=>string wrapper (slot-type discipline, see Rating).
+    const numToStr = props.value;
+    return h("progress", { style: style, value: (): string => String(numToStr()) });
 }
 
 /** A cycling loading spinner (`fontSize` scales the icon). */
@@ -349,21 +363,25 @@ export function Rating(props: {
     max?: number;
     style?: Style;
 }): El {
-    const chgRef = new StrFnRef();
+    const chgRef = new NumFnRef();
     if (props.onChange !== undefined) {
-        chgRef.fn = (v: string) => {
-            if (props.onChange !== undefined) props.onChange(parseFloat(v));
-        };
+        const inner = props.onChange;
+        chgRef.fn = (v: number): void => { inner(v); };
     }
     const style: Style = {};
     if (props.max !== undefined) style.max = props.max;
     if (props.style !== undefined) mergeStyleInto(style, props.style);
+    // value getter is ()=>number; the protocol value channel carries strings
+    // spelled from numbers (see applyValue). Wrap to a ()=>string getter —
+    // scriptc 0.1.7 cannot tell ()=>string from ()=>number apart at runtime,
+    // and calling a ()=>string slot with a ()=>number value traps (SC4013).
+    const numToStr = props.value;
     return h("rating", {
         style: style,
-        value: props.value,
-        onChange: (ev: HostEvent) => {
+        value: (): string => String(numToStr()),
+        onChange: (ev: HostEvent): void => {
             const f = chgRef.fn;
-            if (f !== null) f(String(ev.value));
+            if (f !== null) f(parseFloat(String(ev.value)));
         },
     });
 }
@@ -384,17 +402,15 @@ export function Slider(props: {
     width?: number;
     style?: Style;
 }): El {
-    const inRef = new StrFnRef();
+    const inRef = new NumFnRef();
     if (props.onInput !== undefined) {
-        inRef.fn = (v: string) => {
-            if (props.onInput !== undefined) props.onInput(parseFloat(v));
-        };
+        const inner = props.onInput;
+        inRef.fn = (v: number): void => { inner(v); };
     }
-    const chgRef = new StrFnRef();
+    const chgRef = new NumFnRef();
     if (props.onChange !== undefined) {
-        chgRef.fn = (v: string) => {
-            if (props.onChange !== undefined) props.onChange(parseFloat(v));
-        };
+        const inner = props.onChange;
+        chgRef.fn = (v: number): void => { inner(v); };
     }
     const style: Style = {};
     if (props.width !== undefined) style.width = props.width;
@@ -402,17 +418,20 @@ export function Slider(props: {
     if (props.max !== undefined) style.max = props.max;
     if (props.step !== undefined) style.step = props.step;
     if (props.style !== undefined) mergeStyleInto(style, props.style);
-    const onNum = (ev: HostEvent) => String(ev.value);
+    const onNum = (ev: HostEvent): string => String(ev.value);
+    // ()=>number getter → ()=>string wrapper (same slot-type rationale as
+    // Rating above: the runtime cannot distinguish getter arms).
+    const numToStr = props.value;
     return h("slider", {
         style: style,
-        value: props.value,
-        onInput: (ev: HostEvent) => {
+        value: (): string => String(numToStr()),
+        onInput: (ev: HostEvent): void => {
             const f = inRef.fn;
-            if (f !== null) f(onNum(ev));
+            if (f !== null) f(parseFloat(onNum(ev)));
         },
-        onChange: (ev: HostEvent) => {
+        onChange: (ev: HostEvent): void => {
             const f = chgRef.fn;
-            if (f !== null) f(onNum(ev));
+            if (f !== null) f(parseFloat(onNum(ev)));
         },
     });
 }
@@ -604,8 +623,11 @@ export function AlertNative(props: {
     onClose?: () => void;
     style?: Style;
 }): El {
-    const closeRef = new CtxFnRef();
-    if (props.onClose !== undefined) closeRef.fn = () => props.onClose!();
+    const closeRef = new VoidFnRef();
+    if (props.onClose !== undefined) {
+        const inner = props.onClose;
+        closeRef.fn = (): void => { inner(); };
+    }
     const style: Style = {};
     if (props.style !== undefined) mergeStyleInto(style, props.style);
     return h("alert", {
@@ -613,7 +635,7 @@ export function AlertNative(props: {
         text: props.text,
         onClose: () => {
             const f = closeRef.fn;
-            if (f !== null) f(undefined as unknown as Ctx);
+            if (f !== null) f();
         },
     });
 }
@@ -671,8 +693,11 @@ export function Link(props: {
     onClick?: () => void;
     style?: Style;
 }): El {
-    const clickRef = new CtxFnRef();
-    if (props.onClick !== undefined) clickRef.fn = () => props.onClick!();
+    const clickRef = new VoidFnRef();
+    if (props.onClick !== undefined) {
+        const inner = props.onClick;
+        clickRef.fn = (): void => { inner(); };
+    }
     const style: Style = {};
     if (props.href !== undefined) style.href = props.href;
     if (props.style !== undefined) mergeStyleInto(style, props.style);
@@ -682,7 +707,7 @@ export function Link(props: {
             style: style,
             onClick: () => {
                 const f = clickRef.fn;
-                if (f !== null) f(undefined as unknown as Ctx);
+                if (f !== null) f();
             },
         },
         props.children,

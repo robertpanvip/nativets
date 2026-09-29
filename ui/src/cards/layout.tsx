@@ -3,7 +3,7 @@
  */
 
 import { h, text } from "../io";
-import type { El, Props } from "../io";
+import type { El, HostEvent, Props } from "../io";
 import { C } from "../theme";
 import { ScrollArea } from "../kit";
 import { CounterCard } from "./counter";
@@ -18,6 +18,13 @@ import { ExtendedComponentsCard } from "./extended";
 import { StatsRow } from "./stats";
 import { outerScrolls, setOuterScrolls, nav, mode } from "../state";
 
+/** scriptc 0.1.7: a zero-param arrow cannot re-tag into the HostEventHandler
+ * union (SC2003) — handlers are declared in the single `(ev: HostEvent)`
+ * arm and ignore the argument, like scroll.tsx's onLogScroll. */
+function bumpOuterScrolls(_ev: HostEvent): void {
+    setOuterScrolls(outerScrolls() + 1);
+}
+
 export function MainPanel(_props: Props): El {
     return (
         <div style={{ flexDirection: "column", gap: 14, grow: 1, height: "100%", minWidth: 0 }}>
@@ -28,7 +35,7 @@ export function MainPanel(_props: Props): El {
                 to be worth a scrollbar. */}
             <ScrollArea
                 grow
-                onScroll={() => setOuterScrolls(outerScrolls() + 1)}
+                onScroll={bumpOuterScrolls}
                 style={{
                     gap: 14,
                     padding: 0,

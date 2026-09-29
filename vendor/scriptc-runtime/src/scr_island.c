@@ -1471,6 +1471,13 @@ ScrStr *scr_jsval_typeof(ScrJsval *a) {
   return s;
 }
 
+bool scr_jsval_is_object(ScrJsval *a) {
+  ScrStr *type = scr_jsval_typeof(a);
+  bool object = type->len == 6 && memcmp(type->data, "object", 6) == 0;
+  scr_str_release(type);
+  return object;
+}
+
 ScrStr *scr_jsval_to_str(ScrJsval *a) {
   isl_entry();
   return isl_js_to_str(a->v); /* NULL = bridged (e.g. a symbol) */
@@ -1488,10 +1495,17 @@ ScrJsval *scr_jsval_get_prop(ScrJsval *o, const ScrStr *name) {
   return isl_cell_new(r);
 }
 
+static void isl_ensure_node_globals(void);
+
 /* A member of the engine's global object by name (Math, parseFloat, ...) —
  * the receiver/callee for the island-backed ambient surface. */
 ScrJsval *scr_jsval_global_get(const ScrStr *name) {
   isl_entry();
+  /* A typed program can explicitly escape through globalThis without an
+   * embedded npm import. Install the same Node globals that an embedded
+   * module sees before returning that object. */
+  if (name->len == 10 && memcmp(name->data, "globalThis", 10) == 0)
+    isl_ensure_node_globals();
   JSValue g = JS_GetGlobalObject(isl_ctx); /* owned */
   JSValue r = JS_GetPropertyStr(isl_ctx, g, name->data); /* owned */
   JS_FreeValue(isl_ctx, g);
@@ -3576,10 +3590,14 @@ static const char isl_modules_bootstrap[] =
     /* Node's events module: the emitter surface streams and CLIs drive —
      * prepend/once/remove with listener-unwrap, maxListeners bookkeeping
      * (warnings are not emitted), eventNames/rawListeners, Node's
-     * unhandled-'error' throw, and the once/getEventListeners statics. */
+     * unhandled-'error' throw, and the once/getEventListeners statics.
+     * EventEmitter is callable so legacy constructors can use .call(this). */
     "  builtins.events = memo(() => {\n"
-    "    class EventEmitter {\n"
-    "      constructor() { this._events = Object.create(null); this._maxListeners = undefined; }\n"
+    "    function EventEmitter() {\n"
+    "      if (this._events === undefined || !Object.prototype.hasOwnProperty.call(this, '_events')) this._events = Object.create(null);\n"
+    "      if (!Object.prototype.hasOwnProperty.call(this, '_maxListeners')) this._maxListeners = undefined;\n"
+    "    }\n"
+    "    class EventEmitterMethods {\n"
     "      _add(n, f, prepend) {\n"
     "        if (typeof f !== 'function') {\n"
     "          const e = new TypeError('The \"listener\" argument must be of type function. Received ' + (f === null ? 'null' : typeof f));\n"
@@ -3648,6 +3666,8 @@ static const char isl_modules_bootstrap[] =
     "      rawListeners(n) { const a = this._events[n]; return a ? a.slice() : []; }\n"
     "      eventNames() { return Object.keys(this._events); }\n"
     "    }\n"
+    "    EventEmitter.prototype = EventEmitterMethods.prototype;\n"
+    "    EventEmitter.prototype.constructor = EventEmitter;\n"
     "    EventEmitter.defaultMaxListeners = 10;\n"
     "    EventEmitter.errorMonitor = Symbol('events.errorMonitor');\n"
     "    EventEmitter.captureRejectionSymbol = Symbol.for('nodejs.rejection');\n"
@@ -8203,16 +8223,9 @@ static const char isl_modules_bootstrap[] =
     "    v8.default = v8;\n"
     "    return v8;\n"
     "  });\n"
-    /* node:dns — LOADABLE with Node's surface shape, answers fenced at
-     * the call. proxy-agent's pac-resolver (in a real CLI's graph
-     * whenever proxy env vars exist) requires dns at LOAD and only calls
-     * lookup when a PAC proxy actually resolves — so the module must
-     * import cleanly, and the callback-taking members deliver their
-     * refusal THROUGH the callback (Node's error channel for dns), which
-     * keeps a caller's own error handling alive instead of crashing the
-     * call site. promises members reject. No resolver ships: the island
-     * has no DNS client — the fence text says so at the only point Node
-     * would have queried. */
+    /* node:dns and node:dns/promises load before callers perform a lookup.
+     * Network queries fence through the callback or promise error channel
+     * at the call. The island has no DNS client. */
     "  builtins.dns = memo(() => {\n"
     "    const fenceErr = (what) => {\n"
     "      const e = new Error(\"node:dns '\" + what + \"' is not supported in the scriptc island yet\");\n"
@@ -8226,37 +8239,51 @@ static const char isl_modules_bootstrap[] =
     "      throw fenceErr(what);\n"
     "    };\n"
     "    const pFence = (what) => (...args) => Promise.reject(fenceErr(what));\n"
+    "    let defaultResultOrder = 'verbatim';\n"
+    "    const getDefaultResultOrder = () => defaultResultOrder;\n"
+    "    const setDefaultResultOrder = (order) => {\n"
+    "      if (!['verbatim', 'ipv4first', 'ipv6first'].includes(order)) throw new TypeError('Invalid DNS result order: ' + order);\n"
+    "      defaultResultOrder = order;\n"
+    "    };\n"
+    "    const getServers = () => [];\n"
+    "    const setServers = () => {};\n"
+    "    const queryMethods = ['resolve', 'resolve4', 'resolve6', 'resolveAny', 'resolveCaa', 'resolveCname', 'resolveMx', 'resolveNaptr', 'resolveNs', 'resolvePtr', 'resolveSoa', 'resolveSrv', 'resolveTlsa', 'resolveTxt', 'reverse'];\n"
     "    const promises = {\n"
     "      lookup: pFence('lookup'), lookupService: pFence('lookupService'),\n"
-    "      resolve: pFence('resolve'), resolve4: pFence('resolve4'), resolve6: pFence('resolve6'),\n"
-    "      resolveCname: pFence('resolveCname'), resolveMx: pFence('resolveMx'),\n"
-    "      resolveNs: pFence('resolveNs'), resolveSrv: pFence('resolveSrv'),\n"
-    "      resolveTxt: pFence('resolveTxt'), reverse: pFence('reverse'),\n"
-    "      getServers: () => [], setServers: () => {},\n"
+    "      getServers, setServers, getDefaultResultOrder, setDefaultResultOrder,\n"
     "    };\n"
     "    class Resolver {\n"
     "      constructor() {}\n"
-    "      getServers() { return []; }\n"
-    "      setServers() {}\n"
+    "      getServers() { return getServers(); }\n"
+    "      setServers(servers) { return setServers(servers); }\n"
+    "      cancel() {}\n"
     "    }\n"
-    "    for (const m of ['resolve', 'resolve4', 'resolve6', 'resolveCname', 'resolveMx', 'resolveNs', 'resolveSrv', 'resolveTxt', 'reverse']) {\n"
-    "      Resolver.prototype[m] = cbFence(m);\n"
-    "    }\n"
+    "    const PromiseResolver = class Resolver {\n"
+    "      getServers() { return getServers(); }\n"
+    "      setServers(servers) { return setServers(servers); }\n"
+    "      cancel() {}\n"
+    "    };\n"
+    "    promises.Resolver = PromiseResolver;\n"
     "    const d = {\n"
     "      lookup: cbFence('lookup'), lookupService: cbFence('lookupService'),\n"
-    "      resolve: cbFence('resolve'), resolve4: cbFence('resolve4'), resolve6: cbFence('resolve6'),\n"
-    "      resolveCname: cbFence('resolveCname'), resolveMx: cbFence('resolveMx'),\n"
-    "      resolveNs: cbFence('resolveNs'), resolveSrv: cbFence('resolveSrv'),\n"
-    "      resolveTxt: cbFence('resolveTxt'), reverse: cbFence('reverse'),\n"
-    "      getServers: () => [], setServers: () => {},\n"
-    "      Resolver, promises,\n"
-    "      ADDRCONFIG: 1024, V4MAPPED: 2048, ALL: 256,\n"
-    "      NODATA: 'ENODATA', FORMERR: 'EFORMERR', SERVFAIL: 'ESERVFAIL',\n"
-    "      NOTFOUND: 'ENOTFOUND', NOTIMP: 'ENOTIMP', REFUSED: 'EREFUSED',\n"
+    "      getServers, setServers, getDefaultResultOrder, setDefaultResultOrder,\n"
+    "      Resolver, promises, ADDRCONFIG: 1024, V4MAPPED: 2048, ALL: 256,\n"
     "    };\n"
+    "    for (const m of queryMethods) {\n"
+    "      Resolver.prototype[m] = cbFence(m);\n"
+    "      PromiseResolver.prototype[m] = pFence(m);\n"
+    "      d[m] = cbFence(m);\n"
+    "      promises[m] = pFence(m);\n"
+    "    }\n"
+    "    for (const name of ['NODATA', 'FORMERR', 'SERVFAIL', 'NOTFOUND', 'NOTIMP', 'REFUSED', 'BADQUERY', 'BADNAME', 'BADFAMILY', 'BADRESP', 'CONNREFUSED', 'TIMEOUT', 'EOF', 'FILE', 'NOMEM', 'DESTRUCTION', 'BADSTR', 'BADFLAGS', 'NONAME', 'BADHINTS', 'NOTINITIALIZED', 'LOADIPHLPAPI', 'ADDRGETNETWORKPARAMS', 'CANCELLED']) {\n"
+    "      const value = name === 'EOF' ? name : 'E' + name;\n"
+    "      d[name] = value;\n"
+    "      promises[name] = value;\n"
+    "    }\n"
     "    d.default = d;\n"
     "    return d;\n"
     "  });\n"
+    "  builtins['dns/promises'] = memo(() => builtins.dns().promises);\n"
     /* node:readline — createInterface over any Readable-ish input
      * (data-event line splitting, question/line/close, async
      * iteration) and the cursor-control writers (the ANSI sequences
@@ -9360,6 +9387,10 @@ static void isl_modules_boot(void) {
   isl_booted = true;
 }
 
+static void isl_ensure_node_globals(void) {
+  if (!isl_booted) isl_modules_boot();
+}
+
 static void isl_install_module_loader(void) {
   JS_SetModuleLoaderFunc(isl_rt, isl_module_normalize, isl_module_load, NULL);
   if (isl_mods) isl_modules_boot();
@@ -9496,7 +9527,7 @@ static void isl_rejections_drop_reason(JSValueConst reason) {
 
 ScrJsval *scr_jsval_import_dyn(const ScrStr *key) {
   isl_entry();
-  if (!isl_booted) isl_modules_boot();
+  isl_ensure_node_globals();
   JSValue promise = JS_LoadModule(isl_ctx, ISL_IMPORT_BASE, key->data);
   if (!JS_IsException(promise)) {
     /* Settlement flows through reaction jobs (each module's own promise
@@ -9717,6 +9748,7 @@ ScrJsval *scr_jsval_from_bytes(const ScrBytes *b) {
   JSValue v = JS_NewTypedArray(isl_ctx, 3, argv,
                                b->elem == SCR_BYTES_U32   ? JS_TYPED_ARRAY_UINT32
                                : b->elem == SCR_BYTES_I32 ? JS_TYPED_ARRAY_INT32
+                               : b->elem == SCR_BYTES_F64 ? JS_TYPED_ARRAY_FLOAT64
                                                           : JS_TYPED_ARRAY_FLOAT32);
   JS_FreeValue(isl_ctx, buf);
   if (JS_IsException(v)) {

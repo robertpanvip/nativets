@@ -3,7 +3,12 @@
  * (createSignal/createEffect), and the root mount. Built on the protocol
  * core in ./io-core.
  */
-import { AnyComponent, Child, El, Fragment, HostEvent, Props, Style, appendChild, clearEl, create, createEffect, sendHello, setEvents, setLineHandler, setStyle, setText, setValue, wireEvent } from "./io-core";
+import { Fragment, appendChild, clearEl, create, createEffect, sendHello, setEvents, setLineHandler, setStyle, setText, setValue, wireEvent } from "./io-core";
+// scriptc 0.1.7: `export type X` is a TYPE-only export — pulling it through a
+// value import list makes the runtime module check fail with SC4013
+// ("does not provide an export named 'X'"). El/HostEvent/Props/Style and
+// AnyComponent/Child are type-position-only here, so they ride `import type`.
+import type { AnyComponent, Child, El, HostEvent, Props, Style } from "./io-core";
 
 /**
  * Controlled native widgets (gpui-component migration): these tags are
@@ -95,17 +100,36 @@ export function h(tag: string | AnyComponent, props: Props | null, ...children: 
 
 /**
  * Bind a field value: a function is treated as a getter and re-pushed
- * whenever a signal it reads changes. Numeric values (slider thumb, progress
- * percent) ride the same `setValue` channel spelled as strings.
+ * whenever a signal it reads changes. Values ride the same `setValue`
+ * channel spelled as strings (numbers are stringified at the call site or
+ * by the kit wrappers — the wire has no number arm).
+ *
+ * scriptc 0.1.7: the runtime cannot tell a ()=>string slot from a ()=>number
+ * slot apart — calling through the wrong arm traps (SC4013). With the getter
+ * domain pinned to ONE arm (()=>string, see Props.value), a single cast is
+ * exact; `typeof` narrows the primitive arms before they convert.
+ *
+ * The casts MUST live inside their branches. `const x = value as string`
+ * written ahead of the checks lowers to an eager union_narrow that throws
+ * ("a '() => string' value is not representable in the target union") the
+ * moment a getter reaches this function — the union model has no
+ * cast-then-test, only test-then-cast (same shape as `text()` below).
  */
-function applyValue(e: El, value: string | number | (() => string) | (() => number)): void {
-    if (typeof value === "function") {
-        createEffect(() => {
-            setValue(e, String(value()));
-        });
+function applyValue(e: El, value: string | number | (() => string)): void {
+    if (typeof value === "string") {
+        setValue(e, String(value as string));
         return;
     }
-    setValue(e, String(value));
+    if (typeof value === "number") {
+        setValue(e, String(value as number));
+        return;
+    }
+    // Getter arm — reached only when value is neither string nor number, so
+    // the function-arm narrow cannot see a mismatched tag.
+    const getter = value as (() => string);
+    createEffect(() => {
+        setValue(e, String(getter()));
+    });
 }
 
 /**

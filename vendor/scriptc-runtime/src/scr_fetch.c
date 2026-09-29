@@ -376,8 +376,9 @@ static void sf_throw_dyn_reason(ScrDyn *reason) {
     scr_throw_str(scr_str_retain(reason->v.str));
     return;
   default:
-    scr_throw_ref(scr_dyn_retain(reason ? reason : scr_dyn_undefined()),
-                  &scr_dyn_retain_v, &scr_dyn_release_v, NULL);
+    scr_throw_ref_classified(scr_dyn_retain(reason ? reason : scr_dyn_undefined()),
+                             &scr_dyn_retain_v, &scr_dyn_release_v, NULL,
+                             scr_dyn_is_object(reason ? reason : scr_dyn_undefined()));
     return;
   }
 }

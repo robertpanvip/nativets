@@ -3,7 +3,7 @@
  *
  * Model (see docs/ir.md):
  * - An async function's body is ordinary compiled C, run on its own fiber
- *   (heap-allocated ucontext stack). Calling it runs the body EAGERLY until
+ *   (dedicated ucontext stack). Calling it runs the body EAGERLY until
  *   the first suspension (JS's synchronous-prefix rule), then control
  *   returns to the spawner with a +1 promise.
  * - `await` on a pending promise parks the fiber on the promise's waiter
@@ -18,6 +18,13 @@
  *   downgrades to a note in that case.
  */
 #define _XOPEN_SOURCE 700
+/* Anonymous mappings alongside the XSI ucontext API on Darwin and glibc. */
+#ifndef _DARWIN_C_SOURCE
+#define _DARWIN_C_SOURCE 1
+#endif
+#ifndef _DEFAULT_SOURCE
+#define _DEFAULT_SOURCE 1
+#endif
 #include "scr_runtime.h"
 
 #include <errno.h>
@@ -27,7 +34,7 @@
 #include <string.h>
 #include <time.h>
 #ifdef _WIN32
-/* Windows arm: fibers come from the Win32 Fibers API (CreateFiber /
+/* Windows arm: fibers come from the Win32 Fibers API (CreateFiberEx /
  * SwitchToFiber — the direct ucontext analog: cooperatively scheduled,
  * same thread, own stack); the idle sleep is nanosleep (mingw-w64 ships
  * it, over Sleep). poll(2) has no Windows arm — see the sleep seam in
@@ -43,6 +50,7 @@
 #include <poll.h>
 #include <pthread.h>
 #include <signal.h>
+#include <sys/mman.h>
 #include <ucontext.h>
 #include <unistd.h>
 #endif
@@ -53,6 +61,7 @@
  * their empty implementation makes the absence explicit at link time
  * without weakening async/timer support. */
 bool scr_children_pending(void) { return false; }
+bool scr_children_ready(void) { return false; }
 bool scr_children_reffed_pending(void) { return false; }
 bool scr_children_failed_pending(void) { return false; }
 void scr_children_poll(void) {}
@@ -79,12 +88,63 @@ void __sanitizer_finish_switch_fiber(void *fake_stack_save, const void **bottom_
  * the measured need: an engine call costs 64–96KB there, and a real
  * embedded graph entered FROM A FIBER (a commander action awaiting
  * generateText — zod parses inside promise chains) nests dozens of engine
- * frames; the memory is malloc'd and committed lazily, so idle fibers pay
- * address space, not RSS. */
+ * frames; native POSIX stacks are mapped and committed lazily, so idle
+ * fibers pay address space, not RSS. */
 #ifdef SCR_ASAN_FIBERS
 #define SCR_FIBER_STACK (8 * 1024 * 1024)
 #else
 #define SCR_FIBER_STACK (256 * 1024)
+#endif
+
+#if !defined(_WIN32) && !defined(__wasi__)
+/* Keep stacks out of malloc's size classes. Reuse a bounded number during
+ * a burst of promise/generator work, then unmap the spares before the loop
+ * sleeps. This avoids both heap fragmentation and per-call mmap overhead.
+ * The sanitizer lane unmaps every finished stack immediately. */
+#ifndef SCR_ASAN_FIBERS
+#define SCR_FIBER_SPARES 4
+static SCR_TL void *scr_fiber_spares[SCR_FIBER_SPARES];
+static SCR_TL size_t scr_fiber_nspares;
+static SCR_TL bool scr_fiber_cleanup_registered;
+#endif
+
+static void scr_fiber_stacks_clear(void) {
+#ifndef SCR_ASAN_FIBERS
+  while (scr_fiber_nspares > 0) {
+    (void)munmap(scr_fiber_spares[--scr_fiber_nspares], SCR_FIBER_STACK);
+    scr_fiber_spares[scr_fiber_nspares] = NULL;
+  }
+#endif
+}
+
+static void *scr_fiber_stack_new(void) {
+#ifndef SCR_ASAN_FIBERS
+  if (scr_fiber_nspares > 0) {
+    void *stack = scr_fiber_spares[--scr_fiber_nspares];
+    scr_fiber_spares[scr_fiber_nspares] = NULL;
+    return stack;
+  }
+  if (!scr_fiber_cleanup_registered) {
+    scr_fiber_cleanup_registered = true;
+    scr_atexit(scr_fiber_stacks_clear);
+  }
+#endif
+  void *stack = mmap(NULL, SCR_FIBER_STACK, PROT_READ | PROT_WRITE,
+                    MAP_PRIVATE | MAP_ANON, -1, 0);
+  if (stack == MAP_FAILED) scr_trap("scriptc: out of memory\n");
+  return stack;
+}
+
+static void scr_fiber_stack_free(void *stack) {
+  if (!stack) return;
+#ifndef SCR_ASAN_FIBERS
+  if (scr_fiber_nspares < SCR_FIBER_SPARES) {
+    scr_fiber_spares[scr_fiber_nspares++] = stack;
+    return;
+  }
+#endif
+  (void)munmap(stack, SCR_FIBER_STACK);
+}
 #endif
 
 /* ── promises ─────────────────────────────────────────────────────────── */
@@ -170,7 +230,8 @@ static void scr_promise_trace(void *o, ScrTraceVisit visit, void *ctx) {
   /* Waiters are fibers (not refcounted objects) — the settled payload and
    * the combinator destinations are the strong references this promise
    * owns (destination promises are cycle-headered). */
-  if ((p->payload_kind == SCR_EXC_REF || p->payload_kind == SCR_EXC_OBJ) &&
+  if ((p->payload_kind == SCR_EXC_REF || p->payload_kind == SCR_EXC_OBJ ||
+       p->payload_kind == SCR_EXC_PRIMITIVE_REF) &&
       p->trace_fn) {
     visit(p->payload, ctx);
   }
@@ -184,7 +245,8 @@ static void scr_promise_gcfree(void *o) {
   ScrPromise *p = (ScrPromise *)o;
   if (p->payload_kind == SCR_EXC_STR) {
     scr_str_release((ScrStr *)p->payload);
-  } else if ((p->payload_kind == SCR_EXC_REF || p->payload_kind == SCR_EXC_OBJ) &&
+  } else if ((p->payload_kind == SCR_EXC_REF || p->payload_kind == SCR_EXC_OBJ ||
+              p->payload_kind == SCR_EXC_PRIMITIVE_REF) &&
              p->payload && !p->trace_fn) {
     p->release_fn(p->payload);
   }
@@ -253,7 +315,8 @@ ScrPromise *scr_promise_retain(ScrPromise *p) {
 
 static void scr_promise_release_payload(ScrPromise *p) {
   if (p->payload_kind == SCR_EXC_STR) scr_str_release((ScrStr *)p->payload);
-  else if ((p->payload_kind == SCR_EXC_REF || p->payload_kind == SCR_EXC_OBJ) &&
+  else if ((p->payload_kind == SCR_EXC_REF || p->payload_kind == SCR_EXC_OBJ ||
+            p->payload_kind == SCR_EXC_PRIMITIVE_REF) &&
            p->payload) p->release_fn(p->payload);
   p->payload_kind = SCR_EXC_NONE;
   p->payload = NULL;
@@ -397,7 +460,9 @@ static size_t scr_ready_head = 0, scr_ready_len = 0, scr_ready_cap = 0;
 
 static void scr_ready_push(ScrFiber *f) {
   if (scr_ready_head + scr_ready_len == scr_ready_cap) {
-    memmove(scr_ready, scr_ready + scr_ready_head, scr_ready_len * sizeof *scr_ready);
+    if (scr_ready_len > 0) {
+      memmove(scr_ready, scr_ready + scr_ready_head, scr_ready_len * sizeof *scr_ready);
+    }
     scr_ready_head = 0;
     if (scr_ready_len == scr_ready_cap) {
       scr_ready_cap = scr_ready_cap ? scr_ready_cap * 2 : 16;
@@ -949,7 +1014,8 @@ static void scr_promise_settle_from(ScrPromise *dst, ScrPromise *src) {
     dst->payload = NULL;
     if (src->payload_kind == SCR_EXC_STR && src->payload) {
       dst->payload = scr_str_retain((ScrStr *)src->payload);
-    } else if ((src->payload_kind == SCR_EXC_REF || src->payload_kind == SCR_EXC_OBJ) &&
+    } else if ((src->payload_kind == SCR_EXC_REF || src->payload_kind == SCR_EXC_OBJ ||
+                src->payload_kind == SCR_EXC_PRIMITIVE_REF) &&
                src->payload) {
       dst->payload = src->retain_fn(src->payload);
     }
@@ -1197,6 +1263,34 @@ static void scr_trampoline(void) {
   /* unreachable */
 }
 
+#if !defined(_WIN32) && !defined(__wasi__)
+/* Apple Silicon's makecontext clears all of uc_stack before installing the
+ * initial registers. Passing the whole mapping eagerly commits 256 KiB
+ * (8 MiB under ASan) per call, defeating the lazy allocation above. Its
+ * zero-argument startup frame only needs the top of the downward-growing
+ * stack. Initialize that window, then publish the FULL stack bounds before
+ * any execution or sanitizer switch. The stack top and saved SP are the
+ * same as when initializing the full mapping; ordinary calls can still
+ * use all of SCR_FIBER_STACK.
+ * See libplatform/src/ucontext/generic/makecontext.c's arm64 implementation. */
+static void scr_fiber_context_init(ScrFiber *f) {
+  f->stack = scr_fiber_stack_new();
+  if (getcontext(&f->ctx) != 0) scr_trap("scriptc: getcontext failed\n");
+  f->ctx.uc_stack.ss_sp = f->stack;
+  f->ctx.uc_stack.ss_size = SCR_FIBER_STACK;
+  f->ctx.uc_stack.ss_flags = 0;
+  f->ctx.uc_link = NULL;
+#if defined(__APPLE__) && defined(__aarch64__)
+  const size_t bootstrap = 16 * 1024;
+  f->ctx.uc_stack.ss_sp = f->stack + SCR_FIBER_STACK - bootstrap;
+  f->ctx.uc_stack.ss_size = bootstrap;
+#endif
+  makecontext(&f->ctx, scr_trampoline, 0);
+  f->ctx.uc_stack.ss_sp = f->stack;
+  f->ctx.uc_stack.ss_size = SCR_FIBER_STACK;
+}
+#endif
+
 /* Frees a finished fiber's execution resources (the promise release and
  * bookkeeping stay at the call sites). Windows: DeleteFiber tears down the
  * fiber object and its stack — legal here because a finished fiber has
@@ -1208,7 +1302,11 @@ static void scr_fiber_destroy(ScrFiber *f) {
   if (f->coro != NULL) scr_wasi_coro_destroy(f->coro);
 #endif
   scr_als_ctx_release(f->als);
+#if !defined(_WIN32) && !defined(__wasi__)
+  scr_fiber_stack_free(f->stack);
+#else
   free(f->stack);
+#endif
   free(f);
 }
 
@@ -1226,10 +1324,11 @@ ScrPromise *scr_async_spawn(void (*entry)(ScrFiber *, void *), void *argpack) {
   scr_fibers_live++;
 
 #ifdef _WIN32
-  /* The commit size is the ucontext stack's size; the reserve stays the
-   * default 1MB. Committed lazily by the OS, like the malloc'd stacks. */
+  /* Commit one page initially; Windows commits further pages as the stack
+   * grows. Keep the executable's stack reserve, as with CreateFiber,
+   * without committing SCR_FIBER_STACK for every idle fiber. */
   ScrCtx here = scr_win_self();
-  f->ctx = CreateFiber(SCR_FIBER_STACK, scr_trampoline, NULL);
+  f->ctx = CreateFiberEx(4096, 0, 0, scr_trampoline, NULL);
   if (f->ctx == NULL) scr_oom();
 #elif defined(__wasi__)
   ScrFiber *spawner = scr_current;
@@ -1248,13 +1347,7 @@ ScrPromise *scr_async_spawn(void (*entry)(ScrFiber *, void *), void *argpack) {
   }
   return result;
 #else
-  f->stack = malloc(SCR_FIBER_STACK);
-  if (!f->stack) scr_oom();
-  getcontext(&f->ctx);
-  f->ctx.uc_stack.ss_sp = f->stack;
-  f->ctx.uc_stack.ss_size = SCR_FIBER_STACK;
-  f->ctx.uc_link = NULL;
-  makecontext(&f->ctx, scr_trampoline, 0);
+  scr_fiber_context_init(f);
 
   ucontext_t here;
 #endif
@@ -1399,6 +1492,7 @@ static void scr_promise_rethrow(ScrPromise *p) {
   case SCR_EXC_BOOL: scr_throw_bool(p->b); break;
   case SCR_EXC_STR: scr_throw_str(scr_str_retain((ScrStr *)p->payload)); break;
   case SCR_EXC_REF: scr_throw_ref(p->retain_fn(p->payload), p->retain_fn, p->release_fn, p->trace_fn); break;
+  case SCR_EXC_PRIMITIVE_REF: scr_throw_primitive_ref(p->retain_fn(p->payload), p->retain_fn, p->release_fn, p->trace_fn); break;
   case SCR_EXC_OBJ: scr_throw_obj(p->retain_fn(p->payload), p->retain_fn, p->release_fn, p->trace_fn); break;
   case SCR_EXC_NONE:
   case SCR_EXC_GENRET: /* unreachable: the sentinel never settles a promise */
@@ -2614,6 +2708,14 @@ bool scr_loop_run(ScrPromise *top_level) {
     /* Pending immediates are always-ready work: no sleep — run due timers
      * (Node's timers phase precedes check), then the check phase below. */
     if (scr_pending_immediates > 0) due = now;
+    /* Child polling can drain a pipe into the IPC queue after its dispatch
+     * station has run. Completed sends and disconnects can also become ready
+     * during that turn. No fd will wake us for this userspace work: return to
+     * dispatch without sleeping, still allowing due timers and immediates. */
+    if (scr_children_ready()) due = now;
+#if !defined(_WIN32) && !defined(__wasi__)
+    if (due > now) scr_fiber_stacks_clear();
+#endif
     bool evw = scr_events_watching_fn != NULL && scr_events_watching_fn();
     if (io) {
       if (kids && due > now + SCR_CHILD_POLL_MS) due = now + SCR_CHILD_POLL_MS;
@@ -3142,7 +3244,8 @@ static void scr_gen_slot_reset(ScrGenSlot *s) {
 static void scr_gen_exc_reset(ScrExcCell *cell) {
   if (cell->kind == SCR_EXC_STR) {
     scr_str_release((ScrStr *)cell->payload);
-  } else if (cell->kind == SCR_EXC_REF || cell->kind == SCR_EXC_OBJ) {
+  } else if (cell->kind == SCR_EXC_REF || cell->kind == SCR_EXC_OBJ ||
+             cell->kind == SCR_EXC_PRIMITIVE_REF) {
     cell->release_fn(cell->payload);
   }
   memset(cell, 0, sizeof *cell);
@@ -3197,18 +3300,12 @@ static ScrGen *scr_gen_new_common(void (*entry)(ScrFiber *, void *), void *argpa
   f->als = scr_als_ctx_retain(*scr_als_active);
   scr_fibers_live++;
 #ifdef _WIN32
-  f->ctx = CreateFiber(SCR_FIBER_STACK, scr_trampoline, NULL);
+  f->ctx = CreateFiberEx(4096, 0, 0, scr_trampoline, NULL);
   if (f->ctx == NULL) scr_oom();
 #elif defined(__wasi__)
   f->ctx = 0;
 #else
-  f->stack = malloc(SCR_FIBER_STACK);
-  if (!f->stack) scr_oom();
-  getcontext(&f->ctx);
-  f->ctx.uc_stack.ss_sp = f->stack;
-  f->ctx.uc_stack.ss_size = SCR_FIBER_STACK;
-  f->ctx.uc_link = NULL;
-  makecontext(&f->ctx, scr_trampoline, 0);
+  scr_fiber_context_init(f);
 #endif
   g->fiber = f;
   return g;

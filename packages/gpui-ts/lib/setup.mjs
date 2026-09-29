@@ -9,7 +9,9 @@
 //   rust\          portable rustc/cargo (rust standalone tar.gz, extracted)
 //   tools\         npm prefix for @perryts/perry (perry.cmd shim)
 //   cargo-xwin.exe prebuilt xwin driver (only when no MSVC is found)
-//   windows-sdk\   MS CRT + Windows SDK import libs (~1.1 GB on disk)
+//   windows-sdk\   MS CRT + Windows SDK import libs + headers, PRUNED to the
+//                  dirs the build reads (see XWIN_KEEP) — roughly half the
+//                  raw xwin payload
 //
 // The MS components are redistributed under the Microsoft Software License
 // Terms (https://go.microsoft.com/fwlink/?LinkId=2086102); they are DOWNLOADED
@@ -301,12 +303,18 @@ export async function ensureXwinSdk({ acceptLicense }) {
         }
         if (!fs.existsSync(xwinExe)) throw new Error(`extracting cargo-xwin did not produce ${xwinExe}`);
 
-        log("downloading the Microsoft CRT + Windows SDK (~1.1 GB on disk, one time)…");
+        log("downloading the Microsoft CRT + Windows SDK (~1.1 GB download, pruned on disk)…");
         if (!run(xwinExe, ["cache", "xwin"], {
             env: {
                 ...process.env,
                 XWIN_CACHE_DIR: sdk,
                 XWIN_ARCH: "x86_64",
+                // Only the "desktop" SDK variant — the onecore/spectre variants
+                // double the download and nothing in the AOT build links them.
+                XWIN_VARIANT: "desktop",
+                // Debug import libs and PDBs are pure ballast for us.
+                XWIN_INCLUDE_DEBUG_LIBS: "0",
+                XWIN_INCLUDE_DEBUG_SYMBOLS: "0",
                 // Accepted programmatically — the caller already gated on the
                 // --accept-license flag, which points at MS's license URL.
                 XWIN_ACCEPT_LICENSE: "1",
@@ -314,11 +322,97 @@ export async function ensureXwinSdk({ acceptLicense }) {
         })) {
             throw new Error(`SDK download failed — the partial tree at ${sdk} is safe to re-run over`);
         }
+        pruneXwinSdk(sdk);
     } else {
         log(`✔ Windows SDK already present (${sdk})`);
     }
     log("✔ lightweight Windows toolchain ready (lld-link + xwin SDK)");
     return { mode: "lld", lld, sdk };
+}
+
+/**
+ * Directories the AOT build actually consumes from the xwin sysroot —
+ * the import libraries `toolchain.mjs xwinLibDirs` hands to lld-link and the
+ * headers `xwinIncludeDirs` hands to clang-cl (scriptc C runtime). Everything
+ * else xwin unpacks is removable ballast.
+ */
+const XWIN_KEEP = [
+    ["crt", "lib", "x86_64"],
+    ["sdk", "lib", "um", "x86_64"],
+    ["sdk", "lib", "ucrt", "x86_64"],
+    ["crt", "include"],
+    ["sdk", "include", "ucrt"],
+    ["sdk", "include", "um"],
+    ["sdk", "include", "shared"],
+];
+
+/**
+ * Delete everything under the xwin sysroot that the build never reads
+ * (xwin bookkeeping files, licenses/metadata for pruned trees, leftover
+ * multi-arch payload). Idempotent: safe to run over an already-pruned tree.
+ * Returns the list of removed top-level entries for logging.
+ */
+export function pruneXwinSdk(sdk) {
+    if (!fs.existsSync(sdk)) return [];
+    const sdkLower = sdk.toLowerCase();
+    const keep = new Set(
+        XWIN_KEEP.map((parts) => path.join(sdk, ...parts).toLowerCase()),
+    );
+    const removed = [];
+    // Depth-first walk: a directory survives only if it is kept or is an
+    // ancestor of a kept dir; everything else is removed. Inside survivors,
+    // *.mutex / *.progress / .progress / .lock bookkeeping is dropped too.
+    const walk = (dir) => {
+        let entries;
+        try {
+            entries = fs.readdirSync(dir, { withFileTypes: true });
+        } catch {
+            return;
+        }
+        for (const e of entries) {
+            const full = path.join(dir, e.name);
+            const lower = full.toLowerCase();
+            if (e.isDirectory()) {
+                if (keep.has(lower)) {
+                    pruneBookkeeping(full);
+                } else if ([...keep].some((k) => k.startsWith(lower + path.sep))) {
+                    walk(full); // ancestor of a kept dir — recurse
+                } else {
+                    fs.rmSync(full, { recursive: true, force: true });
+                    removed.push(path.relative(sdk, full));
+                }
+            } else if (e.name.endsWith(".mutex") || e.name.endsWith(".progress") || e.name === ".lock") {
+                fs.rmSync(full, { force: true });
+                removed.push(path.relative(sdk, full));
+            }
+        }
+    };
+    walk(sdk);
+    if (removed.length > 0) {
+        log(`✔ pruned unused SDK payload: ${removed.length} entries`);
+    }
+    return removed;
+}
+
+function pruneBookkeeping(dir) {
+    let entries;
+    try {
+        entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+        return;
+    }
+    for (const e of entries) {
+        const full = path.join(dir, e.name);
+        if (e.isDirectory()) {
+            if (e.name === ".progress" || e.name === ".lock") {
+                fs.rmSync(full, { recursive: true, force: true });
+            } else {
+                pruneBookkeeping(full);
+            }
+        } else if (e.name.endsWith(".mutex") || e.name.endsWith(".progress")) {
+            fs.rmSync(full, { force: true });
+        }
+    }
 }
 
 /** cargo-xwin release to fetch the xwin driver from. */

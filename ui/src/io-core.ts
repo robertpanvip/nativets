@@ -117,13 +117,15 @@ export function hasAbi(): boolean {
 //      pipe; node/`nativets dev` reads it too);
 //   3. nothing found → stay unwired; explicit setSink() still wins.
 //
-// Platform entries that need a custom channel (sc-main.ts's host-pull
-// outbox) simply call setSink() at their own top level, which runs AFTER
-// this module's top level — the explicit call overwrites this default.
-// The `typeof` probes are dynamic-engine-only: scriptc never compiles this
-// file's top level into a static graph without the sc-main entry wrapping
-// it (and sc-main's own setSink overrides this block wholesale).
+// The `typeof` probes below are dynamic-engine-only: scriptc 0.1.7 refuses
+// `globalThis`/`process` lowering outright (SC2020) even in dead code. The
+// block is wrapped in @begin/@end-dynamic-engine comment markers and
+// jsx-keep-types.mjs strips the whole region when it materializes the
+// sc-graph — scriptc never sees it. Dynamic engines keep it verbatim (the
+// markers are comments). sc-main.ts's own top-level setSink() still overrides
+// this default by evaluation order.
 
+// @begin-dynamic-engine
 if (typeof globalThis === "object" && globalThis !== null) {
     const g = globalThis as {
         __hostOps?: unknown;
@@ -162,6 +164,7 @@ if (sink === null) {
         }
     }
 }
+// @end-dynamic-engine
 
 export const stats = {
     batchesSent: 0,
@@ -450,11 +453,17 @@ function writeLine(line: string): void {
  * rather than a discriminated union: the host is the only producer and every
  * consumer switches on `kind`.
  *
- * Click events carry the DOM-ish control surface: `stopPropagation()` halts
- * the runtime's ancestor walk (see `handleLine`), and `currentTarget` is the
- * element whose handler is currently running (`target` stays the element the
- * interaction physically hit). Both exist on every event for shape stability,
- * but only `click` actually bubbles.
+ * Click events carry a DOM-ish control surface: setting `stopped = true`
+ * inside a handler halts the runtime's ancestor walk (see `dispatchEvent`),
+ * and `currentTarget` is the element whose handler is currently running
+ * (`target` stays the element the interaction physically hit). Both exist on
+ * every event for shape stability, but only `click` actually bubbles.
+ *
+ * NO function-valued fields: scriptc 0.1.7 refuses to pass a record whose
+ * interface declares optional function fields through an `Any`-typed
+ * parameter (SC1101 — the callComponent `fn(p)` boundary; pinned by 33
+ * minimal-repro probes). The DOM-style methods are spelled as the plain
+ * boolean flag instead: `ev.stopped = true` ≡ `ev.stopPropagation()`.
  */
 export interface HostEvent {
     kind: string;
@@ -466,12 +475,13 @@ export interface HostEvent {
     content?: number;
     /** Element whose handler is currently running (undefined at the target). */
     currentTarget?: number;
-    /** Halt the ancestor walk. A no-op outside dispatch. */
-    stopPropagation?: () => void;
-    /** DOM-compat no-op: the host has no default action to cancel. */
-    preventDefault?: () => void;
     /** Dispatch bookkeeping — set by stopPropagation, cleared after the walk. */
     stopped?: boolean;
+    /**
+     * DOM-compat no-op flag: `preventDefault()` has no host action to cancel
+     * (a plain field, same rationale as `stopped`).
+     */
+    prevented?: boolean;
 }
 
 /**
@@ -532,6 +542,7 @@ export function handleLine(line: string): void {
     stats.eventsReceived++;
     // A well-formed event line always carries kind+target; build the typed
     // view once (scriptc lowering keeps this a record copy, no dynamic API).
+    // Control surface = plain fields (see HostEvent — no function values).
     const ev: HostEvent = {
         kind: parsed.kind === undefined ? "" : parsed.kind,
         target: parsed.target,
@@ -540,8 +551,8 @@ export function handleLine(line: string): void {
         max: parsed.max,
         viewport: parsed.viewport,
         content: parsed.content,
-        stopPropagation: function (): void { ev.stopped = true; },
-        preventDefault: function (): void { /* no host default action to cancel */ },
+        stopped: false,
+        prevented: false,
     };
     dispatchEvent(ev);
 }
@@ -572,6 +583,8 @@ export function handleHostEvent(
     if (fn === null) return; // no ABI sink registered: drop (as handleLine would)
     stats.eventsReceived++;
     const isScroll = top !== 0 || max !== 0 || viewport !== 0 || content !== 0;
+    // Same field semantics as handleLine's view — control surface is plain
+    // fields (no function values, see HostEvent).
     const ev: HostEvent = {
         kind: kind,
         target: target,
@@ -580,8 +593,8 @@ export function handleHostEvent(
         max: isScroll ? max : undefined,
         viewport: isScroll ? viewport : undefined,
         content: isScroll ? content : undefined,
-        stopPropagation: function (): void { ev.stopped = true; },
-        preventDefault: function (): void { /* no host default action to cancel */ },
+        stopped: false,
+        prevented: false,
     };
     fn(kind, target, value === undefined ? "" : value, top, max, viewport, content);
     dispatchEvent(ev);
@@ -591,7 +604,7 @@ export function handleHostEvent(
  * Dispatch one event to its target and — for bubbling kinds — up the
  * ancestor chain. Element handlers are keyed `(target, kind)`; the global
  * `onHostEvent` listener runs once per event, after the walk, untouched by
- * `stopPropagation` (it is diagnostics, not delegation).
+ * `stopped` (it is diagnostics, not delegation).
  *
  * Each hop re-points `currentTarget` before calling, so a delegated handler
  * reads the ancestor it is registered on — the DOM contract. The walk uses
@@ -951,7 +964,10 @@ export interface Props {
     // --- intrinsic surface: read by h() itself, so typed precisely ---
     style?: Style;
     text?: string;
-    value?: string | number | (() => string) | (() => number);
+    /** Getter arm pinned to ()=>string: the runtime cannot distinguish
+     * function slot types (SC4013), so numeric values are stringified at
+     * the call site (kit wraps its ()=>number getters). */
+    value?: string | number | (() => string);
     placeholder?: string;
     children?: Child;
     onClick?: HostEventHandler;

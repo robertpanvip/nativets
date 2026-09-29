@@ -616,6 +616,7 @@ ScrDyn *scr_caught_to_dyn(const ScrCaught *c) {
   case SCR_EXC_BOOL: return scr_dyn_new_bool(c->b);
   case SCR_EXC_STR: return scr_dyn_new_str((ScrStr *)c->payload);
   case SCR_EXC_REF:
+  case SCR_EXC_PRIMITIVE_REF:
     if (c->retain_fn == scr_dyn_retain_v) return scr_dyn_retain((ScrDyn *)c->payload);
     return scr_dyn_new_obj();
   case SCR_EXC_OBJ:
@@ -665,7 +666,8 @@ ScrDyn *scr_promise_reason_dyn(const ScrPromise *p) {
     scr_str_release(v);
     return d;
   }
-  case SCR_EXC_REF: {
+  case SCR_EXC_REF:
+  case SCR_EXC_PRIMITIVE_REF: {
     void *v = scr_promise_payload_ref((ScrPromise *)p);
     if (v == NULL) return scr_dyn_new_obj();
     if (scr_promise_payload_is_dyn(p)) return (ScrDyn *)v; /* retained */

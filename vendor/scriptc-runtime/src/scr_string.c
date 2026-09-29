@@ -18,6 +18,26 @@ static void scr_oom(void) {
   scr_trap("scriptc: out of memory\n");
 }
 
+/* Weak, bounded interning for tiny slices (including non-ASCII characters).
+ * Unlike an owning cache, this never keeps a string alive: its last release
+ * removes the entry. Collisions simply replace the weak pointer. A unique
+ * string can still be appended to or reallocated, so those paths invalidate
+ * the entry before touching its bytes/address. No ScrStr ABI change. */
+#define SCR_SHORT_N 64
+static SCR_TL ScrStr *scr_short_tab[SCR_SHORT_N];
+
+static size_t scr_short_hash(const char *bytes, size_t len) {
+  size_t h = len;
+  for (size_t i = 0; i < len; i++) h = h * 31 + (unsigned char)bytes[i];
+  return h % SCR_SHORT_N;
+}
+
+static void scr_short_forget(const ScrStr *s) {
+  if (s->len < 2 || s->len > 4) return;
+  size_t h = scr_short_hash(s->data, s->len);
+  if (scr_short_tab[h] == s) scr_short_tab[h] = NULL;
+}
+
 /* ── UTF-16 index cache ───────────────────────────────────────────────
  * JS string semantics are UTF-16 indices over our UTF-8 storage, so
  * .length, charCodeAt, charAt, indexOf and slice all need unit↔byte
@@ -251,6 +271,7 @@ ScrStr *scr_str_alloc_raw(size_t len, size_t cap) {
 }
 
 ScrStr *scr_str_regrow(ScrStr *s, size_t newcap) {
+  scr_short_forget(s);
   scr_sidx_purge(s); /* realloc may move; the old address may be recycled */
   ScrStr *r = realloc(s, sizeof(ScrStr) + newcap + 1);
   if (!r) scr_oom();
@@ -261,6 +282,7 @@ ScrStr *scr_str_regrow(ScrStr *s, size_t newcap) {
 void scr_str_release(ScrStr *s) {
   if (!s || s->rc == SIZE_MAX) return; /* NULL: an uninitialized `let` local */
   if (--s->rc == 0) {
+    scr_short_forget(s);
     scr_sidx_purge(s); /* the address may be recycled by the next malloc */
 #ifdef SCR_RC_AUDIT
     scr_live_strings--;
@@ -287,6 +309,7 @@ ScrStr *scr_str_concat(ScrStr *a, ScrStr *b) {
    * with rc > 1 might be aliased and is copied, never mutated. */
   if (a->rc == 1 && a != b && a->cap >= newlen) {
     size_t oldlen = a->len;
+    scr_short_forget(a);
     memcpy(a->data + a->len, b->data, b->len);
     a->len = newlen;
     a->data[newlen] = '\0';
@@ -410,13 +433,41 @@ static const struct { size_t rc; size_t len; size_t cap; char data[1]; }
 
 static ScrStr *scr_str_empty(void) { return (ScrStr *)&scr_lit_empty; }
 
-/* Interned when the content is empty or one ASCII byte; fresh otherwise. */
+/* Empty/ASCII characters are immortal; tiny spans share live heap strings. */
 static ScrStr *scr_str_from_span(const char *bytes, size_t len) {
   if (len == 0) return scr_str_empty();
   if (len == 1 && (unsigned char)bytes[0] < 0x80) {
     return (ScrStr *)&scr_ascii1[(unsigned char)bytes[0]];
   }
+  if (len >= 2 && len <= 4) {
+    size_t h = scr_short_hash(bytes, len);
+    ScrStr *cached = scr_short_tab[h];
+    if (cached && cached->len == len && memcmp(cached->data, bytes, len) == 0)
+      return scr_str_retain(cached);
+    ScrStr *s = scr_str_new(bytes, len);
+    scr_short_tab[h] = s;
+    return s;
+  }
   return scr_str_new(bytes, len);
+}
+
+/* A scalar fromCharCode needs neither the variadic argument array nor an
+ * encoding buffer. Reuse the same empty/ASCII/tiny-span storage policy as
+ * character indexing. A lone surrogate keeps the existing U+FFFD policy. */
+ScrStr *scr_str_from_char_code_one(double code) {
+  uint32_t cp = scr_to_uint32(code) & 0xFFFFu;
+  if (cp < 0x80) return (ScrStr *)&scr_ascii1[cp];
+  if (cp >= 0xD800 && cp <= 0xDFFF) cp = 0xFFFD;
+  char bytes[3];
+  if (cp < 0x800) {
+    bytes[0] = (char)(0xC0 | (cp >> 6));
+    bytes[1] = (char)(0x80 | (cp & 0x3F));
+    return scr_str_from_span(bytes, 2);
+  }
+  bytes[0] = (char)(0xE0 | (cp >> 12));
+  bytes[1] = (char)(0x80 | ((cp >> 6) & 0x3F));
+  bytes[2] = (char)(0x80 | (cp & 0x3F));
+  return scr_str_from_span(bytes, 3);
 }
 
 /* ── string methods: UTF-16 semantics over UTF-8 storage ──────────
@@ -853,21 +904,29 @@ static const char *scr_byte_find(const char *hay, size_t hay_len,
   return NULL;
 }
 
-/* lastIndexOf(needle), the one-argument form: last occurrence as a UTF-16
- * index, -1 when absent; the empty needle finds the length. A byte-wise
- * reverse scan is boundary-safe because a well-formed needle's first byte
- * is never a continuation byte. Its result routes through the same sparse
- * byte→unit mapper as indexOf rather than re-counting the whole prefix. */
-double scr_str_last_index_of(ScrStr *s, ScrStr *needle) {
+/* Search backwards from a clamped UTF-16 position. A low-surrogate position
+ * maps to its scalar's first byte, so that scalar remains searchable. */
+double scr_str_last_index_of_from(ScrStr *s, ScrStr *needle, double position) {
   ScrSidx *e = scr_sidx(s);
-  if (needle->len == 0) return (double)scr_sidx_len(s, e);
+  size_t len16 = scr_sidx_len(s, e);
+  size_t start16 = isnan(position) || position >= (double)len16 ? len16
+                   : position <= 0 ? 0 : (size_t)trunc(position);
+  if (needle->len == 0) return (double)start16;
   if (needle->len > s->len) return -1.0;
-  for (size_t i = s->len - needle->len + 1; i-- > 0;) {
+  bool mid;
+  size_t start_byte = scr_u16_to_byte_c(s, e, start16, &mid);
+  size_t max_start = s->len - needle->len;
+  if (start_byte < max_start) max_start = start_byte;
+  for (size_t i = max_start + 1; i-- > 0;) {
     if (memcmp(s->data + i, needle->data, needle->len) == 0) {
       return (double)scr_byte_to_u16_c(s, e, i);
     }
   }
   return -1.0;
+}
+
+double scr_str_last_index_of(ScrStr *s, ScrStr *needle) {
+  return scr_str_last_index_of_from(s, needle, INFINITY);
 }
 
 double scr_str_utf16_len(ScrStr *s) {
@@ -941,6 +1000,36 @@ bool scr_str_ends_with(ScrStr *s, ScrStr *needle) {
   return needle->len <= s->len &&
          memcmp(s->data + (s->len - needle->len), needle->data,
                 needle->len) == 0;
+}
+
+static size_t scr_str_clamp_u16_position(double position, size_t len16) {
+  double pos = scr_to_integer_or_infinity(position);
+  return pos <= 0 ? 0 : pos >= (double)len16 ? len16 : (size_t)pos;
+}
+
+bool scr_str_starts_with_from(ScrStr *s, ScrStr *needle, double position) {
+  ScrSidx *e = scr_sidx(s);
+  size_t len16 = scr_sidx_len(s, e);
+  size_t start16 = scr_str_clamp_u16_position(position, len16);
+  if (needle->len == 0) return true;
+  bool mid;
+  size_t start_byte = scr_u16_to_byte_c(s, e, start16, &mid);
+  return !mid && needle->len <= s->len - start_byte &&
+         memcmp(s->data + start_byte, needle->data, needle->len) == 0;
+}
+
+bool scr_str_ends_with_from(ScrStr *s, ScrStr *needle, double end_position) {
+  ScrSidx *e = scr_sidx(s);
+  size_t len16 = scr_sidx_len(s, e);
+  size_t end16 = scr_str_clamp_u16_position(end_position, len16);
+  size_t needle16 = scr_sidx_len(needle, scr_sidx(needle));
+  if (needle16 == 0) return true;
+  if (needle16 > end16) return false;
+  bool start_mid, end_mid;
+  size_t start_byte = scr_u16_to_byte_c(s, e, end16 - needle16, &start_mid);
+  size_t end_byte = scr_u16_to_byte_c(s, e, end16, &end_mid);
+  return !start_mid && !end_mid && end_byte - start_byte == needle->len &&
+         memcmp(s->data + start_byte, needle->data, needle->len) == 0;
 }
 
 /* Resolve one slice() boundary: negatives are relative to the end, then

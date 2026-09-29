@@ -92,6 +92,7 @@
 #include "scr_runtime.h"
 
 #include <errno.h>
+#include <limits.h>
 #include <math.h>
 #include <fcntl.h>
 #include <stdio.h>
@@ -472,7 +473,7 @@ struct ScrNetServer {
                         * address().address answers) */
   ScrStr *pending_err; /* deferred listen failure */
   size_t nconns;
-  ScrNetLs conn_ls, err_ls, close_ls, listening_cbs;
+  ScrNetLs conn_ls, err_ls, close_ls, listening_cbs, timeout_ls;
   /* protocol layer (scr_http.c): a C-level connection consumer + its
    * context, freed with the handle */
   ScrNetNativeConnFn native_conn;
@@ -585,12 +586,14 @@ struct ScrNetSocket {
   ScrNetNativeEventFn native_eof;
   ScrNetNativeEventFn native_closed;
   ScrNetNativeEventFn native_timeout;
+  ScrNetNativeTimeoutHandledFn native_http_timeout; /* HTTP req/res timeout handled */
   ScrNetNativeEventFn native_established; /* client connect completed (the
                                            * h2 session's 'connect' moment;
                                            * fires before conn_ls) */
   ScrNetNativeErrFn native_err; /* true = consumed (the protocol layer owns
                                  * the error story); false falls through to
                                  * this socket's own err_ls */
+  bool (*native_idle)(void *); /* HTTP parser: no active request or partial head */
   void *native_ctx;
   void (*native_ctx_free)(void *);
   /* transport layer (scr_tls.c): reads/writes redirect through the ops
@@ -631,6 +634,7 @@ void scr_net_server_release(ScrNetServer *s) {
     scr_net_ls_drop(&s->err_ls);
     scr_net_ls_drop(&s->close_ls);
     scr_net_ls_drop(&s->listening_cbs);
+    scr_net_ls_drop(&s->timeout_ls);
     scr_closure_release(s->close_override);
     for (size_t i = 0; i < 5; i++) scr_dyn_release(s->http_timeout_dyn[i]);
     scr_str_release(s->bound_host);
@@ -1525,6 +1529,7 @@ void scr_net_listen_opts_reuse_port(ScrNetServer *s, double port, ScrStr *host /
 }
 
 double scr_net_server_port(ScrNetServer *s) { return (double)s->port; }
+bool scr_net_server_listening(ScrNetServer *s) { return s->listening; }
 
 double scr_net_server_timeout_get(ScrNetServer *s, double field) {
   static const char *const names[] = {
@@ -1546,6 +1551,16 @@ void scr_net_server_timeout_set(ScrNetServer *s, double field, double value) {
   scr_dyn_release(s->http_timeout_dyn[i]);
   s->http_timeout_dyn[i] = NULL;
   s->http_timeouts[i] = value;
+}
+
+void scr_net_server_set_timeout_plain(ScrNetServer *s, double ms) {
+  scr_net_server_timeout_set(s, 0, ms);
+}
+
+void scr_net_server_set_timeout_cb(ScrNetServer *s, double ms, ScrClosure *cb /*moves*/,
+                                    ScrNetConnFn fn) {
+  scr_net_server_timeout_set(s, 0, ms);
+  scr_net_server_on_timeout(s, cb, fn, false);
 }
 
 void scr_net_server_enable_http_timeout_surface(ScrNetServer *s) {
@@ -1654,6 +1669,28 @@ void scr_net_server_close(ScrNetServer *s, ScrClosure *cb /*moves, nullable*/) {
   scr_net_server_close_direct(s, cb);
 }
 
+static void scr_net_server_close_http_connections(ScrNetServer *s, bool idle_only) {
+  ScrNetSocket *sock = scr_net_socks;
+  while (sock) {
+    ScrNetSocket *next = sock->next;
+    if (sock->server == s && sock->native_idle != NULL && sock->fd >= 0 &&
+        (!idle_only || sock->native_idle(sock->native_ctx))) {
+      scr_net_sock_retain(sock);
+      scr_net_sock_destroy(sock);
+      scr_net_sock_release(sock);
+    }
+    sock = next;
+  }
+}
+
+void scr_net_server_close_all_connections(ScrNetServer *s) {
+  scr_net_server_close_http_connections(s, false);
+}
+
+void scr_net_server_close_idle_connections(ScrNetServer *s) {
+  scr_net_server_close_http_connections(s, true);
+}
+
 /* wrapper.close = fn: the override MOVES in (a compiler-emitted zero-arg
  * wrapper — see the struct comment); reassignment releases the old one,
  * matching JS's last-write-wins. */
@@ -1714,6 +1751,15 @@ void scr_net_server_on_connection(ScrNetServer *s, ScrClosure *cb /*moves*/, Scr
   scr_net_ls_add(&s->conn_ls, cb, (void *)fn, once);
 }
 
+void scr_net_server_on_timeout(ScrNetServer *s, ScrClosure *cb /*moves*/, ScrNetConnFn fn,
+                                bool once) {
+  if (s->close_emitted) {
+    scr_closure_release(cb);
+    return;
+  }
+  scr_net_ls_add(&s->timeout_ls, cb, (void *)fn, once);
+}
+
 /* Accept until EAGAIN; each connection fires the 'connection' listeners
  * directly (the accepted socket passes +1 per listener via the adapter). */
 static void scr_net_server_accept(ScrNetServer *srv) {
@@ -1732,6 +1778,8 @@ static void scr_net_server_accept(ScrNetServer *srv) {
     sock->server = scr_net_server_retain(srv);
     srv->nconns++;
     scr_net_sock_register(sock);
+    if (srv->http_timeout_surface && srv->http_timeouts[0] > 0)
+      scr_net_sock_set_timeout(sock, srv->http_timeouts[0]);
     if (srv->native_conn) {
       /* the protocol layer (scr_http.c / scr_tls.c) claims the connection */
       srv->native_conn(srv->native_ctx, sock);
@@ -2228,6 +2276,19 @@ ScrNetSocket *scr_net_sock_set_nodelay(ScrNetSocket *s, bool enable) {
   return scr_net_sock_retain(s);
 }
 
+void scr_net_sock_set_keepalive(ScrNetSocket *s, bool enable, double delay_ms) {
+  if (s->fd < 0) return;
+  int value = enable ? 1 : 0;
+  setsockopt(s->fd, SOL_SOCKET, SO_KEEPALIVE, &value, sizeof value);
+  if (!enable || !(delay_ms > 0) || !isfinite(delay_ms)) return;
+  int seconds = (int)fmin((double)INT_MAX, fmax(1.0, floor(delay_ms / 1000.0)));
+#if defined(TCP_KEEPIDLE)
+  setsockopt(s->fd, IPPROTO_TCP, TCP_KEEPIDLE, &seconds, sizeof seconds);
+#elif defined(TCP_KEEPALIVE)
+  setsockopt(s->fd, IPPROTO_TCP, TCP_KEEPALIVE, &seconds, sizeof seconds);
+#endif
+}
+
 /* socket.destroySoon(): end the write half now, destroy once the FIN is
  * actually out (buffered bytes flush first — Node's 'finish'-then-destroy). */
 void scr_net_sock_destroy_soon(ScrNetSocket *s) {
@@ -2574,9 +2635,14 @@ void scr_net_sock_set_native_reader(ScrNetSocket *s, ScrNetNativeDataFn data,
   s->native_data = data;
   s->native_eof = eof;
   s->native_closed = closed;
+  s->native_idle = NULL;
   s->native_ctx = ctx;
   s->native_ctx_free = ctx_free;
   scr_net_sock_update_read(s);
+}
+
+void scr_net_sock_set_native_idle_checker(ScrNetSocket *s, bool (*fn)(void *)) {
+  s->native_idle = fn;
 }
 
 /* The upgrade handover: clear the native reader's FN POINTERS but keep
@@ -2587,6 +2653,8 @@ void scr_net_sock_clear_native_reader(ScrNetSocket *s) {
   s->native_data = NULL;
   s->native_eof = NULL;
   s->native_closed = NULL;
+  s->native_idle = NULL; /* upgraded and CONNECT sockets are outside HTTP close sweeps */
+  s->native_http_timeout = NULL;
   scr_net_sock_update_read(s);
 }
 
@@ -2601,12 +2669,20 @@ bool scr_net_sock_writable(ScrNetSocket *s) {
   return s->fd >= 0 && !s->wr_ending && !s->wr_done;
 }
 
+bool scr_net_sock_established(ScrNetSocket *s) {
+  return s->fd >= 0 && !s->connecting && (!s->tops || s->t_est);
+}
+
 /* The protocol layer's timeout/error hooks (scr_http.c's client and the
  * server parser's error swallowing). */
 void scr_net_sock_set_native_events(ScrNetSocket *s, ScrNetNativeEventFn timeout,
                                      ScrNetNativeErrFn err) {
   s->native_timeout = timeout;
   s->native_err = err;
+}
+
+void scr_net_sock_set_native_http_timeout(ScrNetSocket *s, ScrNetNativeTimeoutHandledFn fn) {
+  s->native_http_timeout = fn;
 }
 
 /* Client connect completion for the protocol layer (the h2 session's
@@ -2770,6 +2846,7 @@ static void scr_net_server_settle(ScrNetServer *srv) {
   scr_net_ls_drop(&srv->err_ls);
   scr_net_ls_drop(&srv->close_ls);
   scr_net_ls_drop(&srv->listening_cbs);
+  scr_net_ls_drop(&srv->timeout_ls);
   if (srv->proto_settle && srv->http_ctx) srv->proto_settle(srv->http_ctx);
   scr_net_server_unregister(srv);
 }
@@ -2912,6 +2989,7 @@ static void scr_net_sweep(void) {
         scr_net_ls_drop(&srv->err_ls);
         scr_net_ls_drop(&srv->close_ls);
         scr_net_ls_drop(&srv->listening_cbs);
+        scr_net_ls_drop(&srv->timeout_ls);
         scr_net_server_unregister(srv);
       }
       if (scr_exc_pending()) {
@@ -2983,7 +3061,34 @@ static void scr_net_dispatch(void) {
             s->native_timeout(s->native_ctx);
             if (scr_exc_pending()) return;
           }
+          if (s->server && s->server->http_timeout_surface &&
+              s->native_http_timeout) {
+            ScrNetServer *srv = scr_net_server_retain(s->server);
+            bool handled = s->native_http_timeout(s->native_ctx);
+            if (scr_exc_pending()) {
+              scr_net_server_release(srv);
+              return;
+            }
+            bool server_handled = srv->timeout_ls.n > 0;
+            if (server_handled) {
+              ScrNetL *snap;
+              size_t count = scr_net_ls_snapshot(&srv->timeout_ls, &snap);
+              scr_dyn_this_push(srv, SCR_DYNH_NET_SERVER);
+              for (size_t j = 0; j < count; j++) {
+                if (!scr_exc_pending()) ((ScrNetConnFn)snap[j].fn)(snap[j].cb, scr_net_sock_retain(s));
+                scr_closure_release(snap[j].cb);
+              }
+              scr_dyn_this_pop();
+              free(snap);
+            }
+            if (!handled && !server_handled && !scr_exc_pending())
+              scr_net_sock_destroy(s); /* Node's unhandled server timeout */
+            scr_net_server_release(srv);
+            if (scr_exc_pending()) return;
+          }
           scr_net_fire0_this(&s->timeout_ls, s, SCR_DYNH_NET_SOCKET);
+          if (scr_exc_pending()) return;
+          if (s->fd < 0) continue;
         }
         /* kqueue delivers one direction per event (today's exact order);
          * epoll may coalesce both into one — writes first (connect
@@ -3042,6 +3147,7 @@ static void scr_net_cleanup_atexit(void) {
       s->native_eof = NULL;
       s->native_closed = NULL;
       s->native_timeout = NULL;
+      s->native_http_timeout = NULL;
       s->native_established = NULL;
       s->native_err = NULL;
       ctx_free(ctx);

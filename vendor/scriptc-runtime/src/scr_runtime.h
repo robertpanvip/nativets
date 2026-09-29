@@ -8,6 +8,12 @@
 #ifndef SCR_RUNTIME_H
 #define SCR_RUNTIME_H
 
+/* VENDORED PATCH (gpui-ts MSVC lane): upstream 0.1.7 dropped the
+ * __has_include hook that let every TU see scr_msvc_compat.h (CLOCK_*
+ * macros, clockid_t, clock_gettime prototype — needed by scr_bytes_io.c's
+ * `+time` lowering). Our build compiles the runtime with cl.exe and NO
+ * force-include, so restore the hook here; on non-MSVC or when the shim
+ * is absent it compiles away to nothing. */
 #if defined(_MSC_VER) && defined(__has_include)
 #if __has_include("scr_msvc_compat.h")
 #include "scr_msvc_compat.h"
@@ -664,12 +670,21 @@ double scr_str_index_of(ScrStr *s, ScrStr *needle, double fromIndex);
  * UTF-16 index, or -1. Empty needle returns length. */
 double scr_str_last_index_of(ScrStr *s, ScrStr *needle);
 
+/* lastIndexOf(needle, position): search at or before the clamped UTF-16
+ * position. NaN starts at the end, including for an empty needle. */
+double scr_str_last_index_of_from(ScrStr *s, ScrStr *needle, double position);
+
 /* includes(needle) — no position argument. Empty needle → true. */
 bool scr_str_includes(ScrStr *s, ScrStr *needle);
 
-/* startsWith(needle) / endsWith(needle) — no position argument. */
+/* startsWith(needle) / endsWith(needle) — one-argument forms. */
 bool scr_str_starts_with(ScrStr *s, ScrStr *needle);
 bool scr_str_ends_with(ScrStr *s, ScrStr *needle);
+
+/* Positioned forms clamp UTF-16 indices to [0, length]. The empty needle
+ * matches at every clamped position. */
+bool scr_str_starts_with_from(ScrStr *s, ScrStr *needle, double position);
+bool scr_str_ends_with_from(ScrStr *s, ScrStr *needle, double end_position);
 
 /* slice(start, end): UTF-16 indices, negatives count from length, clamped
  * to [0, length]; empty when start >= end. The frontend passes
@@ -1004,16 +1019,26 @@ void scr_arr_copy_range_ex(ScrArr *dst, size_t dst_start, const ScrArr *src,
  * fold (NaN poisons, ±0 by the JS preferences, empty → ∓Infinity). */
 double scr_math_max_arr(ScrArr *a);
 double scr_math_min_arr(ScrArr *a);
+double scr_math_hypot_arr(ScrArr *a);
 /* The scalar Math statics (scr_lib.c): min/max are the ECMA two-argument
  * folds (NaN poisons; max prefers +0, min prefers -0 — NOT C's fmin/fmax);
  * random is a uniform [0,1) double at 53-bit granularity from
  * arc4random_buf (SEMANTICS.md 62: Node's distribution, not its sequence). */
 double scr_math_min(double a, double b);
 double scr_math_round(double x);
+double scr_math_pow(double base, double exponent);
+double scr_math_clz32(double x);
+double scr_math_fround(double x);
+double scr_math_imul(double a, double b);
 double scr_math_max(double a, double b);
 double scr_math_random(void);
 
 double scr_arr_get_f64(ScrArr *a, double i); /* trap missing/hole */
+/* ToNumber(a[i]) for f64 storage: borrows a; missing/hole/undefined -> NaN. */
+double scr_arr_get_number(const ScrArr *a, double i);
+/* Strict equality of ordinary indexed reads on matching primitive arrays.
+ * Borrows both arrays, preserves undefined vs NaN, and never allocates. */
+bool scr_arr_index_eq(const ScrArr *a, double i, const ScrArr *b, double j);
 bool scr_arr_get_bool(ScrArr *a, double i);  /* trap missing/hole */
 void *scr_arr_get_ref(ScrArr *a, double i);  /* trap missing/hole; +1 */
 
@@ -1081,6 +1106,9 @@ uint8_t scr_arr_shift_state(ScrArr *a, uint64_t *slot_out);
  * to the end). Returns the removed elements in order as a fresh +1 array,
  * ownership MOVED out of the receiver. Borrows a. */
 ScrArr *scr_arr_splice(ScrArr *a, double start, double deleteCount);
+ScrArr *scr_arr_splice_insert(ScrArr *a, double start, double deleteCount,
+                              const ScrArr *items);
+ScrArr *scr_arr_flat_copy(const ScrArr *a, ScrArr *out, bool flatten);
 
 /* indexOf: first index whose element strictly equals (JS ===) the needle,
  * or -1. Per element kind: f64 by value (NaN never matches — NaN !== NaN;
@@ -2074,6 +2102,10 @@ typedef enum {
    * Carries NO payload (the value rides the generator's ret slot), so
    * scr_exc_clear/reset need no arm. Never escapes a generator fiber. */
   SCR_EXC_GENRET,
+  /* Refcounted values whose JS typeof is not object (Symbol, BigInt,
+   * functions, and checked-dynamic primitives). The payload uses the
+   * same ownership as REF. */
+  SCR_EXC_PRIMITIVE_REF,
 } ScrExcKind;
 
 /* One cell per fiber (JS has one exception in flight per execution
@@ -2104,7 +2136,12 @@ void scr_throw_str(ScrStr *v); /* takes ownership */
  * passes the payload type's `_v` adapters, like scr_union_new_ref); trace
  * is non-NULL iff the payload type carries a cycle header. */
 void scr_throw_ref(void *v, void *(*retain)(void *), void (*release)(void *),
-                    ScrTraceFn trace);
+                   ScrTraceFn trace);
+/* Store a reference whose JS typeof was checked at the throw site. */
+void scr_throw_ref_classified(void *v, void *(*retain)(void *), void (*release)(void *),
+                              ScrTraceFn trace, bool object);
+void scr_throw_primitive_ref(void *v, void *(*retain)(void *), void (*release)(void *),
+                             ScrTraceFn trace);
 /* Same ownership contract as scr_throw_ref; the payload must be a
  * hierarchy-class instance (vtable word present) — see SCR_EXC_OBJ. */
 void scr_throw_obj(void *v, void *(*retain)(void *), void (*release)(void *),
@@ -2147,6 +2184,9 @@ void scr_rethrow(const ScrCaught *c);
 /* `e instanceof C` on a catch binding: an OBJ payload whose vtable preorder
  * lies inside C's interval. False for every other payload kind. */
 bool scr_caught_instanceof(const ScrCaught *c, size_t pre, size_t post);
+/* `typeof e === "object"` on a catch binding. Throw sites choose REF or
+ * PRIMITIVE_REF from the value's JS typeof before storing the payload. */
+bool scr_caught_is_object(const ScrCaught *c);
 /* `String(e)` / `${e}` on a catch binding: JS's String() over the snapshot
  * — numbers/booleans/strings by value, Error payloads via
  * scr_error_to_string ("name: message" — String(e) carries no stack in
@@ -2407,6 +2447,8 @@ void scr_process_stdin_set_raw_mode(bool raw);
  * union's number arm and -1 into its undefined arm (Node's non-TTY
  * `.columns` is undefined). Never throws. */
 double scr_process_columns(double fd);
+/* Terminal height; same optional-number sentinel contract as columns. */
+double scr_process_rows(double fd);
 
 /* Stats values (statSync/lstatSync and their fs.promises twins): an immutable
  * snapshot of stat(2). scr_fs_stat follows symlinks; scr_fs_lstat does not.
@@ -2813,6 +2855,9 @@ const char *scr_signal_name(int sig);
  * pending child: non-kqueue platforms, spawn failures awaiting their
  * first-pass settle, or a child whose exit filter could not be armed. */
 bool scr_children_pending(void);
+/* Work already queued in userspace: dispatch can progress without another
+ * pipe/exit notification. Connected channels and blocked writes are not ready. */
+bool scr_children_ready(void);
 bool scr_children_failed_pending(void);
 void scr_children_poll(void);
 bool scr_children_wait(double max_wait_ms);
@@ -3550,6 +3595,8 @@ bool scr_dyn_has_key(const ScrDyn *v, const ScrStr *key);
 /* Bare `typeof v` on a dyn value: the dyn kind's JS answer (+1 string;
  * null answers "object"). Never throws. */
 ScrStr *scr_dyn_typeof(const ScrDyn *d);
+/* Object.prototype.toString.call over the native checked-dynamic tree; +1. */
+ScrStr *scr_dyn_object_tag(const ScrDyn *d);
 /* Receiver-kind-dispatched toString() (Buffer-flavored bytes decode per
  * enc — utf8 default; strings/numbers/booleans/arrays/objects answer
  * JS-exactly; undefined/null throw the catchable TypeError). Borrows; +1. */
@@ -3575,6 +3622,12 @@ double scr_dyn_number_coerce(const ScrDyn *d);
  * back to its runtime error and the class's stamped preorder interval
  * answers. A dyn value that never came from an error answers false. */
 bool scr_dyn_err_instanceof(const ScrDyn *d, double kind);
+/* Property read on a checked-dynamic object. Own fields take precedence;
+ * runtime Error instances inherit their exact builtin constructor token.
+ * The result is owned. */
+ScrDyn *scr_dyn_obj_read(const ScrDyn *d, const char *key, size_t key_len);
+/* JS typeof comparison, including null's "object" result. */
+bool scr_dyn_is_object(const ScrDyn *d);
 
 /* structuredClone over the checked-dynamic tree: JSON-safe data + bytes deep-copy;
  * functions/handles throw the spec's catchable DataCloneError; cycles
@@ -4799,6 +4852,7 @@ ScrJsval *scr_jsval_iter_new(ScrJsval *a);
 ScrJsval *scr_jsval_plus(ScrJsval *a); /* unary + (ToNumber) */
 int scr_jsval_truthy(ScrJsval *a);
 ScrStr *scr_jsval_typeof(ScrJsval *a);
+bool scr_jsval_is_object(ScrJsval *a);
 ScrStr *scr_jsval_to_str(ScrJsval *a); /* String(v); NULL = bridged */
 
 /* Property/element access and calls. Names are NUL-terminated ScrStr
@@ -5000,6 +5054,9 @@ ScrStr *scr_bool_to_scrstr(bool b); /* interned "true"/"false" */
  * (divergence 1's policy). Borrowed args; the string result is +1; neither
  * throws. */
 ScrStr *scr_str_from_char_code(ScrArr *codes);
+/* Single numeric argument; avoids argument packing. Defined in scr_string.c
+ * to share its character cache. Same ToUint16 and lone-surrogate behavior. */
+ScrStr *scr_str_from_char_code_one(double code);
 /* The spread-typed-array form (String.fromCharCode(...bytes) — the
  * magic-number ASCII probe); same semantics per element. */
 ScrStr *scr_str_from_char_code_bytes(ScrBytes *codes);
@@ -5095,7 +5152,7 @@ double scr_bit_ushr(double a, double b);
 double scr_bit_not(double a);
 
 /* ── typed arrays / Buffer (scr_bytes.c) ──────────────────────────────
- * ONE runtime representation for Uint8Array/Uint32Array/Float32Array,
+ * ONE runtime representation for Uint8Array/Uint32Array/Float32Array/Float64Array,
  * Node's Buffer (a Uint8Array subclass), and DataView: a refcounted,
  * MUTABLE, fixed-length element buffer. An ScrBytes either OWNS its
  * storage (backing == NULL, byteOffset 0) or is a VIEW: its `data` points
@@ -5121,6 +5178,7 @@ typedef enum ScrBytesElem {
   SCR_BYTES_U32, /* Uint32Array */
   SCR_BYTES_F32, /* Float32Array */
   SCR_BYTES_I32, /* Int32Array (reads sign-extend; writes ToInt32-wrap) */
+  SCR_BYTES_F64, /* Float64Array */
 } ScrBytesElem;
 
 typedef struct ScrBytes {
@@ -5135,7 +5193,7 @@ typedef struct ScrBytes {
   struct ScrBytes *backing;
 } ScrBytes;
 
-size_t scr_bytes_elem_size(ScrBytesElem elem); /* 1, 4, 4 */
+size_t scr_bytes_elem_size(ScrBytesElem elem); /* 1, 4, or 8 */
 
 /* node:string_decoder's StringDecoder (scr_bytes.c, beside the decoders
  * it shares): the decoder value is a record holding the CANONICAL
@@ -5583,6 +5641,7 @@ void scr_net_fire_err_this(ScrNetLs *l, ScrStr *msg, void *self, ScrDynHandleTag
 typedef void (*ScrNetNativeConnFn)(void *ctx, ScrNetSocket *sock);
 typedef void (*ScrNetNativeDataFn)(void *ctx, const char *buf, size_t n);
 typedef void (*ScrNetNativeEventFn)(void *ctx);
+typedef bool (*ScrNetNativeTimeoutHandledFn)(void *ctx);
 typedef bool (*ScrNetNativeErrFn)(void *ctx, ScrStr *msg); /* true = consumed */
 void scr_net_server_set_native_conn(ScrNetServer *s, ScrNetNativeConnFn fn, void *ctx, void (*ctx_free)(void *));
 /* The HTTP-parser ctx ALIAS: scr_http.c stamps its server ctx here so
@@ -5606,6 +5665,7 @@ bool scr_net_server_settled(ScrNetServer *s); /* 'close' already emitted */
  * event the http layer does not model (the caller fences loudly). */
 void scr_net_set_dynh_http_on(bool (*fn)(ScrNetServer *, const char *, const ScrDyn *, bool));
 void scr_net_sock_set_native_reader(ScrNetSocket *s, ScrNetNativeDataFn data, ScrNetNativeEventFn eof, ScrNetNativeEventFn closed, void *ctx, void (*ctx_free)(void *));
+void scr_net_sock_set_native_idle_checker(ScrNetSocket *s, bool (*fn)(void *));
 /* The upgrade handover: clear the reader's fn pointers, keep the ctx. */
 void scr_net_sock_clear_native_reader(ScrNetSocket *s);
 /* The accepting server (BORROWED; NULL on client sockets) — the protocol
@@ -5617,7 +5677,9 @@ ScrNetServer *scr_net_sock_server(ScrNetSocket *s);
 void scr_net_sock_set_encoding(ScrNetSocket *s, ScrStr *enc /*borrowed*/);
 bool scr_net_sock_destroyed(ScrNetSocket *s); /* socket.destroyed */
 bool scr_net_sock_writable(ScrNetSocket *s);  /* socket.writable */
+bool scr_net_sock_established(ScrNetSocket *s); /* connected, including TLS handshake */
 void scr_net_sock_set_native_events(ScrNetSocket *s, ScrNetNativeEventFn timeout, ScrNetNativeErrFn err);
+void scr_net_sock_set_native_http_timeout(ScrNetSocket *s, ScrNetNativeTimeoutHandledFn fn);
 void scr_net_sock_write_native(ScrNetSocket *s, const char *buf, size_t n);
 /* The protocol layer's deferred-emit hook: `pending` joins the loop's
  * liveness test, `sweep` runs at every net sweep top. */
@@ -5648,12 +5710,16 @@ void scr_net_listen_opts_reuse_port(ScrNetServer *s, double port, ScrStr *host /
                                     bool ipv6_only, bool reuse_port,
                                     ScrClosure *cb /*moves, nullable*/);
 double scr_net_server_port(ScrNetServer *s); /* address().port */
+bool scr_net_server_listening(ScrNetServer *s);
 /* Writable http.Server timeout property storage. `field` is the compiler
  * ABI selector: timeout, keepAliveTimeout, headersTimeout, requestTimeout,
  * keepAliveTimeoutBuffer. Typed reads validate that no dynamic write left
  * a non-number in the ordinary JS property slot. */
 double scr_net_server_timeout_get(ScrNetServer *s, double field);
 void scr_net_server_timeout_set(ScrNetServer *s, double field, double value);
+void scr_net_server_set_timeout_plain(ScrNetServer *s, double ms);
+void scr_net_server_set_timeout_cb(ScrNetServer *s, double ms, ScrClosure *cb /*moves*/, ScrNetConnFn fn);
+void scr_net_server_on_timeout(ScrNetServer *s, ScrClosure *cb /*moves*/, ScrNetConnFn fn, bool once);
 /* Marks the shared net-server handle as an HTTP/1 or HTTPS server. The
  * dynamic handle uses this to keep HTTP-only fields off net/TLS/H2. */
 void scr_net_server_enable_http_timeout_surface(ScrNetServer *s);
@@ -5665,6 +5731,8 @@ void scr_net_server_timeout_option_set(ScrNetServer *s, double field, const stru
 ScrStr *scr_net_server_addr_ip(ScrNetServer *s);     /* +1 — address().address */
 ScrStr *scr_net_server_addr_family(ScrNetServer *s); /* +1 — address().family */
 void scr_net_server_close(ScrNetServer *s, ScrClosure *cb /*moves, nullable*/);
+void scr_net_server_close_all_connections(ScrNetServer *s);
+void scr_net_server_close_idle_connections(ScrNetServer *s);
 /* The REAL close behind `wrapper.close.bind(wrapper)` — never consults
  * the override (the proxy-through idiom cannot recurse). */
 void scr_net_server_close_direct(ScrNetServer *s, ScrClosure *cb /*moves, nullable*/);
@@ -5725,6 +5793,7 @@ void scr_net_sock_destroy(ScrNetSocket *s);
 ScrNetSocket *scr_net_sock_pause(ScrNetSocket *s);            /* +1: chaining */
 ScrNetSocket *scr_net_sock_resume(ScrNetSocket *s);           /* +1: chaining */
 ScrNetSocket *scr_net_sock_set_nodelay(ScrNetSocket *s, bool enable); /* +1: chaining */
+void scr_net_sock_set_keepalive(ScrNetSocket *s, bool enable, double delay_ms);
 void scr_net_sock_destroy_soon(ScrNetSocket *s);
 void scr_net_sock_on_finish(ScrNetSocket *s, ScrClosure *cb /*moves*/);
 void scr_net_sock_on_write_flush(ScrNetSocket *s, ScrClosure *cb /*moves*/);
@@ -6057,6 +6126,10 @@ bool scr_http_req_complete(ScrHttpReq *r);
  * SCR_DYNH_HTTP_RES) — emitted main() calls this exactly when the http
  * unit is linked (the scr_net_dyn_install story). */
 void scr_http_dyn_install(void);
+void scr_http_validate_header_name(ScrStr *name /*borrowed*/, ScrStr *label /*borrowed*/);
+void scr_http_validate_header_value(ScrStr *name /*borrowed*/, const ScrDyn *value /*borrowed*/);
+ScrDyn *scr_http_status_codes(void); /* +1, shared mutable Node v24 table */
+ScrArr *scr_http_methods(void); /* +1, shared mutable Node v24 array */
 
 ScrNetServer *scr_http_create_server(ScrClosure *handler /*moves, nullable*/, ScrHttpReqFn fn); /* +1 */
 /* The unguarded h2-only stream call: throws Node's exact catchable
@@ -6091,6 +6164,9 @@ void scr_http_req_on_end(ScrHttpReq *r, ScrClosure *cb /*moves*/, bool once);
 void scr_http_res_set_header(ScrHttpRes *r, ScrStr *name /*borrowed*/, ScrStr *value /*borrowed*/);
 void scr_http_res_write_head(ScrHttpRes *r, double status);
 void scr_http_res_write_head_n(ScrHttpRes *r, double status, ScrArr *names /*borrowed*/, ScrArr *values /*borrowed*/);
+void scr_http_res_write_continue(ScrHttpRes *r);
+void scr_http_res_write_processing(ScrHttpRes *r);
+void scr_http_res_write_early_hints(ScrHttpRes *r, ScrArr *pairs /*borrowed: [name, value, ...] */);
 /* writeHead with a CHECKED-DYNAMIC headers object (borrowed): OBJ
  * entries setHeader in insertion order (string/number values), then the
  * head goes out; undefined/null = the plain head; may throw. */
@@ -6108,6 +6184,14 @@ void scr_http_res_add_trailers(ScrHttpRes *r, ScrArr *pairs /*borrowed: [name, v
 void scr_http_res_write_dynv(ScrHttpRes *r, const ScrDyn *d /*borrowed*/);
 void scr_http_res_end_dynv(ScrHttpRes *r, const ScrDyn *d /*borrowed*/);
 bool scr_http_res_headers_sent(ScrHttpRes *r);
+bool scr_http_res_writable_ended(ScrHttpRes *r);
+bool scr_http_res_send_date(ScrHttpRes *r);
+void scr_http_res_set_send_date(ScrHttpRes *r, bool value);
+bool scr_http_res_strict_content_length(ScrHttpRes *r);
+void scr_http_res_set_strict_content_length(ScrHttpRes *r, bool value);
+ScrHttpReq *scr_http_res_request(ScrHttpRes *r); /* +1 */
+ScrNetSocket *scr_http_res_socket(ScrHttpRes *r); /* +1 or NULL after finish */
+bool scr_http_res_writable_finished(ScrHttpRes *r);
 /* The res member surface: statusCode (200 until assigned; inert once the
  * head went out), statusMessage (the reason phrase — assigned value, or
  * the code's default), the header CRUD trio, and end(cb)'s finish slot
@@ -6117,6 +6201,9 @@ void scr_http_res_status_set(ScrHttpRes *r, double status);
 ScrStr *scr_http_res_status_msg_get(ScrHttpRes *r); /* +1 */
 void scr_http_res_status_msg_set(ScrHttpRes *r, ScrStr *msg /*borrowed*/);
 ScrStr *scr_http_res_get_header(ScrHttpRes *r, ScrStr *name /*borrowed*/); /* +1 or NULL */
+ScrArr *scr_http_res_get_header_names(ScrHttpRes *r); /* +1 */
+ScrArr *scr_http_res_get_raw_header_names(ScrHttpRes *r); /* +1 */
+ScrDyn *scr_http_res_get_headers(ScrHttpRes *r); /* +1 */
 bool scr_http_res_has_header_named(ScrHttpRes *r, ScrStr *name /*borrowed*/);
 void scr_http_res_remove_header(ScrHttpRes *r, ScrStr *name /*borrowed*/);
 void scr_http_res_on_finish(ScrHttpRes *r, ScrClosure *cb /*moves*/);
@@ -6155,6 +6242,7 @@ void scr_http_req_resume(ScrHttpReq *r);
  * socket's idle timer; the flags back req.destroyed/req.readable. */
 void scr_http_req_pause(ScrHttpReq *r);
 void scr_http_req_set_timeout(ScrHttpReq *r, double ms, ScrClosure *cb /*moves, nullable*/);
+void scr_http_req_set_timeout_plain(ScrHttpReq *r, double ms);
 bool scr_http_req_destroyed_flag(ScrHttpReq *r);
 bool scr_http_req_readable(ScrHttpReq *r);
 /* flushHeaders/cork/uncork/writableCorked, the res.req backref, the
@@ -6166,6 +6254,7 @@ double scr_http_res_writable_corked(ScrHttpRes *r);
 bool scr_http_res_destroyed_flag(ScrHttpRes *r);
 void scr_http_res_set_req(ScrHttpRes *r, ScrHttpReq *req /*borrowed, nullable*/);
 void scr_http_res_set_timeout(ScrHttpRes *r, double ms, ScrClosure *cb /*moves, nullable*/);
+void scr_http_res_set_timeout_plain(ScrHttpRes *r, double ms);
 void scr_http_res_on_write_flush(ScrHttpRes *r, ScrClosure *cb /*moves*/);
 /* req.setEncoding(enc) — the socket twin's contract; may throw. */
 void scr_http_req_set_encoding(ScrHttpReq *r, ScrStr *enc /*borrowed*/);
@@ -6199,6 +6288,25 @@ void scr_http_client_end(ScrHttpClientReq *c);
 void scr_http_client_end_str(ScrHttpClientReq *c, ScrStr *data /*borrowed*/);
 void scr_http_client_end_bytes(ScrHttpClientReq *c, ScrBytes *data /*borrowed*/);
 void scr_http_client_flush_headers(ScrHttpClientReq *c);
+void scr_http_client_set_header(ScrHttpClientReq *c, ScrStr *name /*borrowed*/, ScrStr *value /*borrowed*/);
+ScrStr *scr_http_client_get_header(ScrHttpClientReq *c, ScrStr *name /*borrowed*/); /* +1 or NULL */
+bool scr_http_client_has_header_named(ScrHttpClientReq *c, ScrStr *name /*borrowed*/);
+void scr_http_client_remove_header(ScrHttpClientReq *c, ScrStr *name /*borrowed*/);
+ScrArr *scr_http_client_get_header_names(ScrHttpClientReq *c); /* +1 */
+ScrArr *scr_http_client_get_raw_header_names(ScrHttpClientReq *c); /* +1 */
+ScrDyn *scr_http_client_get_headers(ScrHttpClientReq *c); /* +1 */
+ScrStr *scr_http_client_method(ScrHttpClientReq *c); /* +1 */
+ScrStr *scr_http_client_path(ScrHttpClientReq *c); /* +1 */
+ScrStr *scr_http_client_host(ScrHttpClientReq *c); /* +1 */
+ScrStr *scr_http_client_protocol(ScrHttpClientReq *c); /* +1 */
+bool scr_http_client_headers_sent(ScrHttpClientReq *c);
+bool scr_http_client_writable_ended(ScrHttpClientReq *c);
+bool scr_http_client_writable_finished(ScrHttpClientReq *c);
+ScrNetSocket *scr_http_client_socket(ScrHttpClientReq *c); /* +1 */
+bool scr_http_client_reused_socket(ScrHttpClientReq *c);
+void scr_http_client_set_nodelay(ScrHttpClientReq *c, bool enable);
+void scr_http_client_set_socket_keepalive(ScrHttpClientReq *c, bool enable, double delay_ms);
+void scr_http_client_set_timeout_cb(ScrHttpClientReq *c, double ms, ScrClosure *cb /*moves*/);
 void scr_http_client_add_trailers(ScrHttpClientReq *c, ScrArr *pairs /*borrowed*/);
 void scr_http_client_cork(ScrHttpClientReq *c);
 void scr_http_client_uncork(ScrHttpClientReq *c);
@@ -6208,8 +6316,13 @@ void scr_http_client_write_dynv(ScrHttpClientReq *c, const ScrDyn *d /*borrowed*
 void scr_http_client_end_dynv(ScrHttpClientReq *c, const ScrDyn *d /*borrowed*/);
 void scr_http_client_set_timeout(ScrHttpClientReq *c, double ms);
 void scr_http_client_destroy(ScrHttpClientReq *c);
+void scr_http_client_abort(ScrHttpClientReq *c);
+bool scr_http_client_aborted(ScrHttpClientReq *c);
 bool scr_http_client_destroyed(ScrHttpClientReq *c);
 void scr_http_client_on_response(ScrHttpClientReq *c, ScrClosure *cb /*moves*/, ScrHttpRespFn fn, bool once);
+void scr_http_client_on_socket(ScrHttpClientReq *c, ScrClosure *cb /*moves*/, ScrNetConnFn fn, bool once);
+void scr_http_client_on_finish(ScrHttpClientReq *c, ScrClosure *cb /*moves*/, bool once);
+void scr_http_client_on_abort(ScrHttpClientReq *c, ScrClosure *cb /*moves*/, bool once);
 void scr_http_client_on_error(ScrHttpClientReq *c, ScrClosure *cb /*moves*/, ScrChildErrFn fn, bool once);
 void scr_http_client_on_timeout(ScrHttpClientReq *c, ScrClosure *cb /*moves*/, bool once);
 void scr_http_client_on_close(ScrHttpClientReq *c, ScrClosure *cb /*moves*/, bool once);

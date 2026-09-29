@@ -22,11 +22,34 @@ const outDir = path.join(uiDir, "build", "sc-graph");
 rmSync(outDir, { recursive: true, force: true });
 mkdirSync(outDir, { recursive: true });
 
-// The typed graph: every .ts/.tsx module the UI is made of.
+// The typed graph: every .ts/.tsx module the UI is made of — RECURSIVE, so
+// subdirectories (cards/, etc.) come along with their relative paths intact.
+// (The flat readdirSync variant silently dropped cards/* and scriptc 0.1.7
+// then failed with SC0001 "Cannot find module './cards/header'".)
 const srcDir = path.join(uiDir, "src");
-const files = readdirSync(srcDir).filter((f) => /\.(tsx|ts)$/.test(f) && !f.endsWith(".d.ts"));
+const files = [];
+(function walk(dir, rel) {
+    for (const e of readdirSync(dir, { withFileTypes: true })) {
+        if (e.isDirectory()) {
+            walk(path.join(dir, e.name), rel ? `${rel}/${e.name}` : e.name);
+        } else if (/\.(tsx|ts)$/.test(e.name) && !e.name.endsWith(".d.ts")) {
+            files.push(rel ? `${rel}/${e.name}` : e.name);
+        }
+    }
+})(srcDir, "");
 
 function desugar(sourceText, fileName) {
+    // Strip @begin-dynamic-engine … @end-dynamic-engine regions BEFORE
+    // parsing. These regions hold dynamic-engine-only code (io-core's
+    // globalThis/process sink self-wiring) that scriptc 0.1.7 refuses even
+    // as dead code (SC2020). The sc-graph never needs it — sc-main.ts calls
+    // setSink() itself — while dynamic engines compile the original src/
+    // where the markers are just comments. Line-comment markers are removed
+    // too, so scriptc never sees the pragma names.
+    sourceText = sourceText.replace(
+        /^[ \t]*\/\/\s*@begin-dynamic-engine.*?^[ \t]*\/\/\s*@end-dynamic-engine[^\n]*\n?/gms,
+        "",
+    );
     const sf = ts.createSourceFile(fileName, sourceText, ts.ScriptTarget.ES2022, true, ts.ScriptKind.TSX);
 
     const transformer = (ctx) => {
@@ -181,7 +204,9 @@ for (const f of files) {
     const src = readFileSync(path.join(srcDir, f), "utf8");
     const out = desugar(src, f);
     const outName = f.replace(/\.tsx$/, ".ts");
-    writeFileSync(path.join(outDir, outName), out);
+    const outPath = path.join(outDir, outName);
+    mkdirSync(path.dirname(outPath), { recursive: true });
+    writeFileSync(outPath, out);
     ok++;
 }
 console.log(`desugared ${ok} files -> ${outDir}`);

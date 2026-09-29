@@ -1387,6 +1387,58 @@ ScrStr *scr_dyn_typeof(const ScrDyn *d) {
   return scr_str_new(s, strlen(s));
 }
 
+bool scr_dyn_is_object(const ScrDyn *d) {
+  ScrStr *type = scr_dyn_typeof(d);
+  bool object = type->len == 6 && memcmp(type->data, "object", 6) == 0;
+  scr_str_release(type);
+  return object;
+}
+
+ScrStr *scr_dyn_object_tag(const ScrDyn *d) {
+  if (d->kind == SCR_DYN_TYPED_REF) {
+    if (scr_dyn_isl_is_error(d)) return scr_str_new("[object Error]", 14);
+    ScrDyn *materialized = scr_dyn_typed_ref_materialize(d);
+    ScrStr *out = scr_dyn_object_tag(materialized);
+    scr_dyn_release(materialized);
+    return out;
+  }
+  if (d->kind == SCR_DYN_JSVAL) {
+    scr_dyn_isl_fence(d, "Object.prototype.toString.call");
+    return NULL;
+  }
+  const char *tag;
+  switch (d->kind) {
+  case SCR_DYN_UNDEF: tag = "[object Undefined]"; break;
+  case SCR_DYN_NULL: tag = "[object Null]"; break;
+  case SCR_DYN_BOOL: tag = "[object Boolean]"; break;
+  case SCR_DYN_NUM: tag = "[object Number]"; break;
+  case SCR_DYN_STR: tag = "[object String]"; break;
+  case SCR_DYN_ARR: tag = "[object Array]"; break;
+  case SCR_DYN_OBJ: tag = "[object Object]"; break;
+  case SCR_DYN_HANDLE:
+    if (d->v.handle.tag >= SCR_DYNH_ABORT_SIGNAL &&
+        d->v.handle.tag <= SCR_DYNH_ABORT_CONTROLLER) {
+      ScrJsonBuf b;
+      scr_jb_init(&b);
+      scr_jb_puts(&b, "[object ");
+      scr_jb_puts(&b, scr_dyn_handle_cls(d));
+      scr_jb_putc(&b, ']');
+      return scr_jb_finish(&b);
+    }
+    tag = "[object Object]";
+    break;
+  case SCR_DYN_BYTES: tag = "[object Uint8Array]"; break;
+  case SCR_DYN_FUNC: tag = "[object Function]"; break;
+  case SCR_DYN_PROMISE: tag = "[object Promise]"; break;
+  default: {
+    const char *msg = "Object.prototype.toString.call on this checked-dynamic kind is not supported yet";
+    scr_throw_error_msg(SCR_ERR_ERROR, msg, strlen(msg));
+    return NULL;
+  }
+  }
+  return scr_str_new(tag, strlen(tag));
+}
+
 /* ── JSON.stringify over a dyn value (util.format's %j) ───────────────
  * The RUNTIME walk the type-directed serializers deliberately avoid for
  * static values — a dyn value has no static type, so the checked-dynamic tree's own kinds
@@ -2914,6 +2966,30 @@ bool scr_dyn_err_instanceof(const ScrDyn *d, double kind) {
   return false;
 }
 
+ScrDyn *scr_dyn_obj_read(const ScrDyn *d, const char *key, size_t key_len) {
+  ScrDyn *own = scr_dyn_obj_get(d, key, key_len);
+  if (own) return scr_dyn_retain(own);
+  if (key_len == 11 && memcmp(key, "constructor", 11) == 0) {
+    static const char *const tokens[] = {
+        "[builtin Error]", "[builtin TypeError]",
+        "[builtin RangeError]", "[builtin SyntaxError]",
+    };
+    for (size_t i = 0; i < scr_errdyn_n; i++) {
+      if (scr_errdyn_cache[i].dyn != d) continue;
+      const ScrVt *vt = scr_errdyn_cache[i].err->vt;
+      for (size_t kind = 0; kind < sizeof tokens / sizeof tokens[0]; kind++) {
+        if (vt != &scr_error_vts[kind]) continue;
+        ScrStr *token = scr_str_new(tokens[kind], strlen(tokens[kind]));
+        ScrDyn *result = scr_dyn_new_str(token);
+        scr_str_release(token);
+        return result;
+      }
+      break;
+    }
+  }
+  return scr_dyn_retain(scr_dyn_undefined());
+}
+
 /* ── Object.keys/values/entries over the checked-dynamic tree ──────────────────────────
  * JS own-key order: array-index keys ascending first, then the rest in
  * insertion order. entries answers [key, value] pairs; values RETAIN
@@ -3259,6 +3335,19 @@ ScrDyn *scr_dyn_assign_all(ScrDyn *target, const ScrDyn *sources) {
   return scr_dyn_retain(target);
 }
 
+static bool scr_dyn_canonical_own_index(const ScrStr *key, size_t length) {
+  if (key->len == 0 || (key->len > 1 && key->data[0] == '0')) return false;
+  size_t index = 0;
+  for (size_t i = 0; i < key->len; i++) {
+    if (key->data[i] < '0' || key->data[i] > '9') return false;
+    size_t digit = (size_t)(key->data[i] - '0');
+    if (index > (SIZE_MAX - digit) / 10) return false;
+    index = index * 10 + digit;
+    if (index >= length) return false;
+  }
+  return true;
+}
+
 bool scr_dyn_has_own(const ScrDyn *v, const ScrStr *key) {
   if (v->kind == SCR_DYN_UNDEF || v->kind == SCR_DYN_NULL) {
     const char *m = "Cannot convert undefined or null to object";
@@ -3276,13 +3365,20 @@ bool scr_dyn_has_own(const ScrDyn *v, const ScrStr *key) {
   }
   if (v->kind == SCR_DYN_ARR) {
     if (key->len == 6 && memcmp(key->data, "length", 6) == 0) return true;
-    size_t idx = 0;
-    int is_index = key->len > 0 && !(key->len > 1 && key->data[0] == '0');
-    for (size_t i = 0; is_index && i < key->len; i++) {
-      if (key->data[i] < '0' || key->data[i] > '9') is_index = 0;
-      else idx = idx * 10 + (size_t)(key->data[i] - '0');
-    }
-    return is_index != 0 && idx < v->v.arr.len;
+    return scr_dyn_canonical_own_index(key, v->v.arr.len);
+  }
+  if (v->kind == SCR_DYN_STR) {
+    if (key->len == 6 && memcmp(key->data, "length", 6) == 0) return true;
+    return scr_dyn_canonical_own_index(key, (size_t)scr_str_utf16_len(v->v.str));
+  }
+  if (v->kind == SCR_DYN_BYTES) {
+    return scr_dyn_canonical_own_index(key, v->v.bytes->len);
+  }
+  if (v->kind == SCR_DYN_FUNC || v->kind == SCR_DYN_HANDLE ||
+      v->kind == SCR_DYN_TYPED_REF) {
+    const char *m = "Own-property checks on this checked-dynamic kind are not supported yet";
+    scr_throw_error_msg(SCR_ERR_ERROR, m, strlen(m));
+    return false;
   }
   return false;
 }

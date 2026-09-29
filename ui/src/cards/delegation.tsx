@@ -22,7 +22,9 @@ function delegAppend(line: string): void {
  * 事件委托演示卡：
  *  - 「冒泡」行：子 div 无自己的 onClick，父容器通过委托拿到点击
  *    （currentTarget 指向父级，target 指向被点的子块）。
- *  - 「拦截」行：子 div 的 onClick 调 stopPropagation()，父容器收不到。
+ *  - 「拦截」行：子 div 的 onClick 置 ev.stopped = true，父容器收不到。
+ *    （scriptc 0.1.7：HostEvent 不携带函数字段 —— SC1101 根因，见 io-core
+ *    的 HostEvent 注释；stopPropagation 语义由 stopped 布尔字段承担。）
  */
 export function DelegationCard(_props: Props): El {
     // 父级委托 handler（挂在外层容器上，两个子区共享）
@@ -30,10 +32,10 @@ export function DelegationCard(_props: Props): El {
         const at = ev.currentTarget === ev.target ? "自身" : "委托(父级)";
         delegAppend("→ 父级收到 " + at + " target=" + String(ev.target));
     };
-    // 拦截行子块：处理后截断冒泡
+    // 拦截行子块：处理后截断冒泡（ev.stopped = true ≡ 旧 stopPropagation()）
     const onStopChild = (ev: HostEvent): void => {
-        delegAppend("● 拦截行子块点击（stopPropagation）");
-        if (ev.stopPropagation !== undefined) ev.stopPropagation();
+        delegAppend("● 拦截行子块点击（stopped）");
+        ev.stopped = true;
     };
     const onBubbleChild = (ev: HostEvent): void => {
         delegAppend("○ 冒泡行子块点击 target=" + String(ev.target));
@@ -52,7 +54,7 @@ export function DelegationCard(_props: Props): El {
             {text("点我：子先跑，父级随后收到（currentTarget=父级）", { fontSize: 12 })}
         </div>
     ));
-    const stopZone = zone("拦截（stopPropagation）", (
+    const stopZone = zone("拦截（ev.stopped）", (
         <div
             style={{ padding: 8, background: C.bg, borderRadius: 6, borderWidth: 1, borderColor: C.border }}
             onClick={onStopChild}
