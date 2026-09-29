@@ -14,8 +14,9 @@ use crate::style::{
 };
 use crate::{DEFAULT_INPUT_W, DEFAULT_FONT_SIZE, LINE_RATIO, HostView};
 use gpui::{
-    prelude::*, AnyElement, ClickEvent, Context, Deferred, ElementId, IntoElement, Render,
-    ScrollHandle, ScrollWheelEvent, SharedString, Window, canvas, deferred, div, px, rgb, rgba,
+    prelude::*, AnyElement, ClickEvent, Context, Deferred, ElementId, IntoElement, MouseButton,
+    MouseDownEvent, MouseUpEvent, Render, ScrollHandle, ScrollWheelEvent, SharedString, Window,
+    canvas, deferred, div, px, rgb, rgba,
 };
 use gpui_component::Sizable;
 use serde_json::json;
@@ -227,6 +228,15 @@ impl HostView {
                     }
                 });
         }
+        // `onWheel` on a plain div: forward every tick under the pointer to
+        // the frontend (no guard — the DOM wheel event fires regardless of
+        // scroll position). Scroll containers keep their guard listener; the
+        // frontend's scroll event already covers them.
+        if wants(node, "wheel") && !scroll {
+            s = s.on_scroll_wheel(cx.listener(move |this, _ev: &ScrollWheelEvent, _window, cx| {
+                this.send_event(id, "wheel", None);
+            }));
+        }
         if wants(node, "click") {
             s = s.on_click(cx.listener(move |this, _ev: &ClickEvent, _window, cx| {
                 // Exactly one protocol event per physical click: GPUI bubbles
@@ -240,6 +250,44 @@ impl HostView {
                 // C3 latency: epoch ms aligned with the frontend's Date.now()
                 log!("[host] click id={id} t={}", now_ms());
                 this.send_event(id, "click", None);
+            }));
+        }
+        // Mouse family — same precise-target delivery as click: stop GPUI's
+        // host-side bubble (which would fire once per ancestor) and let the
+        // frontend runtime walk the mount tree (BUBBLING_KINDS covers these
+        // kinds). `on_mouse_down`/`on_mouse_up` are hovered-hit bubble-phase
+        // listeners, so only the visual target under the pointer reports.
+        if wants(node, "mousedown") {
+            s = s.on_mouse_down(MouseButton::Left, cx.listener(move |this, _ev: &MouseDownEvent, _window, cx| {
+                cx.stop_propagation();
+                this.send_event(id, "mousedown", None);
+            }));
+        }
+        if wants(node, "mouseup") {
+            s = s.on_mouse_up(MouseButton::Left, cx.listener(move |this, _ev: &MouseUpEvent, _window, cx| {
+                cx.stop_propagation();
+                this.send_event(id, "mouseup", None);
+            }));
+        }
+        // dblclick: derive from two clicks inside the OS double-click time.
+        // The per-node last-click cell keeps it stateless on the frontend.
+        if wants(node, "dblclick") {
+            let last = self
+                .dblclick_last
+                .entry(id)
+                .or_insert_with(|| std::rc::Rc::new(std::cell::Cell::new(0.0f64)))
+                .clone();
+            s = s.on_click(cx.listener(move |this, _ev: &ClickEvent, _window, cx| {
+                let now = now_ms() as f64;
+                let prev = last.get();
+                last.set(now);
+                // Windows default double-click time is 500ms; a fixed window
+                // keeps the three backends identical.
+                if now - prev <= 500.0 {
+                    last.set(0.0);
+                    cx.stop_propagation();
+                    this.send_event(id, "dblclick", None);
+                }
             }));
         }
 
@@ -441,6 +489,7 @@ impl HostView {
         self.scroll_handles.retain(|k, _| live.contains(k));
         self.scroll_last_raw.retain(|k, _| live.contains(k));
         self.scroll_reported.retain(|k, _| live.contains(k));
+        self.dblclick_last.retain(|k, _| live.contains(k));
         self.focus_reported.retain(|k, _| live.contains(k));
         self.input_states.retain(|k, _| live.contains(k));
         self.input_reported.retain(|k, _| live.contains(k));

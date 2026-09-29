@@ -40,6 +40,10 @@ export function DelegationCard(_props: Props): El {
     const onBubbleChild = (ev: HostEvent): void => {
         delegAppend("○ 冒泡行子块点击 target=" + String(ev.target));
     };
+    // mousedown 冒泡：与 click 同一条委托链，只是 kind 不同（#129 扩展）。
+    const onParentMouseDown = (ev: HostEvent): void => {
+        delegAppend("⇱ 父级收到 mousedown 委托 target=" + String(ev.target));
+    };
     const zone = (labelText: string, child: El): El => (
         <div style={{ flexDirection: "column", gap: 4 }} onClick={onParentClick}>
             {text(labelText, { fontSize: 11, color: C.textMuted })}
@@ -62,11 +66,36 @@ export function DelegationCard(_props: Props): El {
             {text("点我：父级不会收到", { fontSize: 12 })}
         </div>
     ));
+    // mousedown 演示行：子块只声明 onMouseDown（无 click），父容器用
+    // onMouseDown 委托 —— host 端 mousedown 也走精确投递，前端沿挂载树冒泡。
+    // mouseup/dblclick/wheel（#129 全家族）：子块再挂 onMouseUp + onDblClick，
+    // 父容器挂 onWheel（wheel 不声明在子块，验证跨级委托）。
+    const onChildMouseUp = (): void => delegAppend("⇱ 子块 mouseup");
+    const onChildDblClick = (): void => delegAppend("⇱ 子块 dblclick");
+    const onParentWheel = (): void => delegAppend("⇱ 父级收到 wheel");
+    const mouseZone: El = (
+        <div
+            style={{ flexDirection: "column", gap: 4 }}
+            onMouseDown={onParentMouseDown}
+            onWheel={onParentWheel}
+        >
+            {text("mousedown 冒泡（#129）", { fontSize: 11, color: C.textMuted })}
+            <div
+                style={{ padding: 8, background: C.bg, borderRadius: 6, borderWidth: 1, borderColor: C.border }}
+                onMouseDown={(): void => delegAppend("⇱ 子块 mousedown target 自身")}
+                onMouseUp={onChildMouseUp}
+                onDblClick={onChildDblClick}
+            >
+                {text("按我：子先跑，父级随后收到（mousedown）", { fontSize: 12 })}
+            </div>
+        </div>
+    );
     return (
-        <Card title="事件委托 · click 冒泡（DOM 语义）">
+        <Card title="事件委托 · click/mousedown 冒泡（DOM 语义）">
             <div style={{ flexDirection: "column", gap: 8 }}>
                 {bubbleZone}
                 {stopZone}
+                {mouseZone}
                 {text(() => (delegLog() === "" ? "（还没有点击）" : delegLog()), {
                     fontSize: 11,
                     color: C.textSecondary,

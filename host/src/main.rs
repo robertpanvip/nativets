@@ -340,6 +340,10 @@ struct HostView {
     /// Last offset pushed to the frontend per node — so the poll in `render`
     /// turns a change into exactly one event, not one per frame.
     scroll_reported: HashMap<u64, f32>,
+    /// Epoch ms of the previous click per node, for the `dblclick` derivation
+    /// (two clicks within 500ms). `Rc<Cell<_>>` shares it with the `Fn`
+    /// listener closure, the same shape as `scroll_last_raw`.
+    dblclick_last: HashMap<u64, std::rc::Rc<std::cell::Cell<f64>>>,
     /// Same idea for text-field focus, which the frontend uses to style its own
     /// focus ring (`focus` / `blur` events).
     focus_reported: HashMap<u64, bool>,
@@ -886,6 +890,7 @@ fn open_host_window(
                 scroll_handles: HashMap::new(),
                 scroll_last_raw: HashMap::new(),
                 scroll_reported: HashMap::new(),
+                dblclick_last: HashMap::new(),
                 focus_reported: HashMap::new(),
                 input_states: HashMap::new(),
                 input_reported: HashMap::new(),
@@ -1054,8 +1059,15 @@ fn spawn_ops_apply(
                             log!("[host] tree after {} ops:\n{}", ops.len(), view.tree.dump());
                         }
                         // AOT 前端把挂载摊成单 op 行（batch ops=1），≥32 阈值永不触发；
-                        // 早期批次（前 400 个 op）也 dump，便于排障。
-                        if dump_tree_enabled() && OPS_SEEN.load(Ordering::Relaxed) < 400 {
+                        // 早期批次（前 400 个 op）也 dump，便于排障。`full` 值
+                        // 解除上限（调试事件装配等低频 op 用）。
+                        let dump_all = matches!(
+                            std::env::var("GPUI_TS_DUMP_TREE").as_deref(),
+                            Ok("full") | Ok("all")
+                        );
+                        if dump_tree_enabled()
+                            && (dump_all || OPS_SEEN.load(Ordering::Relaxed) < 400)
+                        {
                             log!("[host] early tree after {} ops:\n{}", ops.len(), view.tree.dump());
                         }
                         cx.notify();

@@ -683,13 +683,15 @@ interface LineMsg {
 }
 
 /**
- * Kinds that bubble to ancestors. `click` is a *user interaction* and follows
- * DOM semantics: a handler on any ancestor sees it unless someone calls
- * `ev.stopPropagation()`. The rest are control *state* (a field was edited,
- * a scroller moved, focus landed) — they belong to exactly one element and
- * stay target-only, like DOM `input`/`scroll` don't bubble.
+ * Kinds that bubble to ancestors, following DOM semantics. User
+ * *interactions* (the mouse family) bubble so a container can delegate; the
+ * click stop is host-side (`cx.stop_propagation` in build_node), so exactly
+ * one protocol event enters this walk per physical click. The rest are
+ * control *state* (a field was edited, a scroller moved, focus landed) —
+ * they belong to exactly one element and stay target-only, matching DOM
+ * `input`/`scroll`/`focus`, which do not bubble either.
  */
-const BUBBLING_KINDS: string[] = ["click"];
+const BUBBLING_KINDS: string[] = ["click", "mousedown", "mouseup", "dblclick", "wheel"];
 
 /** Element-scoped event registry — same class workaround as lineHandlers. */
 class EventEntry {
@@ -971,6 +973,10 @@ export interface Props {
     placeholder?: string;
     children?: Child;
     onClick?: HostEventHandler;
+    onMouseDown?: HostEventHandler;
+    onMouseUp?: HostEventHandler;
+    onDblClick?: HostEventHandler;
+    onWheel?: HostEventHandler;
     onInput?: HostEventHandler;
     onChange?: HostEventHandler;
     onScroll?: HostEventHandler;

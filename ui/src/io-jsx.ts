@@ -83,6 +83,10 @@ export function h(tag: string | AnyComponent, props: Props | null, ...children: 
 
     const kinds: string[] = [];
     if (p.onClick !== undefined) { wireEvent(e, "click", p.onClick); kinds.push("click"); }
+    if (p.onMouseDown !== undefined) { wireEvent(e, "mousedown", p.onMouseDown); kinds.push("mousedown"); }
+    if (p.onMouseUp !== undefined) { wireEvent(e, "mouseup", p.onMouseUp); kinds.push("mouseup"); }
+    if (p.onDblClick !== undefined) { wireEvent(e, "dblclick", p.onDblClick); kinds.push("dblclick"); }
+    if (p.onWheel !== undefined) { wireEvent(e, "wheel", p.onWheel); kinds.push("wheel"); }
     if (p.onInput !== undefined) { wireEvent(e, "input", p.onInput); kinds.push("input"); }
     if (p.onChange !== undefined) { wireEvent(e, "change", p.onChange); kinds.push("change"); }
     if (p.onScroll !== undefined) { wireEvent(e, "scroll", p.onScroll); kinds.push("scroll"); }

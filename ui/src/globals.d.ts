@@ -255,15 +255,25 @@ declare namespace JSX {
      * payload (see `HostEvent`). `onFocus`/`onBlur` are field-only; `onScroll`
      * needs an `overflow: "scroll"` node.
      *
-     * Delegation: `click` bubbles like the DOM — an ancestor's `onClick` fires
+     * Delegation: the mouse family (`click`, `mousedown`, `mouseup`,
+     * `dblclick`, `wheel`) bubbles like the DOM — an ancestor's handler fires
      * after the target's, with `ev.currentTarget` pointed at the ancestor;
-     * `ev.stopped = true` inside a handler halts the walk. The other kinds
-     * stay on target.
+     * `ev.stopped = true` inside a handler halts the walk. The state kinds
+     * (`input`/`change`/`scroll`/`focus`/`blur`) stay on target, matching the
+     * DOM (input/scroll/focus do not bubble).
      */
     interface IntrinsicProps {
         style?: Style;
         /** Bubbles to ancestors (DOM click semantics; ev.stopped honored). */
         onClick?: (ev: HostEvent) => void;
+        /** Left button pressed; bubbles like click. */
+        onMouseDown?: (ev: HostEvent) => void;
+        /** Left button released over the element; bubbles like click. */
+        onMouseUp?: (ev: HostEvent) => void;
+        /** Two clicks within 500ms on the element; bubbles like click. */
+        onDblClick?: (ev: HostEvent) => void;
+        /** A wheel tick over a plain (non-scroll) div; bubbles like click. */
+        onWheel?: (ev: HostEvent) => void;
         /** Text field edited; `ev.value` is the new text. */
         onInput?: (ev: HostEvent) => void;
         /** Enter pressed in a text field; `ev.value` is the committed text. */
