@@ -7,7 +7,7 @@
 use crate::log;
 use crate::now_ms;
 use crate::bom::DialogRequest;
-use crate::canvas_draw::{paint_cmds, scrollbar_overlay, round1};
+use crate::canvas_draw::{paint_cmds, round1, scrollbar_overlay_draggable};
 use crate::style::{
     apply_style, sorted_style, is_box_key, is_placement_key, is_scroll_container, is_transparent,
     scroll_inset, num_of, wants, wants_node,
@@ -247,7 +247,11 @@ impl HostView {
             None => s.into_any_element(),
             Some(w) => w
                 .child(s)
-                .child(scrollbar_overlay(self.scroll_handle(id), scroll_inset(node)))
+                .child(scrollbar_overlay_draggable(
+                    self.scroll_handle(id),
+                    id,
+                    scroll_inset(node),
+                ))
                 .into_any_element(),
         };
         // `elevate` is not a style but a paint-order change: GPUI's `deferred`

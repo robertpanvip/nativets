@@ -5,9 +5,9 @@
 //! lives in a `ScrollHandle` only the host can read.
 
 use gpui::{
-    prelude::*, AnyElement, App, Bounds, BorderStyle, Corners, Edges, Fill, Font, FontWeight, Path,
-    PathBuilder, Point, ScrollHandle, ShapedLine, SharedString, TextAlign, TextRun, Window, canvas,
-    fill, point, px, rgba, size,
+    prelude::*, AnyElement, App, Bounds, BorderStyle, Corners, div, Edges, Fill, Font, FontWeight,
+    Path, PathBuilder, Point, ScrollHandle, ShapedLine, SharedString, TextAlign, TextRun, Window,
+    canvas, fill, point, px, rgba, size,
 };
 use crate::draw::Cmd as DrawCmd;
 use crate::{LINE_RATIO, SCROLLBAR_W, SCROLLBAR_MIN_THUMB, SCROLLBAR_THUMB};
@@ -241,3 +241,129 @@ pub(crate) fn scrollbar_overlay(handle: ScrollHandle, inset: f32) -> AnyElement 
     .bottom(px(inset))
     .into_any_element()
 }
+
+/// Drag payload for the scrollbar thumb: carries the scroll id so a nested
+/// scroller's overlay can tell its own drag move events apart (the payload
+/// type check in `on_drag_move` already scopes by type; the id makes the
+/// assertion airtight for debugging).
+#[derive(Clone)]
+pub(crate) struct DragScrollbar(pub u64);
+
+impl gpui::Render for DragScrollbar {
+    fn render(&mut self, _: &mut gpui::Window, _: &mut gpui::Context<Self>) -> impl IntoElement {
+        gpui::Empty
+    }
+}
+
+/// The interactive scrollbar: the same canvas paint as `scrollbar_overlay`
+/// plus a thumb drag. The track element (the `SCROLLBAR_W`-wide absolute
+/// column) owns the drag: `on_drag_move` fires in the capture phase for the
+/// WHOLE window regardless of hover, so the thumb keeps following the pointer
+/// even when the drag leaves the thin bar. Geometry is linear —
+/// `track height : max scroll travel` — computed live from the handle, so no
+/// grab-offset bookkeeping is needed beyond the pointer's offset within the
+/// thumb when the drag starts (kept in the drag payload).
+pub(crate) fn scrollbar_overlay_draggable(
+    handle: ScrollHandle,
+    id: u64,
+    inset: f32,
+) -> AnyElement {
+    // Canvas paints the thumb; the wrapping div is the interactive element
+    // (Canvas itself is not an InteractiveElement, so drag listeners cannot
+    // attach to it directly). `.id()` makes it Stateful — `on_drag` lives on
+    // `StatefulInteractiveElement`, not `InteractiveElement`.
+    // Clone for the paint closure: the drag closures below need the handle too.
+    let paint_handle = handle.clone();
+    div()
+        .id(gpui::ElementId::from(SharedString::from(format!(
+            "scrollbar-{id}"
+        ))))
+        .relative()
+        .w(px(SCROLLBAR_W))
+        .absolute()
+        .top(px(inset))
+        .right(px(inset))
+        .bottom(px(inset))
+        .child(
+            canvas(
+                move |_bounds, _window, _cx| (),
+                move |bounds, _state, window, _cx| {
+                    let viewport = f32::from(bounds.size.height);
+                    let offset = f32::from(-paint_handle.offset().y);
+                    let max = f32::from(paint_handle.max_offset().y);
+                    let Some((y, thumb_h)) = crate::draw::scrollbar_thumb(
+                        viewport,
+                        viewport + max,
+                        offset,
+                        viewport,
+                        SCROLLBAR_MIN_THUMB,
+                    ) else {
+                        return;
+                    };
+                    let w = f32::from(bounds.size.width);
+                    let inner = if w > 6.0 { w - 4.0 } else { w };
+                    let mut q = fill(
+                        Bounds {
+                            origin: point(bounds.origin.x + px(2.0), bounds.origin.y + px(y)),
+                            size: size(px(inner), px(thumb_h)),
+                        },
+                        rgba(SCROLLBAR_THUMB),
+                    );
+                    q.corner_radii = Corners::all(px(3.0));
+                    window.paint_quad(q);
+                },
+            )
+            .size_full(),
+        )
+        // --- thumb drag (slider-pattern: on_drag + on_drag_move) ---
+        // The drag starts anywhere on the track column: coarse for a thin
+        // bar, but the mapping below anchors the offset to the pointer within
+        // the track, so it feels like a normal scrollbar grab. (A thumb-only
+        // hit test would need per-frame thumb geometry in element state; the
+        // track-level grab is the same tradeoff GTK makes for steppers.)
+        .on_drag(DragScrollbar(id), |_, _, _, cx| {
+            cx.new(|_| DragScrollbar(0))
+        })
+        .on_drag_move(
+            move |ev: &gpui::DragMoveEvent<DragScrollbar>,
+                  window: &mut gpui::Window,
+                  _cx: &mut gpui::App| {
+            let max = f32::from(handle.max_offset().y);
+            if max <= 0.0 {
+                return;
+            }
+            let track_h = f32::from(ev.bounds.size.height);
+            let viewport = track_h; // the track spans the viewport (inset only shifts it)
+            let Some((_, thumb_h)) = crate::draw::scrollbar_thumb(
+                viewport,
+                viewport + max,
+                0.0, // geometry only: thumb size does not depend on offset
+                viewport,
+                SCROLLBAR_MIN_THUMB,
+            ) else {
+                return;
+            };
+            let travel = (track_h - thumb_h).max(0.0);
+            if travel <= 0.0 {
+                return;
+            }
+            // Pointer position within the track, minus half the thumb,
+            // clamped — `scrollbar_thumb`'s progress mapping in reverse.
+            let py = f32::from(ev.event.position.y - ev.bounds.origin.y);
+            let progress = ((py - thumb_h / 2.0) / travel).clamp(0.0, 1.0);
+            let new_offset = progress * max;
+            // Only rewrite on meaningful deltas: `set_offset` dirties layout,
+            // and sub-pixel rewrites per move event jitter the thumb.
+            let cur = f32::from(-handle.offset().y);
+            if (new_offset - cur).abs() < 0.5 {
+                return;
+            }
+            handle.set_offset(gpui::point(px(0.0), px(-new_offset)));
+            // `sync_scroll` reports the new offset to the frontend on its
+            // next tick; refresh so the thumb does not lag a frame behind.
+            window.refresh();
+            },
+        )
+        .into_any_element()
+}
+
