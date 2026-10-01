@@ -216,6 +216,19 @@ impl Node {
     pub fn is_canvas(&self) -> bool {
         self.tag == "canvas"
     }
+
+    /// Is this a virtual list (`tag == "vlist"`)?
+    ///
+    /// A vlist is a scroll container by definition — the *frontend* does the
+    /// windowing (it re-spacers its children from `scroll` geometry), so the
+    /// host's only protocol obligation is the scroll-container semantics:
+    /// handle, clipping, draggable thumb, `scroll` events. Rendering it as a
+    /// plain div when the style omits `overflow` would silently drop all of
+    /// that, so the tag itself carries the meaning (like `input` carries
+    /// value/caret semantics).
+    pub fn is_vlist(&self) -> bool {
+        self.tag == "vlist"
+    }
 }
 
 pub struct Tree {
@@ -402,6 +415,9 @@ impl Tree {
         }
         if n.is_canvas() {
             out.push_str(&format!(" cmds={}", n.canvas.len()));
+        }
+        if n.is_vlist() {
+            out.push_str(" vlist");
         }
         if !n.events.is_empty() {
             out.push_str(&format!(" events={:?}", n.events));

@@ -12,6 +12,7 @@ import { BomCard } from "./bom";
 import { FormCard } from "./form";
 import { CanvasCard } from "./canvas";
 import { ScrollCard } from "./scroll";
+import { VListCard } from "./vlist";
 import { DelegationCard } from "./delegation";
 import { WidgetsCard } from "./widgets";
 import { ExtendedComponentsCard } from "./extended";
@@ -45,6 +46,7 @@ export function MainPanel(_props: Props): El {
                     borderWidth: 0,
                 }}
             >
+                <VListCard />
                 <FormCard />
                 <StatsRow />
                 <CounterCard />

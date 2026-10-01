@@ -60,6 +60,13 @@ export const [scrollEvents, setScrollEvents] = createSignal(0);
  *  ScrollArea. A nested-scroll regression counter. */
 export const [outerScrolls, setOuterScrolls] = createSignal(0);
 
+// --- vlist (virtual scrolling) state — the header labels read these ---
+export const [vlistTotal, setVlistTotal] = createSignal(0);
+export const [vlistFirst, setVlistFirst] = createSignal(0);
+export const [vlistLast, setVlistLast] = createSignal(0);
+export const [vlistMounted, setVlistMounted] = createSignal(0);
+export const [vlistScrolls, setVlistScrolls] = createSignal(0);
+
 // --- canvas state ---
 export const [bars, setBars] = createSignal<number[]>([38, 61, 27, 74, 52, 88, 43, 66]);
 export const [cmdCount, setCmdCount] = createSignal(0);

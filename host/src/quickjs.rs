@@ -531,25 +531,57 @@ impl Engine {
                             value,
                             scroll,
                         }) => {
-                            if let Ok(f) =
-                                ctx.globals().get::<_, Function>("__hostEventSink")
-                            {
-                                let mut a = Args::new(ctx.clone(), 7);
-                                let _ = a.push_arg(kind);
-                                let _ = a.push_arg(target as f64);
-                                // None → JS undefined (not ""): an emptied
-                                // text field must stay distinguishable from
-                                // "this event has no value payload".
-                                let _ = a.push_arg(value);
-                                let (t, m, vp, c) = match scroll {
-                                    Some(s) => (s.top, s.max, s.viewport, s.content),
-                                    None => (0.0, 0.0, 0.0, 0.0),
-                                };
-                                let _ = a.push_arg(t);
-                                let _ = a.push_arg(m);
-                                let _ = a.push_arg(vp);
-                                let _ = a.push_arg(c);
-                                let _ = f.call_arg::<()>(a);
+                            match ctx.globals().get::<_, Function>("__hostEventSink") {
+                                Ok(f) => {
+                                    let mut a = Args::new(ctx.clone(), 7);
+                                    let _ = a.push_arg(kind);
+                                    let _ = a.push_arg(target as f64);
+                                    // None → JS undefined (not ""): an emptied
+                                    // text field must stay distinguishable from
+                                    // "this event has no value payload".
+                                    let _ = a.push_arg(value);
+                                    let (t, m, vp, c) = match scroll {
+                                        Some(s) => (s.top, s.max, s.viewport, s.content),
+                                        None => (0.0, 0.0, 0.0, 0.0),
+                                    };
+                                    let _ = a.push_arg(t);
+                                    let _ = a.push_arg(m);
+                                    let _ = a.push_arg(vp);
+                                    let _ = a.push_arg(c);
+                                    if let Err(e) = f.call_arg::<()>(a) {
+                                        // Pull the exception value out of the
+                                        // context so the JS-side error (message
+                                        // + stack) lands in the log, not just
+                                        // the opaque "Exception" wrapper.
+                                        // rquickjs 0.14: into_* conversions
+                                        // return Option, not Result.
+                                        let caught = ctx.catch();
+                                        let type_name = caught.type_name();
+                                        let detail =
+                                            if let Some(s) = caught.clone().into_string() {
+                                                s.to_string()
+                                                    .unwrap_or_else(|_| "<string?>".into())
+                                            } else if let Some(x) = caught.into_exception() {
+                                                let m = x.message().unwrap_or_default();
+                                                let st = x.stack().unwrap_or_default();
+                                                if st.is_empty() {
+                                                    m
+                                                } else {
+                                                    m + " | stack: " + &st
+                                                }
+                                            } else {
+                                                format!("{:?} @ {}", e, type_name)
+                                            };
+                                        crate::log_line(&format!(
+                                            "[qjs] __hostEventSink call failed: {e:?} :: {detail}"
+                                        ));
+                                    }
+                                }
+                                Err(e) => {
+                                    crate::log_line(&format!(
+                                        "[qjs] __hostEventSink MISSING from globals: {e:?}"
+                                    ));
+                                }
                             }
                         }
                         Inbound::Event(OutEvent::Bom { w, h, dpr, sw, sh }) => {

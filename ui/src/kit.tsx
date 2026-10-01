@@ -24,6 +24,7 @@
  */
 
 import { createEffect, createSignal, For, h, mergeStyleInto, setStyle, Show, text } from "./io";
+import { create, appendChild, remove, wireEvent, setEvents } from "./io";
 import type { Child, El, HostEvent, Style } from "./io";
 
 /**
@@ -46,6 +47,10 @@ class NumFnRef { fn: ((v: number) => void) | null = null; }
  * at runtime ("undefined is not representable in ..."). A `() => void` field
  * accepts a zero-param arrow as-is: no re-tag, no cast, no trap. */
 class VoidFnRef { fn: (() => void) | null = null; }
+/** HostEvent callbacks (onScroll-style handlers). Same class-field rule as
+ * StrFnRef/NumFnRef: SC2011 refuses to CALL a function held in a props
+ * record, but a field on a class instance is whitelisted. */
+class EvFnRef { fn: ((ev: HostEvent) => void) | null = null; }
 import { createCanvas } from "./canvas2d";
 import type { Ctx } from "./canvas2d";
 import { C } from "./theme";
@@ -772,6 +777,149 @@ export function ScrollArea(props: {
             {props.children}
         </div>
     );
+    return box;
+}
+
+// ---------------------------------------------------------------------------
+// VList — virtual scrolling (windowed list)
+// ---------------------------------------------------------------------------
+
+/** Row height constant for the VList below (px). Kept next to the component
+ * so the card and the spacer math cannot drift apart. */
+export const VLIST_ROW_H: number = 44;
+
+/**
+ * Windowed list over a huge dataset — the `vlist` protocol tag.
+ *
+ * Split of responsibilities (the same one react-window makes, expressed in
+ * this protocol's vocabulary):
+ *
+ *   - **Host**: `vlist` is a scroll container by tag (`is_vlist`) — scroll
+ *     handle, clipping, the draggable thumb from #128, and `scroll` events
+ *     with full geometry (`top` / `max` / `viewport`).
+ *   - **Frontend**: windowing. The card hands rows via `items()` and renders
+ *     one `row(i)` element per *visible* row; this component keeps only a
+ *     fixed window mounted and re-spacers it whenever the geometry changes.
+ *
+ * Layout is three flow children of the scroller:
+ *
+ *     [ topSpacer   height = first*ROW_H   ]   pushes the window to the top
+ *     [ window      visible rows, gap 0    ]   the only mounted rows
+ *     [ bottomSpacer height = last*ROW_H    ]   keeps the content height
+ *
+ * So the scrollbar metrics never change while scrolling (total content height
+ * is `items*ROW_H` throughout), the wheel/scrollbar feedback loop is one-way
+ * (geometry → spacers → ops → layout; spacers never move the offset), and no
+ * absolute positioning is needed — the whole thing is plain flex flow, which
+ * is what keeps it scriptc-safe.
+ *
+ * `overscan` rows are mounted above and below the viewport so fast wheel runs
+ * never show a blank edge before the next `scroll` event lands.
+ */
+export function VList(props: {
+    /** Row source — re-read on every scroll event, so it may be reactive. */
+    items: () => number;
+    /** Render one row by index. Called only for indices inside the window. */
+    row: (i: number) => El;
+    /** Exactly one of height / grow, like ScrollArea. */
+    height?: number;
+    grow?: boolean;
+    /** Extra rows mounted above/below the viewport (default 4). */
+    overscan?: number;
+    onScroll?: (ev: HostEvent) => void;
+    style?: Style;
+}): El {
+    const overscan = props.overscan === undefined ? 4 : props.overscan;
+    /** User onScroll, captured into a ref object (scriptc: function-typed
+     * props fields are callable only through a class FIELD). */
+    const userScroll = new EvFnRef();
+    if (props.onScroll !== undefined) userScroll.fn = props.onScroll;
+
+    const box = create("vlist");
+    const style: Style = {
+        flexDirection: "column",
+        gap: 0,
+        padding: 6,
+        background: C.cardAlt,
+        borderRadius: 10,
+        borderWidth: 1,
+        borderColor: C.border,
+    };
+    if (props.height !== undefined) style.height = props.height;
+    if (props.grow === true) style.grow = 1;
+    if (props.style !== undefined) mergeStyleInto(style, props.style);
+    setStyle(box, style);
+
+    const topSpacer = create("div");
+    // NOTE: no `width: "100%"` anywhere in here — percent widths inside a
+    // scroll container resolve to 0 on the host (taffy sizes the scroller's
+    // content box by content, and a percent needs a definite parent width).
+    // Rows and spacers are appended DIRECTLY to the scroller (the exact
+    // shape of the proven ScrollArea/LogRow layout); there is no intermediate
+    // container — one measured earlier collapses to a 1px border sliver.
+    setStyle(topSpacer, { height: 0 });
+    const bottomSpacer = create("div");
+    setStyle(bottomSpacer, { height: 0 });
+    appendChild(box, topSpacer);
+    appendChild(box, bottomSpacer);
+
+    /** The currently mounted row elements — cleared (and only they) on each
+     * relayout. Rows sit between the two spacers in the scroller's flow. */
+    const rowEls: El[] = [];
+
+    /** Clamp + window computation for one scroll geometry. */
+    const relayout = function (top: number, viewport: number, total: number): void {
+        let n = total;
+        if (n < 0) n = 0;
+        const vh = viewport < 0 ? 0 : viewport;
+        const inner = vh - 12; // the padding above
+        const capacity = Math.ceil(inner / VLIST_ROW_H) + 1;
+        let first = Math.floor(top / VLIST_ROW_H) - overscan;
+        if (first < 0) first = 0;
+        let last = first + capacity + overscan * 2;
+        if (last > n) last = n;
+        if (first > last) first = last;
+
+        setStyle(topSpacer, { height: first * VLIST_ROW_H });
+        setStyle(bottomSpacer, { height: (n - last) * VLIST_ROW_H });
+        // Remove the old window. remove() unmounts each row subtree (and
+        // drops its event handlers); the rows sat right before bottomSpacer.
+        for (let r = 0; r < rowEls.length; r++) {
+            remove(rowEls[r]);
+        }
+        rowEls.length = 0;
+        for (let i = first; i < last; i++) {
+            const el = props.row(i);
+            rowEls.push(el);
+            // Insert before the bottom spacer: the protocol has no insert-at,
+            // so append + re-append the spacer keeps the order stable.
+            appendChild(box, el);
+            appendChild(box, bottomSpacer);
+        }
+    };
+
+    const onEv = function (ev: HostEvent): void {
+        const top = ev.top === undefined ? 0 : ev.top;
+        const viewport = ev.viewport === undefined ? 0 : ev.viewport;
+        const content = ev.content === undefined ? 0 : ev.content;
+        relayout(top, viewport, Math.round(content / VLIST_ROW_H));
+        // scriptc SC2011: a function stored in a props record has no static
+        // representation at the call site — route it through a class FIELD
+        // (the same workaround every other component here uses).
+        const notify = userScroll.fn;
+        if (notify !== null) notify(ev);
+    };
+    wireEvent(box, "scroll", onEv);
+    setEvents(box, ["scroll"]);
+
+    // First paint: no `scroll` event has arrived yet (the host reports
+    // geometry only after the first layout), so seed the window with a
+    // conservative guess — `height` if given, else 320px of viewport. The
+    // first real scroll event (host pushes one whenever the offset *changes*;
+    // the card's own outer scroller guarantees one on first interaction)
+    // corrects both numbers.
+    const seedTotal = props.items();
+    relayout(0, props.height === undefined ? 320 : props.height, seedTotal);
     return box;
 }
 

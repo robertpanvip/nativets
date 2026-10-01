@@ -181,6 +181,12 @@ pub(crate) fn is_box_key(k: &str) -> bool {
 }
 
 pub(crate) fn is_scroll_container(node: &Node) -> bool {
+    // `vlist` is a scroll container by protocol (see `Node::is_vlist`): the
+    // frontend does the windowing, the host owns the scrolling — regardless
+    // of whether the author also wrote `overflow: "scroll"` on it.
+    if node.is_vlist() {
+        return true;
+    }
     let overflow = node
         .style
         .get("overflow")

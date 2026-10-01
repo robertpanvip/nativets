@@ -478,7 +478,14 @@ impl HostView {
                 round1(viewport + max),
                 id,
             );
-            log!("[host] ev scroll id={id} t={}", now_ms());
+            log!(
+                "[host] ev scroll id={id} t={} top={} max={} viewport={} content={}",
+                now_ms(),
+                round1(top),
+                round1(max),
+                round1(viewport),
+                round1(viewport + max),
+            );
             let _ = self.event_tx.send(ev);
         }
     }

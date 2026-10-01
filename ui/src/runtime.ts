@@ -50,6 +50,7 @@ export type {
 
 import {
     setSink,
+    setHostEventSink,
     handleLine,
     handleHostEvent,
     stats,
@@ -169,6 +170,19 @@ if (stdinFacade !== null) {
     // handled (they already reach io-core via pumpStdin → handleLine).
     if (typeof g.__hostOps !== "function") return;
     if (g.__hostEventSink !== undefined) return; // already installed
+    // Register the io-core slot too: `handleHostEvent` guards on
+    // `hostEventSink.fn` and silently drops every event when it is null.
+    // Only the JSONL tier (`handleLine`) bypasses that guard, so before this
+    // registration the QuickJS ABI tier delivered nothing — scroll/click/
+    // input events reached the bundle and vanished (vlist #59 symptom: the
+    // window label froze at "[0, 0) · 0 行" while the host scrolled fine).
+    //
+    // The slot fn must NOT call `handleHostEvent` — `handleHostEvent` itself
+    // invokes the slot fn after its guard (that's the slot's whole purpose:
+    // a legacy transport hook), so a self-referencing fn recurses until the
+    // engine blows the stack. Dispatch happens inside `handleHostEvent`; a
+    // no-op is the correct registration.
+    setHostEventSink(function (): void {});
     g.__hostEventSink = function (
         kind: string,
         target: number,

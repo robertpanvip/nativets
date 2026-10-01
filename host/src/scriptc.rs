@@ -165,19 +165,33 @@ struct Engine {
 }
 
 impl Engine {
-    /// Copy one polled line into the ops pipeline (the borrow is valid only
-    /// until the next engine call — copy before anything else).
+    /// Copy polled lines into the ops pipeline until the engine says the
+    /// outbox is empty (the borrow is valid only until the next engine call —
+    /// copy before anything else).
+    ///
+    /// Why drain-to-empty and not one line per tick: `gpts_poll` hands back a
+    /// single buffered line per call, so the CALLER decides the rate. One
+    /// line per 10 ms tick capped the whole ops pipeline at 100 lines/s, and
+    /// one VList relayout emits ~100+ lines (spacer resize + 14 rows ×
+    /// remove/create/style/append). A 12-notch wheel burst then needed
+    /// ~14 s to drain while the host viewport had already moved on — the
+    /// frontend's stale window rendered as a blank scroller (the "vlist does
+    /// not scroll" bug). The init loop below already drains to empty; the
+    /// steady state now does the same. With a drained outbox each tick, the
+    /// practical rate is the ops channel's, not the quantum's.
     fn drain_poll(&self) {
-        let mut ptr: *const u8 = std::ptr::null();
-        let mut len: usize = 0;
-        unsafe { (self.api.poll)(&mut ptr, &mut len) };
-        if len == 0 || ptr.is_null() {
-            return;
-        }
-        let bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
-        if let Ok(line) = std::str::from_utf8(bytes) {
-            let owned = line.to_string();
-            crate::ingest_line(&owned, &self.ops_tx);
+        loop {
+            let mut ptr: *const u8 = std::ptr::null();
+            let mut len: usize = 0;
+            unsafe { (self.api.poll)(&mut ptr, &mut len) };
+            if len == 0 || ptr.is_null() {
+                return;
+            }
+            let bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
+            if let Ok(line) = std::str::from_utf8(bytes) {
+                let owned = line.to_string();
+                crate::ingest_line(&owned, &self.ops_tx);
+            }
         }
     }
 
